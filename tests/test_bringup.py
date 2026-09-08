@@ -66,10 +66,9 @@ class VisualControlTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             visual.trail_points(kinematics, [0] * 5, [1] * 5, samples=1)
 
-    def test_model_preview_is_watchable_and_hardware_bounds_untouched(self):
+    def test_model_preview_is_watchable_and_cli_jog_bounds_untouched(self):
         self.assertGreaterEqual(visual.ANIMATION_MIN_SECONDS, 1.0)
-        self.assertGreater(visual.MODEL_STEP_MM, demo.STEP_MM)
-        self.assertGreater(visual.MODEL_XYZ_ENVELOPE_MM, demo.SESSION_XYZ_ENVELOPE_MM)
+        self.assertLessEqual(visual.MOTION_RATE_DEG_S, 15.0)
         self.assertEqual(demo.STEP_MM, 2.0)
         self.assertEqual(demo.SESSION_JOINT_ENVELOPE_DEG, 8.0)
 
@@ -87,20 +86,11 @@ class VisualControlTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 visual.check_request(request, owner, now, connected)
 
-    def test_preview_rejected_when_arm_moves(self):
-        preview = visual.Preview((0,) * 5, (1,) * 5, (0.1, 0, 0.2))
-        visual.check_preview(preview, [0.1] * 5)
-        for value in ([1] * 5, [math.nan] * 5, [0] * 6):
-            with self.assertRaises(ValueError):
-                visual.check_preview(preview, value)
-        with self.assertRaises(ValueError):
-            visual.check_preview(None, [0] * 5)
-
-    def test_preview_is_immutable(self):
+    def test_plan_is_immutable(self):
         from dataclasses import FrozenInstanceError
-        preview = visual.Preview((0,) * 5, (1,) * 5, (0, 0, 0))
+        plan = visual.Plan((0,) * 5, (1,) * 5, None, None, (0, 0, 0), 2.0)
         with self.assertRaises(FrozenInstanceError):
-            preview.joints = (2,) * 5
+            plan.goal = (2,) * 5
 
     def test_visual_joint_mapping_uses_names_and_radians(self):
         names = ["gripper", *reversed(demo.JOINTS)]
@@ -114,16 +104,58 @@ class VisualControlTests(unittest.TestCase):
         from unittest.mock import patch
         with patch.object(visual, "run") as run, patch("sys.stderr"):
             with self.assertRaises(SystemExit):
-                visual.main(["--model-dir", "not-a-device", "--web-port", "4602", "--readback"])
+                visual.main(["--model-dir", "not-a-device", "--web-port", "4602", "--hardware"])
+            with self.assertRaises(SystemExit):
+                visual.main(["--model-dir", "not-a-device", "--web-port", "4602", "--port", "x"])
             run.assert_not_called()
 
-    def test_visual_readback_never_writes_or_changes_torque(self):
+    def test_visual_torque_only_through_the_checked_hold_and_explicit_release(self):
+        # Torque is enabled only by control.configure_and_hold (validated snapshot, hold, then enable);
+        # the viewer itself never writes registers or calls enable_torque, and it releases torque
+        # explicitly before the single read-only disconnect.
         tree = ast.parse(Path(visual.__file__).read_text())
         called = {node.func.attr for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
-        self.assertFalse(called & {"send_action", "write", "sync_write", "enable_torque", "disable_torque", "configure", "configure_and_hold", "write_calibration"})
+        self.assertFalse(called & {"write", "sync_write", "enable_torque", "configure", "write_calibration", "connect_robot"})
+        self.assertIn("configure_and_hold", called)
+        self.assertIn("disable_torque", called)
         disconnects = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "disconnect"]
         self.assertEqual(len(disconnects), 1)
         self.assertTrue(any(keyword.arg == "disable_torque" and isinstance(keyword.value, ast.Constant) and keyword.value.value is False for keyword in disconnects[0].keywords))
+
+    def test_motion_duration_respects_joint_and_gripper_rates(self):
+        self.assertAlmostEqual(visual.motion_duration([0] * 5, [30, 0, 0, 0, 0]), 30 / visual.MOTION_RATE_DEG_S)
+        self.assertAlmostEqual(visual.motion_duration([0] * 5, [0] * 5, gripper_change=50), 50 / visual.GRIPPER_RATE_PCT_S)
+        self.assertEqual(visual.motion_duration([0] * 5, [1] * 5, minimum=2.0), 2.0)
+        self.assertGreaterEqual(visual.motion_duration([0] * 5, [0] * 5), visual.UPDATE_SECONDS)
+
+    def test_step_based_motion_never_exceeds_one_lerobot_command_clip(self):
+        # The eased profile peaks at pi/2 times the average rate; every per-tick joint and
+        # gripper change must stay under MAX_JOINT_STEP_DEG, or LeRobot clips and the viewer aborts.
+        start, goal = [0.0] * 5, [90.0, -60.0, 45.0, 30.0, 120.0]
+        duration = visual.motion_duration(start, goal, gripper_change=100)
+        steps = visual.motion_steps(duration)
+        previous, previous_grip = start, 0.0
+        for k in range(1, steps + 1):
+            fraction = visual.eased(k / steps)
+            waypoint = visual.interpolation(start, goal, fraction)
+            self.assertLess(visual.lag(waypoint, previous), demo.MAX_JOINT_STEP_DEG)
+            self.assertLess(abs(100 * fraction - previous_grip), demo.MAX_JOINT_STEP_DEG)
+            previous, previous_grip = waypoint, 100 * fraction
+        self.assertEqual(visual.motion_steps(0), 1)
+
+    def test_target_limits_intersect_model_and_recorded_travel(self):
+        model = {name: (-100, 100) for name in demo.JOINTS}
+        recorded = {name: (-105, 105) for name in demo.JOINTS}
+        recorded["elbow_flex"] = (-40, 40)
+        limits = visual.intersect_limits(model, recorded)
+        self.assertEqual(limits["shoulder_lift"], (-100, 100))
+        self.assertEqual(limits["elbow_flex"], (-40, 40))
+
+    def test_arming_needs_the_exact_word(self):
+        self.assertTrue(visual.arming_requested(" ENABLE "))
+        for text in ("enable", "", "ENABLE now", "yes"):
+            self.assertFalse(visual.arming_requested(text))
+        self.assertEqual(visual.lag([0, 0, 0, 0, 0], [1, -3, 2, 0, 0]), 3)
 
 
 class BusReadTests(unittest.TestCase):
