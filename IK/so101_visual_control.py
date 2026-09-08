@@ -114,6 +114,18 @@ def intersect_limits(model_limits, reading_limits):
             for name in control.JOINTS}
 
 
+def slider_bounds(limits):
+    """Slider ends rounded inwards to the slider step, so every slider value is a valid target."""
+    factor = 1 / SLIDER_STEP_DEG
+    return {name: (math.ceil(low * factor) / factor, math.floor(high * factor) / factor) for name, (low, high) in limits.items()}
+
+
+def slider_value(value, bounds):
+    """Round to the slider step and clamp inside its ends; the servo reading itself is never altered."""
+    low, high = bounds
+    return float(min(max(round(float(value) / SLIDER_STEP_DEG) * SLIDER_STEP_DEG, low), high))
+
+
 def arming_requested(text):
     return text.strip() == ARM_WORD
 
@@ -174,6 +186,12 @@ def run(args):
         # the main thread; Viser callbacks run concurrently.
         nonlocal latest_drag, latest_joints
         if kind == "quit":
+            if armed:
+                try:
+                    requests.put_nowait(Request("quit-refused", client_id, time.monotonic()))
+                except queue.Full:
+                    pass
+                return
             stop_requested.set()
             return
         if client_id is not None and client_id != owner and kind != "connected":
@@ -261,9 +279,9 @@ def run(args):
         ))
         readout = server.gui.add_markdown("")
         status = server.gui.add_markdown(copy("拖动目标或拨动滑杆，先出现橙色目标和轨迹。", "Drag the target or move a slider; the orange target and path appear first."))
+        bounds = slider_bounds(target_limits)
         with server.gui.add_folder(copy("目标关节角 / °", "Target joints / °")):
-            sliders = [server.gui.add_slider(label, round(target_limits[name][0], 1), round(target_limits[name][1], 1), SLIDER_STEP_DEG,
-                                             float(min(max(v, target_limits[name][0]), target_limits[name][1])))
+            sliders = [server.gui.add_slider(label, bounds[name][0], bounds[name][1], SLIDER_STEP_DEG, slider_value(v, bounds[name]))
                        for label, name, v in zip(JOINT_LABELS, control.JOINTS, current)]
             gripper_slider = server.gui.add_slider(copy("夹爪开合 / %", "Gripper / %"), 0, 100, 1, float(opening)) if arm else None
         preview = server.gui.add_button(copy("预览运动（只动橙色模型）", "Preview motion (orange model only)"), disabled=True)
@@ -277,8 +295,8 @@ def run(args):
                 release_button = server.gui.add_button(copy("释放力矩（先托住手臂）", "Release torque (support the arm first)"), disabled=True)
         quit_button = server.gui.add_button(copy("关闭程序", "Close program"))
         server.gui.add_markdown(copy(
-            "执行时每次只发送一小步关节目标，速度上限每秒 10°；实物落后指令超过 8° 即停止并保持。关闭程序会释放力矩，手臂可能下落。软件不是物理断电。",
-            "Execution sends one small joint step at a time, at most 10° per second; if the arm lags its command by more than 8° it stops and holds. Closing the program releases torque and the arm may drop. Software is not a physical power cutoff.",
+            "执行时每次只发送一小步关节目标，速度上限每秒 10°；实物落后指令超过 8° 即停止并保持。力矩开着时不能关闭程序，要先托住手臂、释放力矩；终端里按 Ctrl+C 会直接释放力矩，手臂会下落。软件不是物理断电。",
+            "Execution sends one small joint step at a time, at most 10° per second; if the arm lags its command by more than 8° it stops and holds. The program cannot be closed while torque is on: support the arm and release torque first. Ctrl+C in the terminal releases torque at once and the arm drops. Software is not a physical power cutoff.",
         ))
 
         @server.on_client_connect
@@ -325,9 +343,9 @@ def run(args):
             trail.append(server.scene.add_spline_catmull_rom("/trail/path", path, color=TRAIL_COLOR, thickness=0.004))
             trail.append(server.scene.add_point_cloud("/trail/waypoints", path[::6], np.tile(TRAIL_COLOR, (len(path[::6]), 1)),
                                                      point_size=0.008, point_shape="circle"))
-            for slider, value in zip(sliders, new_plan.goal):
+            for slider, name, value in zip(sliders, control.JOINTS, new_plan.goal):
                 if abs(float(slider.value) - value) >= SLIDER_STEP_DEG / 2:
-                    slider.value = float(round(value / SLIDER_STEP_DEG) * SLIDER_STEP_DEG)
+                    slider.value = slider_value(value, bounds[name])
             preview.disabled = False
             execute.disabled = bool(arm) and not armed
 
@@ -397,6 +415,9 @@ def run(args):
                 if request.client_id is not None and request.client_id != owner:
                     continue
                 try:
+                    if request.kind == "quit-refused":
+                        status.content = copy("力矩还开着：先托住手臂，点“释放力矩”，再关闭程序。", "Torque is still on: support the arm, press Release torque, then close the program.")
+                        continue
                     if request.kind == "stop":
                         if phase == "executing":
                             abort_and_hold(copy("操作者按下停止", "operator pressed stop"))
@@ -424,8 +445,7 @@ def run(args):
                             drop_plan()
                             gizmo.position = tuple(xyz)
                             for slider, name, value in zip(sliders, control.JOINTS, current):
-                                low, high = target_limits[name]
-                                slider.value = float(min(max(round(value / SLIDER_STEP_DEG) * SLIDER_STEP_DEG, low), high))
+                                slider.value = slider_value(value, bounds[name])
                             if gripper_slider:
                                 gripper_slider.value = float(round(opening))
                             status.content = copy("目标已回到当前姿态。", "Target reset to the current pose.")

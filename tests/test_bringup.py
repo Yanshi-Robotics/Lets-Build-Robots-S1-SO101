@@ -151,6 +151,18 @@ class VisualControlTests(unittest.TestCase):
         self.assertEqual(limits["shoulder_lift"], (-100, 100))
         self.assertEqual(limits["elbow_flex"], (-40, 40))
 
+    def test_slider_bounds_round_inwards_and_values_stay_inside(self):
+        # A URDF limit of -1.74533 rad is -100.00004°; a slider cannot start outside [min, max].
+        limits = {name: (-100.00004285756798, 96.7995) for name in demo.JOINTS}
+        bounds = visual.slider_bounds(limits)["shoulder_lift"]
+        self.assertEqual(bounds, (-100.0, 96.5))
+        self.assertGreaterEqual(bounds[0], limits["shoulder_lift"][0])
+        self.assertLessEqual(bounds[1], limits["shoulder_lift"][1])
+        self.assertEqual(visual.slider_value(-103.5, bounds), -100.0)
+        self.assertEqual(visual.slider_value(-100.00004285756798, bounds), -100.0)
+        self.assertEqual(visual.slider_value(12.26, bounds), 12.5)
+        self.assertEqual(visual.slider_value(200, bounds), 96.5)
+
     def test_arming_needs_the_exact_word(self):
         self.assertTrue(visual.arming_requested(" ENABLE "))
         for text in ("enable", "", "ENABLE now", "yes"):
