@@ -177,6 +177,9 @@ def validate_web_port(port):
     if os.environ.get("_VISER_PORT_OVERRIDE"):
         raise ValueError("Unset _VISER_PORT_OVERRIDE; use the explicit --web-port")
     with socket.socket() as probe:
+        # Connections left in TIME_WAIT by the previous run must not block a restart;
+        # a live listener on the port still fails the bind and is reported.
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         probe.bind((LOOPBACK, port))
 
 
