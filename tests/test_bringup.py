@@ -399,6 +399,33 @@ class NumericalTests(unittest.TestCase):
         with self.assertRaises((ValueError, RuntimeError)):
             demo.solve_position(self.kinematics, demo.PREVIEW_JOINTS_DEG, [1, 1, 1], self.limits)
 
+    def test_ctrl_c_exits_quickly_and_the_port_can_be_reused_at_once(self):
+        # The one test that opens a listener: a real viewer on a free loopback port, a client
+        # left connected, then SIGINT. It must exit with 130 within seconds, and the port must be
+        # bindable immediately even though the closed connection lingers in TIME_WAIT.
+        import socket, subprocess, signal, time
+        with socket.socket() as probe:
+            probe.bind((visual.LOOPBACK, 0))
+            port = probe.getsockname()[1]
+        process = subprocess.Popen([sys.executable, "-u", str(ROOT / "IK/so101_visual_control.py"), "--model-dir", str(args.model_dir),
+                                    "--web-port", str(port)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            started = time.monotonic()
+            while "Open http" not in process.stdout.readline():
+                self.assertLess(time.monotonic() - started, 90, "viewer did not start")
+            from websockets.sync.client import connect
+            client = connect(f"ws://{visual.LOOPBACK}:{port}", open_timeout=10)
+            interrupted = time.monotonic()
+            process.send_signal(signal.SIGINT)
+            self.assertEqual(process.wait(timeout=10), 130)
+            self.assertLess(time.monotonic() - interrupted, 5)
+            client.close()
+            visual.validate_web_port(port)  # would raise "Address already in use" without SO_REUSEADDR
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.stdout.close()
+
     def test_viser_urdf_meshes_and_fk_match_the_solver(self):
         # Real Viser/yourdfpy loading; only scene transport is a test fixture.
         # No listener, browser, serial port, or hardware is opened by this test.
