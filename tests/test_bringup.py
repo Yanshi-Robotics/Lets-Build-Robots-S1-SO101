@@ -186,6 +186,13 @@ class VisualControlTests(unittest.TestCase):
         self.assertEqual(visual.counts_from_percent(100, gripper), 3539)
         self.assertEqual(visual.counts_from_percent(3.6387, gripper), 2056)
 
+    def test_preview_is_faster_than_execution_but_never_instant(self):
+        start, goal = [0] * 5, [60, 0, 0, 0, 0]
+        self.assertLess(visual.preview_duration(start, goal), visual.motion_duration(start, goal, 0, visual.ANIMATION_MIN_SECONDS))
+        self.assertAlmostEqual(visual.preview_duration(start, goal), 60 / visual.PREVIEW_RATE_DEG_S)
+        self.assertEqual(visual.preview_duration(start, [1, 0, 0, 0, 0]), visual.PREVIEW_MIN_SECONDS)
+        self.assertEqual(visual.MOTION_RATE_DEG_S, 10.0)  # Hardware speed is untouched by the preview speed.
+
     def test_arming_needs_the_exact_word(self):
         self.assertTrue(visual.arming_requested(" ENABLE "))
         for text in ("enable", "", "ENABLE now", "yes"):

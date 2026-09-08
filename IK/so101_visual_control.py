@@ -31,9 +31,11 @@ import so101_cartesian_demo as control
 VISER_VERSION = "1.1.0"
 LOOPBACK = "127.0.0.1"  # Hardware control must never bind a LAN/public interface.
 UPDATE_SECONDS = 0.05  # 20 Hz UI, readback and command loop; not a real-time guarantee.
-MOTION_RATE_DEG_S = 10.0  # Joint speed for previews and for hardware execution.
+MOTION_RATE_DEG_S = 10.0  # Joint speed for hardware execution and the model-mode execute.
 GRIPPER_RATE_PCT_S = 20.0  # Gripper opening speed; its eased peak stays under LeRobot's 2 %-per-command clip.
-ANIMATION_MIN_SECONDS = 2.0  # A preview plays long enough to be watched.
+ANIMATION_MIN_SECONDS = 2.0  # Execution of even a tiny move takes at least this long.
+PREVIEW_RATE_DEG_S = 45.0  # The orange model only: fast enough to watch, nothing physical behind it.
+PREVIEW_MIN_SECONDS = 1.0
 TRACKING_ABORT_DEG = 8.0  # The arm lags its command by more than this: stop and hold.
 SETTLE_TOLERANCE_DEG = 0.8
 SETTLE_TIMEOUT_SECONDS = 2.0
@@ -90,6 +92,11 @@ def motion_duration(start, goal, gripper_change=0.0, minimum=0.0):
     joints = max(abs(float(b) - float(a)) for a, b in zip(start, goal)) / MOTION_RATE_DEG_S
     gripper = abs(float(gripper_change)) / GRIPPER_RATE_PCT_S
     return max(joints, gripper, minimum, UPDATE_SECONDS)
+
+
+def preview_duration(start, goal):
+    """Seconds the orange model takes to show a plan; independent of the execution speed."""
+    return max(max(abs(float(b) - float(a)) for a, b in zip(start, goal)) / PREVIEW_RATE_DEG_S, PREVIEW_MIN_SECONDS, UPDATE_SECONDS)
 
 
 def trail_points(kinematics, start, goal, samples=TRAIL_SAMPLES):
@@ -542,7 +549,7 @@ def run(args):
                         plan = make_plan()
                         phase, step = "planning", 0
                         refresh_buttons()
-                        status.content = copy(f"已计划：约 {plan.duration:.1f} s，橙色模型正在走这条路。满意就点“执行运动”。", f"Planned: about {plan.duration:.1f} s; the orange model is running the path. Press Execute if it looks right.")
+                        status.content = copy(f"已计划，橙色模型正在走这条路；真正执行约需 {plan.duration:.1f} s。满意就点“执行运动”。", f"Planned; the orange model is running the path. Execution will take about {plan.duration:.1f} s. Press Execute if it looks right.")
                     elif request.kind == "execute":
                         check_request(request, owner, time.monotonic(), server.get_clients())
                         if estopped:
@@ -588,7 +595,8 @@ def run(args):
 
             if phase in ("planning", "executing") and plan is not None:
                 # One fixed step per tick: a slow tick slows the motion, it never enlarges a step.
-                steps = max(1, math.ceil(plan.duration / UPDATE_SECONDS))
+                seconds = preview_duration(plan.start, plan.goal) if phase == "planning" else plan.duration
+                steps = max(1, math.ceil(seconds / UPDATE_SECONDS))
                 step = min(step + 1, steps)
                 fraction = eased(step / steps)
                 waypoint = interpolation(plan.start, plan.goal, fraction)
