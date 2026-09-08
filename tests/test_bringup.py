@@ -124,7 +124,8 @@ class VisualControlTests(unittest.TestCase):
         called = {node.func.attr for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
         self.assertFalse(called & {"write", "sync_write", "enable_torque", "configure", "write_calibration", "connect_robot"})
         self.assertIn("configure_and_hold", called)
-        self.assertIn("disable_torque", called)
+        self.assertIn("release_torque", called)  # the only way the viewer switches torque off
+        self.assertNotIn("disable_torque", called)
         disconnects = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "disconnect"]
         self.assertEqual(len(disconnects), 1)
         self.assertTrue(any(keyword.arg == "disable_torque" and isinstance(keyword.value, ast.Constant) and keyword.value.value is False for keyword in disconnects[0].keywords))
@@ -211,11 +212,13 @@ class VisualControlTests(unittest.TestCase):
         # The only functions allowed to switch torque off are the explicit release and the exit path.
         tree = ast.parse(Path(visual.__file__).read_text())
         for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name in ("emergency_stop", "abort_and_hold", "clear_emergency_stop"):
+            if isinstance(node, ast.FunctionDef) and node.name in ("emergency_stop", "abort_and_hold", "clear_emergency_stop", "hold_here"):
                 calls = {n.func.attr for n in ast.walk(node) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
                 self.assertNotIn("disable_torque", calls, node.name)
-        for phrase in ("紧急停止", "EMERGENCY STOP", "解除紧急停止", "Clear emergency stop"):
-            self.assertIn(phrase, Path(visual.__file__).read_text())
+                self.assertNotIn("release_torque", calls, node.name)
+        source = Path(visual.__file__).read_text()
+        for phrase in ("紧急停止", "EMERGENCY STOP", "解除紧急停止", "Clear emergency stop", "1 · 上电", "3 · 断电", "Power on", "Power off"):
+            self.assertIn(phrase, source)
 
     def test_settling_ends_by_tolerance_or_by_timeout_never_hangs(self):
         self.assertEqual(visual.settle_state(0.5, 0), "done")
@@ -254,6 +257,33 @@ class VisualControlTests(unittest.TestCase):
             self.assertIn("probe line", text)
             for handler in list(visual.LOG.handlers):
                 visual.LOG.removeHandler(handler); handler.close()
+
+    def test_power_on_is_refused_on_a_stop_and_holds_clamp_inside_the_travel(self):
+        limits = {name: (-105.48, 105.48) for name in demo.JOINTS}  # recorded +-100.48 plus the 5 deg reading margin
+        rest = [13.98, -103.69, 97.01, -102.29, 6.37]
+        blockers = demo.joints_on_a_stop(rest, limits)
+        self.assertEqual([b[0] for b in blockers], ["shoulder_lift", "elbow_flex", "wrist_flex"])
+        self.assertEqual(blockers[0][2], (-100.48, 100.48))
+        self.assertEqual(demo.joints_on_a_stop([0, -60, 60, -30, 0], limits), [])
+        self.assertEqual(demo.joints_on_a_stop([0, -95.0, 0, 0, 0], limits), [])  # exactly 5.48 deg inside: allowed
+        self.assertEqual(demo.clamp_for_hold(rest, limits), [13.98, -98.48, 97.01, -98.48, 6.37])
+
+    def test_release_torque_keeps_going_past_a_motor_in_protection(self):
+        events = []
+        def write(register, motor, value, **kwargs):
+            events.append(("write", motor, value))
+            if motor == "shoulder_lift":
+                raise RuntimeError("[RxPacketError] Overload error!")
+        def read(register, motor, **kwargs):
+            if motor == "shoulder_lift":
+                raise RuntimeError("[RxPacketError] Overload error!")
+            return 0
+        bus = SimpleNamespace(motors={name: object() for name in scan.JOINT_NAMES}, write=write, read=read,
+                              sync_write=lambda register, values, **kwargs: events.append(("broadcast", tuple(values))))
+        unconfirmed = demo.release_torque(bus)
+        self.assertEqual([e[1] for e in events if e[0] == "write"], list(scan.JOINT_NAMES))  # every motor still written
+        self.assertEqual(events[-1][0], "broadcast")
+        self.assertEqual(list(unconfirmed), ["shoulder_lift"])
 
     def test_arming_needs_the_exact_word(self):
         self.assertTrue(visual.arming_requested(" ENABLE "))
@@ -494,6 +524,17 @@ class NumericalTests(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
             process.stdout.close()
+
+    def test_wrist_roll_stays_put_while_dragging(self):
+        import numpy as np
+        rest = np.array([13.98, -103.69, 97.01, -102.29, 6.37])
+        seed = visual.ik_seed(rest, None, self.limits)
+        demo.lock_wrist_roll(self.kinematics, rest[4])
+        goal = seed.copy()
+        for dx, dy, dz in ((0.02, 0, 0.05), (0.03, 0.01, 0.05), (0.03, 0.02, 0.06), (0.05, 0.02, 0.08)):
+            target = self.kinematics.forward_kinematics(seed)[:3, 3] + np.array([dx, dy, dz])
+            goal, _, _ = demo.solve_position(self.kinematics, goal, target, self.limits)
+            self.assertLess(abs(goal[4] - rest[4]), 2.0)  # 2026-09-08: without the lock a drag planned a 155 deg roll
 
     def test_viser_urdf_meshes_and_fk_match_the_solver(self):
         # Real Viser/yourdfpy loading; only scene transport is a test fixture.

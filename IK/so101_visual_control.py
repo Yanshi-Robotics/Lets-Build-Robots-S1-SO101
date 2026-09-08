@@ -255,24 +255,24 @@ def help_markdown(zh, args):
 - **滑杆**：直接给五个关节和夹爪设目标；和操纵柄是同一个目标的两种给法。
 
 #### 三步走
-1. **目标**：拖操纵柄或拨滑杆，橙色手臂出现。
+1. **目标**：上电后拖操纵柄或拨滑杆，橙色手臂出现。
 2. **计划轨迹**：算出从当前到目标的路径并画出来，橙色模型走一遍演示（每秒 {PREVIEW_RATE_DEG_S:g}°，只是演示）。改了目标就要重新计划。
 3. **执行运动**：沿计划的轨迹过去。模型模式动蓝色模型；实机模式动真机，速度上限每秒 {MOTION_RATE_DEG_S:g}°，每个周期只发一小步。
 
-#### 力矩（实机模式）
-- **启用力矩并保持当前姿态**：先输入 {ARM_WORD}。程序核对读数在校准范围内，把六个电机的目标设成当前位置，再开力矩。可以在休息姿态直接启用。
-- **释放力矩**：六个电机同时停止出力，手臂会失去支撑，先托住再点。这是唯一让电机松开的按钮。
+#### 上电与断电（实机模式）
+- **1 · 上电**：先输入 {ARM_WORD}。每个关节都要离活动范围两端 5° 以上，靠在止点上的休息姿态不许上电，要先用手托到中间姿态。程序把六个电机的目标设成当前位置再开力矩，从此电机锁定，才能设目标、计划、执行。
+- **3 · 断电**：也要输入 {ARM_WORD}。六个电机同时停止出力，手臂会失去支撑，先托住再点。断电是唯一让电机松开的操作；断电没确认干净时界面会说明，这时切断直流电源。
 
 #### 四种停
 - **停止并保持**：执行中随时可按，停在原地，电机继续出力。
 - **自动停止**：执行中某关节落后指令超过 {e}° 且负载超过 {l}%（判定为碰到东西）、落后超过 {TRACKING_ABORT_DEG:g}°、LeRobot 截短了目标、浏览器断开，程序都自动停止并保持，状态行写明原因。
-- **紧急停止**：任何时候都能按，比如执行中看到手臂快撞到东西。立刻停在原地并保持力矩，绝不卸力；之后界面锁住，检查完点“解除紧急停止”继续，或托住手臂后点“释放力矩”。
-- **终端 Ctrl+C**：程序退出，退出前释放力矩，手臂会掉。只作最后手段。
+- **紧急停止**：任何时候都能按，比如执行中看到手臂快撞到东西。立刻停在原地并保持力矩，绝不卸力；之后界面锁住，检查完点“解除紧急停止”继续，或托住手臂后断电。
+- **终端 Ctrl+C**：程序退出，退出前断电（释放力矩），手臂会掉。只作最后手段。
 
 #### 边界
 - 程序不识别障碍物，也不规划避障；碰撞检测是碰上之后才停，不是提前避开。
 - “负载”一行实时显示六个电机的负载百分比，用它来调 `--contact-error-deg` 和 `--contact-load-pct`。
-- 力矩开着时不能关闭程序，先释放。软件停止不是物理断电，直流电源开关必须在手边。"""
+- 上电状态下不能关闭程序，先断电。软件停止不是物理断电，直流电源开关必须在手边。"""
     return f"""#### Colours and handles
 - **Blue arm**: current pose. In hardware mode it comes from the motors; each joint shows degrees with the encoder count in brackets, the same number as in the calibration table.
 - **Orange arm**: goal pose, not yet executed. The orange line and dots are the planned gripper path.
@@ -280,24 +280,24 @@ def help_markdown(zh, args):
 - **Sliders**: set the five joints and the gripper directly; the handle and the sliders are two ways of giving the same goal.
 
 #### Three steps
-1. **Goal**: drag the handle or move a slider; the orange arm appears.
+1. **Goal**: after power-on, drag the handle or move a slider; the orange arm appears.
 2. **Plan trajectory**: computes and draws the path from the current pose to the goal and runs the orange model along it ({PREVIEW_RATE_DEG_S:g}° per second, a demonstration only). Changing the goal requires planning again.
 3. **Execute**: follows the planned trajectory. Model mode moves the blue model; hardware mode moves the arm at no more than {MOTION_RATE_DEG_S:g}° per second, one small step per cycle.
 
-#### Torque (hardware mode)
-- **Enable torque and hold this pose**: type {ARM_WORD} first. The program checks the readings are inside the calibrated range, sets all six motor targets to the present position, then switches torque on. It may be done in the rest pose.
-- **Release torque**: all six motors stop driving and the arm loses its support, so hold it before pressing. This is the only button that lets the motors go.
+#### Power on and off (hardware mode)
+- **1 · Power on**: type {ARM_WORD} first. Every joint must be more than 5° from either end of its travel; the folded rest pose on the stops is refused, so support the arm in a mid pose first. The program sets all six motor targets to the present position and then switches torque on; from then on the motors are locked and goals, plans and execution become available.
+- **3 · Power off**: also requires {ARM_WORD}. All six motors stop driving and the arm loses its support, so hold it before pressing. Power-off is the only action that lets the motors go; if it cannot be confirmed on every motor the interface says so, and you cut DC power.
 
 #### Four kinds of stop
 - **Stop and hold**: available at any moment during execution; the arm stops in place with the motors still driving.
 - **Automatic stop**: during execution a joint more than {e}° behind its command at over {l}% load (taken as contact), a lag over {TRACKING_ABORT_DEG:g}°, a target clipped by LeRobot, or a browser disconnect all stop and hold, and the status line states why.
-- **EMERGENCY STOP**: available at any moment, for example when you see the arm about to hit something during execution. It stops in place at once with torque kept on and never releases; the interface then locks until you press Clear emergency stop after checking, or Release torque with the arm supported.
-- **Ctrl+C in the terminal**: the program exits and releases torque first, so the arm drops. Last resort only.
+- **EMERGENCY STOP**: available at any moment, for example when you see the arm about to hit something during execution. It stops in place at once with torque kept on and never releases; the interface then locks until you press Clear emergency stop after checking, or power off with the arm supported.
+- **Ctrl+C in the terminal**: the program exits and powers off (releases torque) first, so the arm drops. Last resort only.
 
 #### Boundaries
 - The program does not recognise obstacles or plan around them; contact detection stops after contact, it does not avoid it.
 - The Load line shows the six motor loads live; use it to tune `--contact-error-deg` and `--contact-load-pct`.
-- The program cannot be closed while torque is on; release first. A software stop is not a physical power cutoff; keep the DC switch within reach."""
+- The program cannot be closed while powered; power off first. A software stop is not a physical power cutoff; keep the DC switch within reach."""
 
 
 def run(args):
@@ -321,7 +321,8 @@ def run(args):
     reading_limits = target_limits = model_limits
     arm = None
     server = None
-    armed = False
+    powered = not args.hardware  # Model mode needs no power step; hardware starts read-only.
+    torque_uncertain = False  # A power-off that could not be confirmed on every motor.
     estopped = False
     requests: queue.Queue[Request] = queue.Queue(maxsize=64)
     stop_requested = threading.Event()
@@ -345,7 +346,7 @@ def run(args):
         # the main thread; Viser callbacks run concurrently.
         nonlocal latest_drag, latest_joints
         if kind == "quit":
-            if armed:
+            if arm and (powered or torque_uncertain):
                 kind = "quit-refused"
             else:
                 stop_requested.set()
@@ -374,10 +375,29 @@ def run(args):
         return q, opening
 
     def hold_here(current, opening):
-        """Command the present position so a stopped arm neither drifts nor drops."""
-        action = {f"{name}.pos": float(v) for name, v in zip(control.JOINTS, current)}
+        """Command a position inside the recorded travel so a stopped arm neither drifts nor drops.
+
+        Only while torque is known to be on: a Feetech servo that receives a goal with torque
+        off switches torque on by itself, which is how an emergency stop once re-energised a
+        motor that had just been released.
+        """
+        if not powered or torque_uncertain:
+            return
+        target = control.clamp_for_hold(current, reading_limits)
+        action = {f"{name}.pos": float(v) for name, v in zip(control.JOINTS, target)}
         action["gripper.pos"] = float(opening)
         arm.send_action(action)
+
+    def power_off():
+        """Release every motor and report what could not be confirmed. Returns True when all are off."""
+        nonlocal powered, torque_uncertain
+        unconfirmed = control.release_torque(arm.bus)
+        powered = False
+        torque_uncertain = bool(unconfirmed)
+        LOG.info("power off: unconfirmed=%s", unconfirmed)
+        if unconfirmed:
+            note(f"Torque not confirmed off on {unconfirmed}. Cut DC power to be sure.")
+        return not unconfirmed
 
     try:
         if args.hardware:
@@ -424,6 +444,7 @@ def run(args):
         # Arrows move along one axis, the plane handles move in two: free dragging, position only.
         gizmo = server.scene.add_transform_controls(
             "/target", position=tuple(xyz), scale=0.13, disable_rotations=True, disable_sliders=False, line_width=4.0,
+            visible=powered,
         )
 
         def joints_line(joints, gripper):
@@ -435,50 +456,56 @@ def run(args):
             return " · ".join(f"F{i + 1} {v:.1f}°" for i, v in enumerate(joints))
 
         def mode_label():
+            if torque_uncertain:
+                return copy("断电未确认 · 部分电机可能仍在出力，切断直流电源", "Power-off unconfirmed · some motors may still be driving; cut DC power")
             if estopped:
                 return copy("紧急停止 · 停在原地并保持力矩，解除后才能继续", "Emergency stop · holding in place with torque on; clear it to continue")
             if not arm:
                 return copy("模型模式 · 未连接硬件", "Model mode · no hardware")
-            return copy("实机模式 · 力矩已启用，执行会动真机", "Hardware mode · torque on, Execute moves the arm") if armed \
-                else copy("实机模式 · 力矩未启用，只读", "Hardware mode · torque off, reading only")
+            return copy("实机 · 已上电，电机锁定，执行会动真机", "Hardware · powered, motors locked, Execute moves the arm") if powered \
+                else copy("实机 · 未上电，只读回姿态", "Hardware · not powered, reading only")
 
         mode_text = server.gui.add_markdown(f"### {mode_label()}")
         server.gui.add_markdown(copy(
-            "蓝色：当前姿态，实机模式下来自电机回读。橙色：目标姿态。拖动三轴或平面手柄、或拨动关节滑杆设定目标；“计划轨迹”算出路径并让橙色走一遍；“执行运动”才真的过去。旋转视角不改变底座坐标。",
-            "Blue: current pose, read from the motors in hardware mode. Orange: goal pose. Drag the axes or plane handles, or move the joint sliders, to set a goal; Plan trajectory computes the path and runs the orange model along it; Execute is what actually moves. Camera rotation does not change the base frame.",
+            "蓝色：当前姿态，实机模式下来自电机回读。橙色：目标姿态。流程：上电 → 拖操纵柄或拨滑杆设目标 → 计划轨迹 → 执行运动 → 断电。旋转视角不改变底座坐标。",
+            "Blue: current pose, read from the motors in hardware mode. Orange: goal pose. Flow: power on → set a goal with the handle or the sliders → Plan trajectory → Execute → power off. Camera rotation does not change the base frame.",
         ))
         readout = server.gui.add_markdown("")
         load_text = server.gui.add_markdown("")
         goal_text = server.gui.add_markdown("")
-        status = server.gui.add_markdown(copy("拖动目标或拨动滑杆，先出现橙色目标。", "Drag the target or move a slider; the orange goal appears first."))
+        status = server.gui.add_markdown(copy("先上电。", "Power on first.") if arm else copy("拖动目标或拨动滑杆，先出现橙色目标。", "Drag the target or move a slider; the orange goal appears first."))
 
         def say(text):
             """Status line for the operator, also kept in the log."""
             status.content = text
             LOG.info("status: %s", text)
 
+        if arm:
+            with server.gui.add_folder(copy("1 · 上电", "1 · Power on")):
+                on_word = server.gui.add_text(copy(f"输入 {ARM_WORD}", f"Type {ARM_WORD}"), "")
+                on_button = server.gui.add_button(copy("上电（锁定电机，保持当前姿态）", "Power on (lock the motors at this pose)"),
+                                                  hint=copy("每个关节都要离活动范围两端 5° 以上；靠在止点上不许上电", "Every joint must be more than 5° from either end of its travel; power-on is refused on a stop"))
         bounds = slider_bounds(target_limits)
-        with server.gui.add_folder(copy("目标关节角 / °", "Goal joints / °")):
-            sliders = [server.gui.add_slider(label, bounds[name][0], bounds[name][1], SLIDER_STEP_DEG, slider_value(v, bounds[name]))
+        with server.gui.add_folder(copy("2 · 目标关节角 / °", "2 · Goal joints / °")):
+            sliders = [server.gui.add_slider(label, bounds[name][0], bounds[name][1], SLIDER_STEP_DEG, slider_value(v, bounds[name]), disabled=not powered)
                        for label, name, v in zip(JOINT_LABELS, control.JOINTS, current)]
-            gripper_slider = server.gui.add_slider(copy("夹爪开合 / %", "Gripper / %"), 0, 100, 1, float(opening)) if arm else None
+            gripper_slider = server.gui.add_slider(copy("夹爪开合 / %", "Gripper / %"), 0, 100, 1, float(opening), disabled=not powered) if arm else None
         plan_button = server.gui.add_button(copy("计划轨迹", "Plan trajectory"), disabled=True,
                                             hint=copy("算出从当前到目标的路径，橙色模型走一遍，实物不动", "Compute the path from the current pose to the goal; the orange model runs it, the arm does not move"))
         execute = server.gui.add_button(copy("执行运动", "Execute"), disabled=True,
-                                        hint=copy("沿计划好的轨迹过去；实机模式需先启用力矩", "Follow the planned trajectory; hardware mode requires torque on"))
+                                        hint=copy("沿计划好的轨迹过去", "Follow the planned trajectory"))
         stop = server.gui.add_button(copy("停止并保持", "Stop and hold"), disabled=True,
                                      hint=copy("停在当前位置，电机继续出力", "Hold the current position with torque on"))
-        reset = server.gui.add_button(copy("目标回到当前姿态", "Reset goal to current pose"))
-        if arm:
-            with server.gui.add_folder(copy("力矩", "Torque")):
-                arm_word = server.gui.add_text(copy(f"输入 {ARM_WORD} 再点启用", f"Type {ARM_WORD}, then enable"), "")
-                arm_button = server.gui.add_button(copy("启用力矩并保持当前姿态", "Enable torque and hold this pose"))
-                release_button = server.gui.add_button(copy("释放力矩", "Release torque"), disabled=True,
-                                                       hint=copy("先托住手臂：释放后六个电机不再出力，手臂会下落", "Support the arm first: after release the six motors stop driving and the arm drops"))
+        reset = server.gui.add_button(copy("目标回到当前姿态", "Reset goal to current pose"), disabled=not powered)
         estop_button = server.gui.add_button(copy("紧急停止", "EMERGENCY STOP"), color="red",
                                              hint=copy("任何时候可按：立刻停在原地并保持力矩，绝不卸力；之后界面锁住，检查完再解除", "Press at any moment: stops in place with torque kept on, never releases; the interface then locks until you clear it"))
         clear_estop_button = server.gui.add_button(copy("解除紧急停止", "Clear emergency stop"), disabled=True,
                                                    hint=copy("检查过手臂和周围之后再点；力矩保持不变", "Press after checking the arm and its surroundings; torque stays as it is"))
+        if arm:
+            with server.gui.add_folder(copy("3 · 断电", "3 · Power off")):
+                off_word = server.gui.add_text(copy(f"输入 {ARM_WORD}", f"Type {ARM_WORD}"), "")
+                off_button = server.gui.add_button(copy("断电（释放力矩）", "Power off (release torque)"), disabled=True,
+                                                   hint=copy("先托住手臂：断电后六个电机不再出力，手臂会下落", "Support the arm first: after power-off the six motors stop driving and the arm drops"))
         help_button = server.gui.add_button(copy("说明", "Help"), hint=copy("展开或收起完整说明", "Show or hide the full explanation"))
         quit_button = server.gui.add_button(copy("关闭程序", "Close program"))
         server.gui.add_markdown(copy("完整说明在“说明”按钮里。软件停止不是物理断电，直流电源开关要在手边。",
@@ -515,8 +542,8 @@ def run(args):
         clear_estop_button.on_click(lambda event: enqueue("clear-estop", event.client_id))
         help_button.on_click(lambda event: enqueue("help", event.client_id))
         if arm:
-            arm_button.on_click(lambda event: enqueue("arm", event.client_id, arm_word.value))
-            release_button.on_click(lambda event: enqueue("release", event.client_id))
+            on_button.on_click(lambda event: enqueue("power-on", event.client_id, on_word.value))
+            off_button.on_click(lambda event: enqueue("power-off", event.client_id, off_word.value))
         quit_button.on_click(lambda event: enqueue("quit", event.client_id))
 
         def clear_trail():
@@ -525,13 +552,18 @@ def run(args):
             trail.clear()
 
         def refresh_buttons():
-            plan_button.disabled = estopped or goal is None or phase != "idle"
-            execute.disabled = estopped or plan is None or phase != "idle" or (bool(arm) and not armed)
+            usable = powered and not estopped and not torque_uncertain
+            for slider in sliders + ([gripper_slider] if gripper_slider else []):
+                slider.disabled = not usable or phase == "executing"
+            gizmo.visible = usable and phase != "executing"
+            reset.disabled = not usable or phase != "idle"
+            plan_button.disabled = not usable or goal is None or phase != "idle"
+            execute.disabled = not usable or plan is None or phase != "idle"
             stop.disabled = phase != "executing"
             clear_estop_button.disabled = not estopped
             if arm:
-                arm_button.disabled = estopped or armed
-                release_button.disabled = not armed  # Always a way out, latched or not: support the arm first.
+                on_button.disabled = powered or torque_uncertain or estopped
+                off_button.disabled = not (powered or torque_uncertain)
             mode_text.content = f"### {mode_label()}"
 
         def set_goal(goal_q, opening_goal):
@@ -576,7 +608,7 @@ def run(args):
 
         def abort_and_hold(reason):
             nonlocal phase, last_command, plan
-            if arm and armed:
+            if arm:
                 try:
                     hold_here(current, opening)
                 except (ConnectionError, RuntimeError, OSError) as exc:
@@ -585,7 +617,6 @@ def run(args):
             last_command = None
             plan = None
             clear_trail()
-            gizmo.visible = True
             refresh_buttons()
             say(f"{copy('已停止并保持', 'Stopped and holding')}: {reason}")
             note(f"STOP-HOLD: {reason}")
@@ -593,7 +624,7 @@ def run(args):
         def emergency_stop():
             """Freeze in place with torque kept on, then latch. Releasing torque here would drop the arm."""
             nonlocal phase, last_command, estopped, plan
-            if arm and armed:
+            if arm:
                 try:
                     hold_here(current, opening)
                 except (ConnectionError, RuntimeError, OSError) as exc:
@@ -603,10 +634,9 @@ def run(args):
             plan = None
             estopped = True
             clear_trail()
-            gizmo.visible = True
             refresh_buttons()
-            say(copy("紧急停止：已停在原地并保持力矩。检查手臂和周围，然后点“解除紧急停止”继续，或托住手臂后“释放力矩”。",
-                                  "EMERGENCY STOP: holding in place with torque on. Check the arm and its surroundings, then press Clear emergency stop to continue, or Release torque with the arm supported."))
+            say(copy("紧急停止：已停在原地并保持力矩。检查手臂和周围，然后点“解除紧急停止”继续，或托住手臂后断电。",
+                     "EMERGENCY STOP: holding in place with torque on. Check the arm and its surroundings, then press Clear emergency stop to continue, or power off with the arm supported."))
             note("EMERGENCY STOP: holding in place; torque unchanged.")
 
         def clear_emergency_stop():
@@ -627,7 +657,7 @@ def run(args):
                 owner = None  # The next page to connect, a refresh included, takes over.
                 if phase == "executing":
                     abort_and_hold(copy("浏览器断开", "browser disconnected"))
-                note("Controlling browser disconnected; the next page to connect takes control. Ctrl+C releases torque and exits.")
+                note("Controlling browser disconnected; the next page to connect takes control. Ctrl+C powers off and exits.")
             if arm:
                 try:
                     current, opening = read_pose()
@@ -652,7 +682,7 @@ def run(args):
                 loads = [load_percent(raw_loads[name]) for name in control.JOINTS]
                 if phase != "executing" and tick - last_heartbeat >= HEARTBEAT_SECONDS:
                     last_heartbeat = tick
-                    LOG.debug("pose=%s gripper=%.1f loads=%s phase=%s armed=%s", np.round(current, 2).tolist(), opening, [round(v) for v in loads], phase, armed)
+                    LOG.debug("pose=%s gripper=%.1f loads=%s phase=%s powered=%s", np.round(current, 2).tolist(), opening, [round(v) for v in loads], phase, powered)
                 load_text.content = f"**{copy('负载', 'Load')} / %**: " + " · ".join(f"F{i + 1} {v:.0f}" for i, v in enumerate(loads)) + f" · {copy('夹爪', 'gripper')} {load_percent(raw_loads['gripper']):.0f}"
             actual_model.update_cfg(np.array(viewer_configuration(names, current)))
             xyz = kinematics.forward_kinematics(current)[:3, 3].copy()
@@ -669,13 +699,13 @@ def run(args):
                 latest_drag = latest_joints = None
             batch.sort(key=lambda r: (r.kind != "estop", r.created))  # An emergency stop goes first.
             for request in batch:
-                LOG.debug("request %s client=%s payload=%s phase=%s armed=%s", request.kind, request.client_id,
-                          np.round(request.payload, 3).tolist() if isinstance(request.payload, tuple) and request.payload else request.payload, phase, armed)
+                LOG.debug("request %s client=%s payload=%s phase=%s powered=%s", request.kind, request.client_id,
+                          np.round(request.payload, 3).tolist() if isinstance(request.payload, tuple) and request.payload else request.payload, phase, powered)
                 if request.kind == "connected":
                     if owner is None:
                         owner = request.client_id
                         LOG.info("owner -> client %s", owner)
-                        say(copy("这个页面已接管控制。", "This page is now in control."))
+                        say(copy("这个页面已接管控制。", "This page is now in control.") + ("" if powered else copy(" 先上电。", " Power on first.")))
                     else:
                         note("A second browser connected; only the first one is in control.")
                     continue
@@ -696,19 +726,71 @@ def run(args):
                     continue
                 try:
                     if request.kind == "quit-refused":
-                        say(copy("力矩还开着：先托住手臂，点“释放力矩”，再关闭程序。", "Torque is still on: support the arm, press Release torque, then close the program."))
+                        say(copy("还没断电：先托住手臂，在“断电”栏输入 ENABLE 并断电，再关闭程序。", "Not powered off yet: support the arm, type ENABLE in the Power off panel and power off, then close the program."))
                         continue
                     if request.kind == "stop":
                         if phase == "executing":
                             abort_and_hold(copy("操作者按下停止", "operator pressed Stop"))
                         continue
+                    if request.kind == "power-off":
+                        if len(server.get_clients()) > 1:
+                            raise ValueError(copy("有第二个浏览器页面连着，关掉它再断电", "A second browser page is connected; close it before powering off"))
+                        check_request(request, owner, time.monotonic(), server.get_clients())
+                        if not arming_requested(str(request.payload)):
+                            raise ValueError(copy(f"先在“断电”栏输入 {ARM_WORD}", f"Type {ARM_WORD} in the Power off panel first"))
+                        if phase == "executing":
+                            abort_and_hold(copy("断电前先停止", "stopped before power-off"))
+                        off_word.value = ""
+                        LOG.info("power off requested at pose %s", np.round(current, 2).tolist())
+                        drop_goal()
+                        if power_off():
+                            say(copy("已断电，六个电机不再出力，手臂可以用手搬动。", "Powered off; the six motors no longer drive and the arm can be moved by hand."))
+                        else:
+                            say(copy("断电未确认：部分电机没有干净地回应，可能仍在出力。切断直流电源，再重开程序。", "Power-off unconfirmed: some motors did not answer cleanly and may still be driving. Cut DC power, then restart the program."))
+                        refresh_buttons()
+                        continue
                     if phase == "executing":
                         say(copy("执行中：先按“停止并保持”。", "Executing: press Stop and hold first."))
+                        continue
+                    if request.kind == "power-on":
+                        if len(server.get_clients()) > 1:
+                            raise ValueError(copy("有第二个浏览器页面连着，关掉它再上电", "A second browser page is connected; close it before powering on"))
+                        check_request(request, owner, time.monotonic(), server.get_clients())
+                        if estopped:
+                            raise ValueError(copy("紧急停止未解除", "Emergency stop is latched; clear it first"))
+                        if torque_uncertain:
+                            raise ValueError(copy("上次断电未确认，切断直流电源后重开程序", "The last power-off was not confirmed; cut DC power and restart the program"))
+                        if not arming_requested(str(request.payload)):
+                            raise ValueError(copy(f"先在“上电”栏输入 {ARM_WORD}", f"Type {ARM_WORD} in the Power on panel first"))
+                        blockers = control.joints_on_a_stop(current, reading_limits)
+                        if blockers:
+                            name, value, (low_end, high_end) = blockers[0]
+                            joint = f"F{control.JOINTS.index(name) + 1}"
+                            raise ValueError(copy(f"{joint} 靠在止点上（{value:.1f}°，活动范围 {low_end:.1f}° 到 {high_end:.1f}°）。先用手把手臂托到中间姿态，每个关节都离两端 5° 以上，再上电",
+                                                  f"{joint} rests on a stop ({value:.1f}°, travel {low_end:.1f}° to {high_end:.1f}°). Support the arm in a mid pose, every joint more than 5° from either end, then power on"))
+                        from lerobot.motors.feetech import OperatingMode
+                        LOG.info("power on: pose %s", np.round(current, 2).tolist())
+                        control.configure_and_hold(arm, OperatingMode.POSITION.value)
+                        powered = True
+                        on_word.value = ""
+                        LOG.info("powered; torque on")
+                        drop_goal()
+                        gizmo.position = tuple(xyz)
+                        for slider, name, value in zip(sliders, control.JOINTS, current):
+                            slider.value = slider_value(value, bounds[name])
+                        gripper_slider.value = float(round(opening))
+                        refresh_buttons()
+                        say(copy("已上电，电机锁定在当前姿态。可以松手，断电开关放在手边。现在拖操纵柄或拨滑杆设目标。", "Powered on; the motors hold this pose. You may let go; keep the DC switch within reach. Now set a goal with the handle or the sliders."))
+                        continue
+                    if not powered or torque_uncertain:
+                        if request.kind in ("drag", "joints", "reset", "plan", "execute"):
+                            say(copy("先上电。", "Power on first.") if not torque_uncertain else copy("断电未确认，切断直流电源后重开程序。", "Power-off unconfirmed; cut DC power and restart the program."))
                         continue
                     if request.kind in ("drag", "joints", "reset"):
                         if phase == "planning":
                             phase = "idle"
                         if request.kind == "drag":
+                            control.lock_wrist_roll(kinematics, current[4])  # Position-only IK must not spin the roll axis.
                             seed = ik_seed(current, goal[0] if goal is not None else None, target_limits)
                             try:
                                 goal_q, _, error = control.solve_position(kinematics, seed, np.asarray(request.payload, dtype=float), target_limits)
@@ -736,9 +818,9 @@ def run(args):
                             say(copy("目标已回到当前姿态。", "Goal reset to the current pose."))
                     elif request.kind == "plan":
                         if estopped:
-                            raise ValueError("Emergency stop is latched; clear it first")
+                            raise ValueError(copy("紧急停止未解除", "Emergency stop is latched; clear it first"))
                         if goal is None:
-                            raise ValueError("No goal; drag the target or move a slider first")
+                            raise ValueError(copy("还没有目标：先拖操纵柄或拨滑杆", "No goal; drag the target or move a slider first"))
                         plan = make_plan()
                         phase, step = "planning", 0
                         refresh_buttons()
@@ -748,47 +830,22 @@ def run(args):
                             raise ValueError(copy("有第二个浏览器页面连着，关掉它再执行", "A second browser page is connected; close it before executing"))
                         check_request(request, owner, time.monotonic(), server.get_clients())
                         if estopped:
-                            raise ValueError("Emergency stop is latched; clear it first")
+                            raise ValueError(copy("紧急停止未解除", "Emergency stop is latched; clear it first"))
                         if plan is None:
-                            raise ValueError("No plan; press Plan trajectory first")
-                        if arm and not armed:
-                            raise ValueError("Torque is off; enable and hold first")
+                            raise ValueError(copy("还没有计划：先点“计划轨迹”", "No plan; press Plan trajectory first"))
                         if lag(current, plan.start) > REPLAN_TOLERANCE_DEG:
                             plan = None
                             refresh_buttons()
-                            raise ValueError("The arm moved since planning; plan again")
+                            raise ValueError(copy("计划之后手臂动过了，重新计划", "The arm moved since planning; plan again"))
                         phase, step, settle_ticks, comm_failures = "executing", 0, 0, 0
                         last_command = tuple(plan.start)
                         LOG.info("execute begins hardware=%s", bool(arm))
-                        gizmo.visible = False
                         refresh_buttons()
                         say(copy("执行中……", "Executing…"))
-                    elif request.kind == "arm":
-                        if len(server.get_clients()) > 1:
-                            raise ValueError(copy("有第二个浏览器页面连着，关掉它再启用", "A second browser page is connected; close it before enabling torque"))
-                        check_request(request, owner, time.monotonic(), server.get_clients())
-                        if estopped:
-                            raise ValueError("Emergency stop is latched; clear it first")
-                        if not arming_requested(str(request.payload)):
-                            raise ValueError(f"Type {ARM_WORD} in the text box first")
-                        from lerobot.motors.feetech import OperatingMode
-                        LOG.info("arming: pose %s", np.round(current, 2).tolist())
-                        control.configure_and_hold(arm, OperatingMode.POSITION.value)
-                        armed = True
-                        LOG.info("armed; torque on")
-                        arm_word.value = ""
-                        refresh_buttons()
-                        say(copy("力矩已启用，手臂保持当前姿态。可以松手，但断电开关要在手边。", "Torque on; the arm holds this pose. You may let go, but keep the power cutoff within reach."))
-                    elif request.kind == "release":
-                        arm.bus.disable_torque()
-                        armed = False
-                        LOG.info("torque released by operator")
-                        refresh_buttons()
-                        say(copy("力矩已释放，手臂现在可以用手搬动。", "Torque released; the arm can be moved by hand."))
                 except (ValueError, RuntimeError) as exc:
                     LOG.warning("request %s rejected: %s", request.kind, exc)
-                    if request.kind == "arm" and not armed:
-                        say(f"{copy('未启用', 'Not enabled')}: {exc}")
+                    if request.kind == "power-on":
+                        say(f"{copy('未上电', 'Not powered on')}: {exc}")
                     elif request.kind == "joints":
                         drop_goal()
                         say(copy(f"目标不可用：{exc}", f"Goal unavailable: {exc}"))
@@ -802,7 +859,7 @@ def run(args):
                 step = min(step + 1, steps)
                 fraction = eased(step / steps)
                 waypoint = interpolation(plan.start, plan.goal, fraction)
-                control.validate_joints(waypoint, reading_limits)  # The start may sit on a stop outside the model.
+                control.validate_joints(waypoint, reading_limits)
                 if phase == "planning":
                     ghost_model.update_cfg(np.array(viewer_configuration(names, waypoint)))
                     if step >= steps:
@@ -842,7 +899,6 @@ def run(args):
                         settle_ticks += 1
                         if state != "wait":
                             phase, last_command, plan = "idle", None, None
-                            gizmo.visible = True
                             clear_trail()
                             refresh_buttons()
                             say(copy("已到达目标并保持。", "Goal reached and holding.") if state == "done" else
@@ -851,19 +907,20 @@ def run(args):
                     current = np.array(waypoint)
                     if step >= steps:
                         phase, plan = "idle", None
-                        gizmo.visible = True
                         clear_trail()
                         refresh_buttons()
                         say(copy("模型已到达目标。", "The model reached the goal."))
             time.sleep(max(0.0, UPDATE_SECONDS - (time.monotonic() - tick)))
     finally:
-        LOG.info("shutting down: armed=%s phase=%s estopped=%s", armed, phase, estopped)
+        LOG.info("shutting down: powered=%s uncertain=%s phase=%s estopped=%s", powered, torque_uncertain, phase, estopped)
         try:
             if arm and arm.bus.is_connected:
-                if armed:
-                    note("Releasing torque; support the arm.")
+                if powered or torque_uncertain:
+                    note("Powering off (releasing torque); support the arm.")
                     try:
-                        arm.bus.disable_torque()
+                        unconfirmed = control.release_torque(arm.bus)
+                        if unconfirmed:
+                            note(f"Torque not confirmed off on {unconfirmed}. Cut DC power to be sure.")
                     except Exception as exc:  # noqa: BLE001 - report, then still disconnect
                         note(f"Torque release failed ({exc}); the motors may still be holding. Cut DC power to release.")
                 arm.bus.disconnect(disable_torque=False)

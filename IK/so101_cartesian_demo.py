@@ -34,6 +34,14 @@ STEP_MM = 2.0
 # shoulder_lift minimum with torque on. The margin still catches a wrong calibration file,
 # which is tens of degrees off, without refusing an honest rest pose.
 LIMIT_MARGIN_DEG = 5.0
+# Power-on is refused while any joint rests this close to the end of its recorded travel.
+# 2026-09-08 incident: torque enabled with shoulder_lift and wrist_flex on their stops drove
+# both at 100 % load into the stops within a second and tripped the servos' overload
+# protection (output cut to 20 %, error bit set on every acknowledged write afterwards).
+POWER_ON_MARGIN_DEG = 5.0
+# Hold and goal commands never point at the very end of the recorded travel.
+HOLD_MARGIN_DEG = 2.0
+WRIST_ROLL_LOCK_WEIGHT = 1.0  # Soft joints task: position-only IK must not drift the roll axis.
 MAX_JOINT_STEP_DEG = 2.0
 SESSION_JOINT_ENVELOPE_DEG = 8.0
 SESSION_XYZ_ENVELOPE_MM = 20.0
@@ -99,6 +107,69 @@ def load_kinematics(directory):
         limits[name] = tuple(math.degrees(float(limit.attrib[key])) for key in ("lower", "upper"))
     from lerobot.model.kinematics import RobotKinematics
     return RobotKinematics(str(path), "gripper_frame_link", list(JOINTS)), limits
+
+
+def joints_on_a_stop(joints, reading_limits, margin=POWER_ON_MARGIN_DEG):
+    """Joints closer than margin to either end of the recorded travel: torque must not be enabled there."""
+    blockers = []
+    for name, value in zip(JOINTS, joints):
+        low, high = reading_limits[name]
+        # reading_limits already carry LIMIT_MARGIN_DEG outwards; measure from the recorded ends themselves.
+        low_end, high_end = low + LIMIT_MARGIN_DEG, high - LIMIT_MARGIN_DEG
+        if float(value) < low_end + margin or float(value) > high_end - margin:
+            blockers.append((name, float(value), (low_end, high_end)))
+    return blockers
+
+
+def clamp_for_hold(joints, reading_limits, margin=HOLD_MARGIN_DEG):
+    """A hold target inside the recorded travel, never on its ends."""
+    out = []
+    for name, value in zip(JOINTS, joints):
+        low, high = reading_limits[name]
+        low_end, high_end = low + LIMIT_MARGIN_DEG, high - LIMIT_MARGIN_DEG
+        out.append(float(min(max(float(value), low_end + margin), high_end - margin)))
+    return out
+
+
+def lock_wrist_roll(kinematics, degrees):
+    """Keep wrist_roll at the arm's present angle while solving position-only IK.
+
+    The gripper position barely depends on the roll axis, so without this the solver is free
+    to walk it towards a limit: a dragged goal once planned a 155-degree roll.
+    """
+    task = getattr(kinematics, "_wrist_roll_task", None)
+    if task is None:
+        task = kinematics.solver.add_joints_task()
+        task.configure("wrist_roll_lock", "soft", WRIST_ROLL_LOCK_WEIGHT)
+        kinematics._wrist_roll_task = task
+    task.set_joints({"wrist_roll": math.radians(float(degrees))})
+
+
+def release_torque(bus):
+    """Switch torque off on every motor, tolerating motors that answer with an error status.
+
+    A servo in overload protection acknowledges writes with its error bit set, which the bus
+    layer reports as a failure even though the register took the value. Write each motor on
+    its own, then broadcast, then read back. Returns the motors that could not be confirmed off.
+    """
+    problems = {}
+    for name in bus.motors:
+        try:
+            bus.write("Torque_Enable", name, 0, normalize=False, num_retry=2)
+        except Exception as exc:  # noqa: BLE001 - keep going: the next motor must still be released
+            problems[name] = f"write: {exc}"
+    try:
+        bus.sync_write("Torque_Enable", {name: 0 for name in bus.motors}, normalize=False)
+    except Exception as exc:  # noqa: BLE001
+        problems["broadcast"] = str(exc)
+    unconfirmed = {}
+    for name in bus.motors:
+        try:
+            if bus.read("Torque_Enable", name, normalize=False, num_retry=2) != 0:
+                unconfirmed[name] = "torque bit still set"
+        except Exception as exc:  # noqa: BLE001
+            unconfirmed[name] = f"no clean answer ({exc})"
+    return unconfirmed
 
 
 def validate_joints(joints, limits):
@@ -279,7 +350,9 @@ def jog(args):
         # torque release; only the operator can physically cut the DC supply.
         if arm.bus.is_connected:
             try:
-                arm.bus.disable_torque()
+                unconfirmed = release_torque(arm.bus)
+                if unconfirmed:
+                    print(f"Torque not confirmed off on {unconfirmed}; cut DC power.", file=sys.stderr)
             finally:
                 arm.bus.disconnect(disable_torque=False)
 
