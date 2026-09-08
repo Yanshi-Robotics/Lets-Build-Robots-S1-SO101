@@ -9,6 +9,7 @@ import ast
 import importlib.util
 import math
 import sys
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -236,6 +237,23 @@ class VisualControlTests(unittest.TestCase):
         self.assertLess(demo.LIMIT_MARGIN_DEG, 15.0)  # still small next to a wrong-file mismatch
         source = Path(visual.__file__).read_text()
         self.assertIn("except ValueError as exc:", source)  # an out-of-range reading stops and holds, it never exits
+
+    def test_debug_log_is_written_and_old_logs_are_pruned(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            for _ in range(4):
+                path = visual.start_log(SimpleNamespace(model_dir="m", web_port=4602, locale="cn", hardware=False), directory=tmp, keep=3)
+                visual.LOG.info("probe line")
+                time.sleep(1.05)  # distinct timestamps in the file names
+            logs = sorted(Path(tmp).glob("so101_visual_control_*.log"))
+            self.assertEqual(len(logs), 3)
+            self.assertEqual(logs[-1], path)
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("args {", text)
+            self.assertIn("lerobot", text)
+            self.assertIn("probe line", text)
+            for handler in list(visual.LOG.handlers):
+                visual.LOG.removeHandler(handler); handler.close()
 
     def test_arming_needs_the_exact_word(self):
         self.assertTrue(visual.arming_requested(" ENABLE "))

@@ -14,6 +14,7 @@ arm and keeps the DC cutoff within reach. Keep so101_cartesian_demo.py in the sa
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 import os
 import queue
@@ -58,6 +59,11 @@ PREVIEW_GRIPPER_RAD = 0.0  # Geometry reference only: not mapped from LeRobot pe
 CURRENT_COLOR = (0.18, 0.48, 0.72, 1.0)
 TARGET_COLOR = (1.0, 0.61, 0.12, 0.35)
 JOINT_LABELS = ("F1 shoulder_pan", "F2 shoulder_lift", "F3 elbow_flex", "F4 wrist_flex", "F5 wrist_roll")
+# Every run writes one debug log next to the program; the folder is git-ignored and pruned.
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+LOG_KEEP = 20
+HEARTBEAT_SECONDS = 1.0  # Idle hardware telemetry rate in the log; execution logs every cycle.
+LOG = logging.getLogger("so101_visual_control")
 
 
 @dataclass(frozen=True)
@@ -218,6 +224,27 @@ def validate_web_port(port):
         probe.bind((LOOPBACK, port))
 
 
+def start_log(args, directory=LOG_DIR, keep=LOG_KEEP):
+    """Open this run's debug log, prune old ones, record the configuration. Returns the log path."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"so101_visual_control_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    for handler in list(LOG.handlers):
+        LOG.removeHandler(handler)
+        handler.close()
+    handler = logging.FileHandler(path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)s %(message)s", "%H:%M:%S"))
+    LOG.addHandler(handler)
+    LOG.setLevel(logging.DEBUG)
+    LOG.propagate = False
+    for old in sorted(directory.glob("so101_visual_control_*.log"))[:-keep]:
+        old.unlink()
+    LOG.info("start %s", " ".join(sys.argv))
+    LOG.info("args %s", vars(args))
+    LOG.info("python %s lerobot %s viser %s", sys.version.split()[0], version("lerobot"), version("viser"))
+    return path
+
+
 def help_markdown(zh, args):
     e, l = f"{args.contact_error_deg:g}", f"{args.contact_load_pct:g}"
     if zh:
@@ -279,9 +306,18 @@ def run(args):
 
     if version("viser") != VISER_VERSION:
         raise RuntimeError(f"Use viser[urdf]=={VISER_VERSION}")
+    log_path = start_log(args)
+    print(f"Log: {log_path}")
+
+    def note(message):
+        """Operator-facing terminal line, also kept in the log."""
+        print(message, file=sys.stderr)
+        LOG.warning(message)
+
     zh = args.locale == "cn"
     copy = lambda chinese, english: chinese if zh else english
     kinematics, model_limits = control.load_kinematics(args.model_dir)
+    LOG.info("model limits deg %s", {k: (round(a, 2), round(b, 2)) for k, (a, b) in model_limits.items()})
     reading_limits = target_limits = model_limits
     arm = None
     server = None
@@ -359,7 +395,11 @@ def run(args):
                 raise RuntimeError("Torque already enabled; cut power and investigate")
             reading_limits = control.calibrated_limits(arm)
             target_limits = intersect_limits(model_limits, reading_limits)
+            LOG.info("calibration %s", {name: (c.range_min, c.range_max, c.homing_offset) for name, c in arm.calibration.items()})
+            LOG.info("reading limits deg %s", {k: (round(a, 2), round(b, 2)) for k, (a, b) in reading_limits.items()})
+            LOG.info("target limits deg %s", {k: (round(a, 2), round(b, 2)) for k, (a, b) in target_limits.items()})
             current, opening = read_pose()
+            LOG.info("initial pose deg %s gripper %.1f%%", np.round(current, 2).tolist(), opening)
         else:
             current = np.array(control.PREVIEW_JOINTS_DEG, dtype=float)
             opening = None
@@ -411,6 +451,12 @@ def run(args):
         load_text = server.gui.add_markdown("")
         goal_text = server.gui.add_markdown("")
         status = server.gui.add_markdown(copy("拖动目标或拨动滑杆，先出现橙色目标。", "Drag the target or move a slider; the orange goal appears first."))
+
+        def say(text):
+            """Status line for the operator, also kept in the log."""
+            status.content = text
+            LOG.info("status: %s", text)
+
         bounds = slider_bounds(target_limits)
         with server.gui.add_folder(copy("目标关节角 / °", "Goal joints / °")):
             sliders = [server.gui.add_slider(label, bounds[name][0], bounds[name][1], SLIDER_STEP_DEG, slider_value(v, bounds[name]))
@@ -493,6 +539,7 @@ def run(args):
             control.validate_joints(goal_q, target_limits)
             goal_xyz = kinematics.forward_kinematics(np.array(goal_q))[:3, 3]
             goal = (tuple(map(float, goal_q)), None if opening is None else float(opening_goal), tuple(map(float, goal_xyz)))
+            LOG.info("goal joints=%s gripper=%s xyz_mm=%s", np.round(goal[0], 2).tolist(), goal[1], np.round(np.array(goal[2]) * 1000, 1).tolist())
             plan = None  # A new goal makes any earlier plan stale.
             clear_trail()
             ghost_root.visible = True
@@ -522,6 +569,8 @@ def run(args):
                 trail.append(server.scene.add_spline_catmull_rom("/trail/path", path, color=TRAIL_COLOR, thickness=0.004))
                 trail.append(server.scene.add_point_cloud("/trail/waypoints", path[::6], np.tile(TRAIL_COLOR, (len(path[::6]), 1)),
                                                          point_size=0.008, point_shape="circle"))
+            LOG.info("plan start=%s goal=%s gripper %s->%s duration=%.2fs", np.round(current, 2).tolist(), np.round(goal_q, 2).tolist(),
+                     None if opening is None else round(float(opening), 1), None if opening is None else round(float(opening_goal), 1), duration)
             return Plan(tuple(map(float, current)), goal_q, None if opening is None else float(opening),
                         None if opening is None else float(opening_goal), goal_xyz, duration)
 
@@ -531,15 +580,15 @@ def run(args):
                 try:
                     hold_here(current, opening)
                 except (ConnectionError, RuntimeError, OSError) as exc:
-                    print(f"hold command failed ({exc}); the servos keep their last goal", file=sys.stderr)
+                    note(f"hold command failed ({exc}); the servos keep their last goal")
             phase = "idle"
             last_command = None
             plan = None
             clear_trail()
             gizmo.visible = True
             refresh_buttons()
-            status.content = f"{copy('已停止并保持', 'Stopped and holding')}: {reason}"
-            print(f"STOP-HOLD: {reason}", file=sys.stderr)
+            say(f"{copy('已停止并保持', 'Stopped and holding')}: {reason}")
+            note(f"STOP-HOLD: {reason}")
 
         def emergency_stop():
             """Freeze in place with torque kept on, then latch. Releasing torque here would drop the arm."""
@@ -548,7 +597,7 @@ def run(args):
                 try:
                     hold_here(current, opening)
                 except (ConnectionError, RuntimeError, OSError) as exc:
-                    print(f"hold command failed ({exc}); the servos keep their last goal", file=sys.stderr)
+                    note(f"hold command failed ({exc}); the servos keep their last goal")
             phase = "idle"
             last_command = None
             plan = None
@@ -556,17 +605,19 @@ def run(args):
             clear_trail()
             gizmo.visible = True
             refresh_buttons()
-            status.content = copy("紧急停止：已停在原地并保持力矩。检查手臂和周围，然后点“解除紧急停止”继续，或托住手臂后“释放力矩”。",
-                                  "EMERGENCY STOP: holding in place with torque on. Check the arm and its surroundings, then press Clear emergency stop to continue, or Release torque with the arm supported.")
-            print("EMERGENCY STOP: holding in place; torque unchanged.", file=sys.stderr)
+            say(copy("紧急停止：已停在原地并保持力矩。检查手臂和周围，然后点“解除紧急停止”继续，或托住手臂后“释放力矩”。",
+                                  "EMERGENCY STOP: holding in place with torque on. Check the arm and its surroundings, then press Clear emergency stop to continue, or Release torque with the arm supported."))
+            note("EMERGENCY STOP: holding in place; torque unchanged.")
 
         def clear_emergency_stop():
             nonlocal estopped
             estopped = False
             refresh_buttons()
-            status.content = copy("紧急停止已解除。目标和计划需要重新给。", "Emergency stop cleared. Set the goal and plan again.")
+            say(copy("紧急停止已解除。目标和计划需要重新给。", "Emergency stop cleared. Set the goal and plan again."))
 
         print(f"Open http://{LOOPBACK}:{args.web_port}; mode={mode_label()}")
+        LOG.info("serving http://%s:%d mode=%s", LOOPBACK, args.web_port, mode_label())
+        last_heartbeat = 0.0
         while True:
             tick = time.monotonic()
             if stop_requested.is_set():
@@ -576,7 +627,7 @@ def run(args):
                 owner = None  # The next page to connect, a refresh included, takes over.
                 if phase == "executing":
                     abort_and_hold(copy("浏览器断开", "browser disconnected"))
-                print("Controlling browser disconnected; the next page to connect takes control. Ctrl+C releases torque and exits.", file=sys.stderr)
+                note("Controlling browser disconnected; the next page to connect takes control. Ctrl+C releases torque and exits.")
             if arm:
                 try:
                     current, opening = read_pose()
@@ -587,18 +638,21 @@ def run(args):
                     # would release torque and drop the arm. Stop, hold, report, keep the last good pose.
                     if phase == "executing":
                         abort_and_hold(copy("读数超出校准范围", "reading outside the calibrated range"))
-                    status.content = copy(f"读数超出校准范围：{exc}。反复出现就检查标定文件是否属于这只臂。", f"Reading outside the calibrated range: {exc}. If it persists, check that the calibration file belongs to this arm.")
+                    say(copy(f"读数超出校准范围：{exc}。反复出现就检查标定文件是否属于这只臂。", f"Reading outside the calibrated range: {exc}. If it persists, check that the calibration file belongs to this arm."))
                     time.sleep(UPDATE_SECONDS)
                     continue
                 except (ConnectionError, RuntimeError, OSError) as exc:
                     read_failures += 1
-                    print(f"bus read failed ({read_failures}): {exc}", file=sys.stderr)
+                    note(f"bus read failed ({read_failures}): {exc}")
                     if phase == "executing" and read_failures >= COMM_FAILURE_LIMIT:
                         abort_and_hold(copy("总线通信连续失败", "bus communication failed repeatedly"))
-                    status.content = copy(f"总线读取失败 {read_failures} 次，正在重试；电机仍保持上一个目标。", f"Bus read failed {read_failures} times, retrying; the motors still hold their last target.")
+                    say(copy(f"总线读取失败 {read_failures} 次，正在重试；电机仍保持上一个目标。", f"Bus read failed {read_failures} times, retrying; the motors still hold their last target."))
                     time.sleep(UPDATE_SECONDS)
                     continue
                 loads = [load_percent(raw_loads[name]) for name in control.JOINTS]
+                if phase != "executing" and tick - last_heartbeat >= HEARTBEAT_SECONDS:
+                    last_heartbeat = tick
+                    LOG.debug("pose=%s gripper=%.1f loads=%s phase=%s armed=%s", np.round(current, 2).tolist(), opening, [round(v) for v in loads], phase, armed)
                 load_text.content = f"**{copy('负载', 'Load')} / %**: " + " · ".join(f"F{i + 1} {v:.0f}" for i, v in enumerate(loads)) + f" · {copy('夹爪', 'gripper')} {load_percent(raw_loads['gripper']):.0f}"
             actual_model.update_cfg(np.array(viewer_configuration(names, current)))
             xyz = kinematics.forward_kinematics(current)[:3, 3].copy()
@@ -615,12 +669,15 @@ def run(args):
                 latest_drag = latest_joints = None
             batch.sort(key=lambda r: (r.kind != "estop", r.created))  # An emergency stop goes first.
             for request in batch:
+                LOG.debug("request %s client=%s payload=%s phase=%s armed=%s", request.kind, request.client_id,
+                          np.round(request.payload, 3).tolist() if isinstance(request.payload, tuple) and request.payload else request.payload, phase, armed)
                 if request.kind == "connected":
                     if owner is None:
                         owner = request.client_id
-                        status.content = copy("这个页面已接管控制。", "This page is now in control.")
+                        LOG.info("owner -> client %s", owner)
+                        say(copy("这个页面已接管控制。", "This page is now in control."))
                     else:
-                        print("A second browser connected; only the first one is in control.", file=sys.stderr)
+                        note("A second browser connected; only the first one is in control.")
                     continue
                 if request.kind == "estop":
                     emergency_stop()
@@ -628,7 +685,7 @@ def run(args):
                 if request.client_id is not None and owner is None:
                     owner = request.client_id  # Input arrived before the connect notice was processed.
                 if request.client_id is not None and request.client_id != owner:
-                    status.content = copy("输入被忽略：另一个浏览器页面先连上了。关掉那个页面，或刷新本页接管。", "Input ignored: another browser page connected first. Close that page, or refresh this one to take over.")
+                    say(copy("输入被忽略：另一个浏览器页面先连上了。关掉那个页面，或刷新本页接管。", "Input ignored: another browser page connected first. Close that page, or refresh this one to take over."))
                     continue
                 if request.kind == "help":
                     help_text.visible = not help_text.visible
@@ -639,14 +696,14 @@ def run(args):
                     continue
                 try:
                     if request.kind == "quit-refused":
-                        status.content = copy("力矩还开着：先托住手臂，点“释放力矩”，再关闭程序。", "Torque is still on: support the arm, press Release torque, then close the program.")
+                        say(copy("力矩还开着：先托住手臂，点“释放力矩”，再关闭程序。", "Torque is still on: support the arm, press Release torque, then close the program."))
                         continue
                     if request.kind == "stop":
                         if phase == "executing":
                             abort_and_hold(copy("操作者按下停止", "operator pressed Stop"))
                         continue
                     if phase == "executing":
-                        status.content = copy("执行中：先按“停止并保持”。", "Executing: press Stop and hold first.")
+                        say(copy("执行中：先按“停止并保持”。", "Executing: press Stop and hold first."))
                         continue
                     if request.kind in ("drag", "joints", "reset"):
                         if phase == "planning":
@@ -658,17 +715,17 @@ def run(args):
                             except ValueError:
                                 # Out of reach or outside the joint range: keep the last reachable goal and snap back.
                                 gizmo.position = goal[2] if goal is not None else tuple(xyz)
-                                status.content = copy("够不到或超出关节范围，操纵柄退回上一个可达位置。", "Out of reach or outside the joint range; the handle snapped back to the last reachable position.")
+                                say(copy("够不到或超出关节范围，操纵柄退回上一个可达位置。", "Out of reach or outside the joint range; the handle snapped back to the last reachable position."))
                                 continue
                             set_goal(goal_q, gripper_slider.value if gripper_slider else None)
-                            status.content = copy(f"目标已设定，模型误差 {error:.3f} mm。点“计划轨迹”。", f"Goal set, model residual {error:.3f} mm. Press Plan trajectory.")
+                            say(copy(f"目标已设定，模型误差 {error:.3f} mm。点“计划轨迹”。", f"Goal set, model residual {error:.3f} mm. Press Plan trajectory."))
                         elif request.kind == "joints":
                             goal_q = np.asarray(request.payload[:5], dtype=float)
                             opening_goal = float(request.payload[5]) if len(request.payload) > 5 else None
                             if goal is not None and lag(goal_q, goal[0]) < SLIDER_STEP_DEG / 2 and (opening_goal is None or abs(opening_goal - goal[1]) < 0.5):
                                 continue  # Echo of a slider we just synchronised.
                             set_goal(goal_q, opening_goal)
-                            status.content = copy("目标来自滑杆。点“计划轨迹”。", "Goal set from the sliders. Press Plan trajectory.")
+                            say(copy("目标来自滑杆。点“计划轨迹”。", "Goal set from the sliders. Press Plan trajectory."))
                         else:
                             drop_goal()
                             gizmo.position = tuple(xyz)
@@ -676,7 +733,7 @@ def run(args):
                                 slider.value = slider_value(value, bounds[name])
                             if gripper_slider:
                                 gripper_slider.value = float(round(opening))
-                            status.content = copy("目标已回到当前姿态。", "Goal reset to the current pose.")
+                            say(copy("目标已回到当前姿态。", "Goal reset to the current pose."))
                     elif request.kind == "plan":
                         if estopped:
                             raise ValueError("Emergency stop is latched; clear it first")
@@ -685,7 +742,7 @@ def run(args):
                         plan = make_plan()
                         phase, step = "planning", 0
                         refresh_buttons()
-                        status.content = copy(f"已计划，橙色模型正在走这条路；真正执行约需 {plan.duration:.1f} s。满意就点“执行运动”。", f"Planned; the orange model is running the path. Execution will take about {plan.duration:.1f} s. Press Execute if it looks right.")
+                        say(copy(f"已计划，橙色模型正在走这条路；真正执行约需 {plan.duration:.1f} s。满意就点“执行运动”。", f"Planned; the orange model is running the path. Execution will take about {plan.duration:.1f} s. Press Execute if it looks right."))
                     elif request.kind == "execute":
                         if len(server.get_clients()) > 1:
                             raise ValueError(copy("有第二个浏览器页面连着，关掉它再执行", "A second browser page is connected; close it before executing"))
@@ -702,9 +759,10 @@ def run(args):
                             raise ValueError("The arm moved since planning; plan again")
                         phase, step, settle_ticks, comm_failures = "executing", 0, 0, 0
                         last_command = tuple(plan.start)
+                        LOG.info("execute begins hardware=%s", bool(arm))
                         gizmo.visible = False
                         refresh_buttons()
-                        status.content = copy("执行中……", "Executing…")
+                        say(copy("执行中……", "Executing…"))
                     elif request.kind == "arm":
                         if len(server.get_clients()) > 1:
                             raise ValueError(copy("有第二个浏览器页面连着，关掉它再启用", "A second browser page is connected; close it before enabling torque"))
@@ -714,24 +772,28 @@ def run(args):
                         if not arming_requested(str(request.payload)):
                             raise ValueError(f"Type {ARM_WORD} in the text box first")
                         from lerobot.motors.feetech import OperatingMode
+                        LOG.info("arming: pose %s", np.round(current, 2).tolist())
                         control.configure_and_hold(arm, OperatingMode.POSITION.value)
                         armed = True
+                        LOG.info("armed; torque on")
                         arm_word.value = ""
                         refresh_buttons()
-                        status.content = copy("力矩已启用，手臂保持当前姿态。可以松手，但断电开关要在手边。", "Torque on; the arm holds this pose. You may let go, but keep the power cutoff within reach.")
+                        say(copy("力矩已启用，手臂保持当前姿态。可以松手，但断电开关要在手边。", "Torque on; the arm holds this pose. You may let go, but keep the power cutoff within reach."))
                     elif request.kind == "release":
                         arm.bus.disable_torque()
                         armed = False
+                        LOG.info("torque released by operator")
                         refresh_buttons()
-                        status.content = copy("力矩已释放，手臂现在可以用手搬动。", "Torque released; the arm can be moved by hand.")
+                        say(copy("力矩已释放，手臂现在可以用手搬动。", "Torque released; the arm can be moved by hand."))
                 except (ValueError, RuntimeError) as exc:
+                    LOG.warning("request %s rejected: %s", request.kind, exc)
                     if request.kind == "arm" and not armed:
-                        status.content = f"{copy('未启用', 'Not enabled')}: {exc}"
+                        say(f"{copy('未启用', 'Not enabled')}: {exc}")
                     elif request.kind == "joints":
                         drop_goal()
-                        status.content = copy(f"目标不可用：{exc}", f"Goal unavailable: {exc}")
+                        say(copy(f"目标不可用：{exc}", f"Goal unavailable: {exc}"))
                     else:
-                        status.content = f"{copy('未执行', 'Not executed')}: {exc}"
+                        say(f"{copy('未执行', 'Not executed')}: {exc}")
 
             if phase in ("planning", "executing") and plan is not None:
                 # One fixed step per tick: a slow tick slows the motion, it never enlarges a step.
@@ -746,7 +808,7 @@ def run(args):
                     if step >= steps:
                         phase = "idle"
                         refresh_buttons()
-                        status.content = copy("计划演示完毕。要真的过去，点“执行运动”；改目标就要重新计划。", "Plan shown. Press Execute to move; changing the goal requires planning again.")
+                        say(copy("计划演示完毕。要真的过去，点“执行运动”；改目标就要重新计划。", "Plan shown. Press Execute to move; changing the goal requires planning again."))
                 elif arm:
                     blocked = blocked_joints(current, last_command, loads, args.contact_error_deg, args.contact_load_pct)
                     if blocked:
@@ -764,7 +826,7 @@ def run(args):
                         comm_failures = 0
                     except (ConnectionError, RuntimeError, OSError) as exc:
                         comm_failures += 1  # Skip this cycle; the previous command is still held by the servos.
-                        print(f"bus error during execution ({comm_failures}/{COMM_FAILURE_LIMIT}): {exc}", file=sys.stderr)
+                        note(f"bus error during execution ({comm_failures}/{COMM_FAILURE_LIMIT}): {exc}")
                         if comm_failures >= COMM_FAILURE_LIMIT:
                             abort_and_hold(copy("总线通信连续失败", "bus communication failed repeatedly"))
                         continue
@@ -772,6 +834,8 @@ def run(args):
                         abort_and_hold(copy("LeRobot 截短了关节目标", "LeRobot clipped the joint target"))
                         continue
                     last_command = tuple(waypoint)
+                    LOG.debug("exec %d/%d f=%.3f cmd=%s cur=%s lag=%.2f loads=%s", step, steps, fraction, np.round(waypoint, 2).tolist(),
+                              np.round(current, 2).tolist(), lag(current, waypoint), [round(v) for v in loads])
                     if step >= steps:
                         residual = lag(current, plan.goal)
                         state = settle_state(residual, settle_ticks)
@@ -781,8 +845,8 @@ def run(args):
                             gizmo.visible = True
                             clear_trail()
                             refresh_buttons()
-                            status.content = copy("已到达目标并保持。", "Goal reached and holding.") if state == "done" else \
-                                copy(f"已发出最终目标并保持，剩余误差 {residual:.1f}°。", f"Final target sent and holding; residual error {residual:.1f}°.")
+                            say(copy("已到达目标并保持。", "Goal reached and holding.") if state == "done" else
+                                copy(f"已发出最终目标并保持，剩余误差 {residual:.1f}°。", f"Final target sent and holding; residual error {residual:.1f}°."))
                 else:
                     current = np.array(waypoint)
                     if step >= steps:
@@ -790,21 +854,23 @@ def run(args):
                         gizmo.visible = True
                         clear_trail()
                         refresh_buttons()
-                        status.content = copy("模型已到达目标。", "The model reached the goal.")
+                        say(copy("模型已到达目标。", "The model reached the goal."))
             time.sleep(max(0.0, UPDATE_SECONDS - (time.monotonic() - tick)))
     finally:
+        LOG.info("shutting down: armed=%s phase=%s estopped=%s", armed, phase, estopped)
         try:
             if arm and arm.bus.is_connected:
                 if armed:
-                    print("Releasing torque; support the arm.", file=sys.stderr)
+                    note("Releasing torque; support the arm.")
                     try:
                         arm.bus.disable_torque()
                     except Exception as exc:  # noqa: BLE001 - report, then still disconnect
-                        print(f"Torque release failed ({exc}); the motors may still be holding. Cut DC power to release.", file=sys.stderr)
+                        note(f"Torque release failed ({exc}); the motors may still be holding. Cut DC power to release.")
                 arm.bus.disconnect(disable_torque=False)
         finally:
             if server:
                 server.stop()
+            LOG.info("exit")
 
 
 def main(argv=None):
@@ -830,10 +896,14 @@ def main(argv=None):
         run(args)
         return 0
     except KeyboardInterrupt:
+        LOG.info("keyboard interrupt")
         print("Stopped; this is not a physical power cutoff.", file=sys.stderr)
         return 130
     except Exception as exc:
+        LOG.exception("fatal: %s", exc)
         print(f"STOP: {exc}. Hardware: cut motor power before investigating.", file=sys.stderr)
+        if LOG.handlers:
+            print(f"Details in {LOG.handlers[0].baseFilename}", file=sys.stderr)
         return 1
 
 

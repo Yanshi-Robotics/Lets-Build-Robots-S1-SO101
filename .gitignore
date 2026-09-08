@@ -10,3 +10,6 @@ calibration/
 
 # 第 7 课 prepare 从 TheRobotStudio 锁定 commit 下载的模型，随时可重取
 models/
+
+# 第 7 课三维控制程序每次运行写一份调试日志，只留最近 20 份，出问题时把最新那份发出来
+IK/logs/
