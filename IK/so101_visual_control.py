@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """SO-101 interactive control with Viser 1.1.0 and LeRobot 0.6.1.
 
-Model mode (default) plans and animates on the model only. --hardware connects the
-Follower bus: joint readings are live from the start, and motion is sent only after
-the operator arms the arm by typing ENABLE. Every command is a small interpolated
-joint step at a limited rate, the arm is watched for lag, and Stop holds the current
-position. There is no collision detection: the operator watches the arm and keeps
-the DC cutoff within reach. Keep so101_cartesian_demo.py in the same directory.
+Goal, plan, execute, the way a planner front end works: dragging the handle or moving
+a joint slider sets the orange goal; Plan trajectory computes the path and runs the
+orange model along it; Execute follows it. Model mode (default) moves the model only.
+--hardware connects the Follower bus: readings are live from the start, motion is sent
+only after the operator arms the arm by typing ENABLE, every command is a small joint
+step at a limited rate, the arm is watched for lag, Stop holds the current position, and
+EMERGENCY STOP cuts torque. There is no collision detection: the operator watches the
+arm and keeps the DC cutoff within reach. Keep so101_cartesian_demo.py in the same directory.
 """
 from __future__ import annotations
 
@@ -126,6 +128,29 @@ def slider_value(value, bounds):
     return float(min(max(round(float(value) / SLIDER_STEP_DEG) * SLIDER_STEP_DEG, low), high))
 
 
+def ik_seed(current, previous_goal, limits):
+    """Where the solver starts: the last goal while dragging, else the arm clamped into the model.
+
+    An arm resting on a mechanical stop sits a few degrees outside the URDF limits; clamping the
+    seed lets a goal be set from there, while the plan itself still starts at the real pose.
+    """
+    if previous_goal is not None:
+        return np.asarray(previous_goal, dtype=float)
+    lows = np.array([limits[name][0] for name in control.JOINTS])
+    highs = np.array([limits[name][1] for name in control.JOINTS])
+    return np.clip(np.asarray(current, dtype=float), lows, highs)
+
+
+def counts_from_degrees(degrees, calibration):
+    """Encoder counts the calibration table would read for these degrees: zero is the range middle."""
+    return int(round((calibration.range_min + calibration.range_max) / 2 + float(degrees) * 4095 / 360))
+
+
+def counts_from_percent(percent, calibration):
+    """Encoder counts for a gripper opening percentage over its recorded range."""
+    return int(round(calibration.range_min + float(percent) / 100 * (calibration.range_max - calibration.range_min)))
+
+
 def arming_requested(text):
     return text.strip() == ARM_WORD
 
@@ -168,6 +193,7 @@ def run(args):
     arm = None
     server = None
     armed = False
+    estopped = False
     requests: queue.Queue[Request] = queue.Queue(maxsize=64)
     stop_requested = threading.Event()
     owner = None
@@ -175,9 +201,10 @@ def run(args):
     lock = threading.Lock()
     latest_drag = None
     latest_joints = None
-    plan = None
-    phase = "idle"  # idle | previewing | executing
-    step = 0  # Motion advances one fixed step per tick, never by wall-clock time.
+    goal = None  # (joints, gripper, xyz): where the operator wants to go
+    plan = None  # Plan: how to get there, computed on request
+    phase = "idle"  # idle | planning (ghost runs the path) | executing
+    step = 0
     last_command = None
     trail = []
 
@@ -187,14 +214,11 @@ def run(args):
         nonlocal latest_drag, latest_joints
         if kind == "quit":
             if armed:
-                try:
-                    requests.put_nowait(Request("quit-refused", client_id, time.monotonic()))
-                except queue.Full:
-                    pass
+                kind = "quit-refused"
+            else:
+                stop_requested.set()
                 return
-            stop_requested.set()
-            return
-        if client_id is not None and client_id != owner and kind != "connected":
+        if client_id is not None and client_id != owner and kind not in ("connected", "estop"):
             return
         if kind in ("drag", "joints"):
             with lock:  # Coalesce: only the latest slider or drag position matters.
@@ -256,48 +280,65 @@ def run(args):
         server.scene.add_grid("/ground", width=1.2, height=1.2, plane="xy", cell_size=0.05)
         server.scene.add_frame("/base", axes_length=0.12, axes_radius=0.003)
         server.scene.add_frame("/current", show_axes=False)
-        ghost_root = server.scene.add_frame("/preview", show_axes=False, visible=False)
+        ghost_root = server.scene.add_frame("/goal", show_axes=False, visible=False)
         model_path = Path(args.model_dir) / control.URDF_NAME
         actual_model = ViserUrdf(server, model_path, root_node_name="/current", mesh_color_override=CURRENT_COLOR)
-        ghost_model = ViserUrdf(server, model_path, root_node_name="/preview", mesh_color_override=TARGET_COLOR)
+        ghost_model = ViserUrdf(server, model_path, root_node_name="/goal", mesh_color_override=TARGET_COLOR)
         names = actual_model.get_actuated_joint_names()
         xyz = kinematics.forward_kinematics(current)[:3, 3].copy()
+        # Arrows move along one axis, the plane handles move in two: free dragging, position only.
         gizmo = server.scene.add_transform_controls(
-            "/target", position=tuple(xyz), scale=0.13, disable_rotations=True, disable_sliders=True, line_width=4.0,
+            "/target", position=tuple(xyz), scale=0.13, disable_rotations=True, disable_sliders=False, line_width=4.0,
         )
 
+        def joints_line(joints, gripper):
+            """Degrees always; encoder counts beside them when a calibration is loaded, like km/h and mph."""
+            if arm:
+                parts = [f"F{i + 1} {v:.1f}° ({counts_from_degrees(v, arm.calibration[name])})" for i, (name, v) in enumerate(zip(control.JOINTS, joints))]
+                gripper_part = f"{copy('夹爪', 'Gripper')} {gripper:.1f}% ({counts_from_percent(gripper, arm.calibration['gripper'])})"
+                return " · ".join(parts) + f"\n\n{gripper_part}"
+            return " · ".join(f"F{i + 1} {v:.1f}°" for i, v in enumerate(joints))
+
         def mode_label():
+            if estopped:
+                return copy("紧急停止 · 力矩已切断，重开程序才能再启用", "Emergency stop · torque cut, restart the program to enable again")
             if not arm:
                 return copy("模型模式 · 未连接硬件", "Model mode · no hardware")
-            return copy("实机模式 · 力矩已启用，执行会动真机", "Hardware mode · torque on, execute moves the arm") if armed \
+            return copy("实机模式 · 力矩已启用，执行会动真机", "Hardware mode · torque on, Execute moves the arm") if armed \
                 else copy("实机模式 · 力矩未启用，只读", "Hardware mode · torque off, reading only")
 
         mode_text = server.gui.add_markdown(f"### {mode_label()}")
         server.gui.add_markdown(copy(
-            "蓝色：当前姿态，实机模式下来自电机回读。橙色：目标姿态。拖动红、绿、蓝轴或拨动关节滑杆设定目标，橙色轨迹线是夹爪将走的路。旋转视角不改变底座坐标。",
-            "Blue: current pose, read from the motors in hardware mode. Orange: target pose. Drag the red, green or blue axis or move the joint sliders to set a target; the orange line is the path the gripper will take. Camera rotation does not change the base frame.",
+            "蓝色：当前姿态，实机模式下来自电机回读。橙色：目标姿态。拖动三轴或平面手柄、或拨动关节滑杆设定目标；“计划轨迹”算出路径并让橙色走一遍；“执行运动”才真的过去。旋转视角不改变底座坐标。",
+            "Blue: current pose, read from the motors in hardware mode. Orange: goal pose. Drag the axes or plane handles, or move the joint sliders, to set a goal; Plan trajectory computes the path and runs the orange model along it; Execute is what actually moves. Camera rotation does not change the base frame.",
         ))
         readout = server.gui.add_markdown("")
-        status = server.gui.add_markdown(copy("拖动目标或拨动滑杆，先出现橙色目标和轨迹。", "Drag the target or move a slider; the orange target and path appear first."))
+        goal_text = server.gui.add_markdown("")
+        status = server.gui.add_markdown(copy("拖动目标或拨动滑杆，先出现橙色目标。", "Drag the target or move a slider; the orange goal appears first."))
         bounds = slider_bounds(target_limits)
-        with server.gui.add_folder(copy("目标关节角 / °", "Target joints / °")):
+        with server.gui.add_folder(copy("目标关节角 / °", "Goal joints / °")):
             sliders = [server.gui.add_slider(label, bounds[name][0], bounds[name][1], SLIDER_STEP_DEG, slider_value(v, bounds[name]))
                        for label, name, v in zip(JOINT_LABELS, control.JOINTS, current)]
             gripper_slider = server.gui.add_slider(copy("夹爪开合 / %", "Gripper / %"), 0, 100, 1, float(opening)) if arm else None
-        preview = server.gui.add_button(copy("预览运动（只动橙色模型）", "Preview motion (orange model only)"), disabled=True)
-        execute = server.gui.add_button(copy("执行运动", "Execute motion"), disabled=True)
-        stop = server.gui.add_button(copy("停止并保持", "Stop and hold"), disabled=True)
-        reset = server.gui.add_button(copy("目标回到当前姿态", "Reset target to current pose"))
+        plan_button = server.gui.add_button(copy("计划轨迹", "Plan trajectory"), disabled=True,
+                                            hint=copy("算出从当前到目标的路径，橙色模型走一遍，实物不动", "Compute the path from the current pose to the goal; the orange model runs it, the arm does not move"))
+        execute = server.gui.add_button(copy("执行运动", "Execute"), disabled=True,
+                                        hint=copy("沿计划好的轨迹过去；实机模式需先启用力矩", "Follow the planned trajectory; hardware mode requires torque on"))
+        stop = server.gui.add_button(copy("停止并保持", "Stop and hold"), disabled=True,
+                                     hint=copy("停在当前位置，电机继续出力", "Hold the current position with torque on"))
+        reset = server.gui.add_button(copy("目标回到当前姿态", "Reset goal to current pose"))
         if arm:
             with server.gui.add_folder(copy("力矩", "Torque")):
                 arm_word = server.gui.add_text(copy(f"输入 {ARM_WORD} 再点启用", f"Type {ARM_WORD}, then enable"), "")
                 arm_button = server.gui.add_button(copy("启用力矩并保持当前姿态", "Enable torque and hold this pose"))
                 release_button = server.gui.add_button(copy("释放力矩", "Release torque"), disabled=True,
                                                        hint=copy("先托住手臂：释放后六个电机不再出力，手臂会下落", "Support the arm first: after release the six motors stop driving and the arm drops"))
+        estop_button = server.gui.add_button(copy("紧急停止", "EMERGENCY STOP"), color="red",
+                                             hint=copy("立刻停止并切断力矩，手臂会下落；之后要重开程序", "Stop at once and cut torque; the arm drops; restart the program afterwards"))
         quit_button = server.gui.add_button(copy("关闭程序", "Close program"))
         server.gui.add_markdown(copy(
-            "执行时每次只发送一小步关节目标，速度上限每秒 10°；实物落后指令超过 8° 即停止并保持。力矩开着时不能关闭程序，要先托住手臂、释放力矩；终端里按 Ctrl+C 会直接释放力矩，手臂会下落。软件不是物理断电。",
-            "Execution sends one small joint step at a time, at most 10° per second; if the arm lags its command by more than 8° it stops and holds. The program cannot be closed while torque is on: support the arm and release torque first. Ctrl+C in the terminal releases torque at once and the arm drops. Software is not a physical power cutoff.",
+            "三种停法：“停止并保持”停在原地、电机继续出力；“释放力矩”是单独的一步，先托住手臂再点；“紧急停止”立刻切断全部力矩，手臂会掉。执行时每次只发一小步，速度上限每秒 10°，实物落后指令超过 8° 自动停止并保持。力矩开着时不能关闭程序；终端 Ctrl+C 会直接卸力。软件不是物理断电。",
+            "Three ways to stop: Stop and hold keeps the motors driving in place; Release torque is a separate step, support the arm first; EMERGENCY STOP cuts all torque at once and the arm drops. Execution sends one small step at a time, at most 10° per second, and stops and holds if the arm lags by more than 8°. The program cannot be closed while torque is on; Ctrl+C in the terminal releases torque at once. Software is not a physical power cutoff.",
         ))
 
         @server.on_client_connect
@@ -314,15 +355,19 @@ def run(args):
         def dragged(event):
             enqueue("drag", event.client_id, tuple(gizmo.position))
 
-        for slider in sliders:
+        def slider_goal():
+            return tuple(float(s.value) for s in sliders) + ((float(gripper_slider.value),) if gripper_slider else ())
+
+        for slider in sliders + ([gripper_slider] if gripper_slider else []):
             @slider.on_update
             def moved(event):
-                enqueue("joints", event.client_id, tuple(float(s.value) for s in sliders))
+                enqueue("joints", event.client_id, slider_goal())
 
-        preview.on_click(lambda event: enqueue("preview", event.client_id))
+        plan_button.on_click(lambda event: enqueue("plan", event.client_id))
         execute.on_click(lambda event: enqueue("execute", event.client_id))
         stop.on_click(lambda event: enqueue("stop", event.client_id))
         reset.on_click(lambda event: enqueue("reset", event.client_id))
+        estop_button.on_click(lambda event: enqueue("estop", event.client_id))
         if arm:
             arm_button.on_click(lambda event: enqueue("arm", event.client_id, arm_word.value))
             release_button.on_click(lambda event: enqueue("release", event.client_id))
@@ -333,50 +378,80 @@ def run(args):
                 handle.remove()
             trail.clear()
 
-        def show_plan(new_plan):
-            nonlocal plan
-            plan = new_plan
-            clear_trail()
-            ghost_root.visible = True
-            ghost_model.update_cfg(np.array(viewer_configuration(names, new_plan.goal)))
-            gizmo.position = tuple(new_plan.xyz)
-            path = trail_points(kinematics, new_plan.start, new_plan.goal)
-            trail.append(server.scene.add_spline_catmull_rom("/trail/path", path, color=TRAIL_COLOR, thickness=0.004))
-            trail.append(server.scene.add_point_cloud("/trail/waypoints", path[::6], np.tile(TRAIL_COLOR, (len(path[::6]), 1)),
-                                                     point_size=0.008, point_shape="circle"))
-            for slider, name, value in zip(sliders, control.JOINTS, new_plan.goal):
-                if abs(float(slider.value) - value) >= SLIDER_STEP_DEG / 2:
-                    slider.value = slider_value(value, bounds[name])
-            preview.disabled = False
-            execute.disabled = bool(arm) and not armed
+        def refresh_buttons():
+            plan_button.disabled = estopped or goal is None or phase != "idle"
+            execute.disabled = estopped or plan is None or phase != "idle" or (bool(arm) and not armed)
+            stop.disabled = phase != "executing"
+            if arm:
+                arm_button.disabled = estopped or armed
+                release_button.disabled = estopped or not armed
+            mode_text.content = f"### {mode_label()}"
 
-        def drop_plan():
-            nonlocal plan
-            plan = None
-            clear_trail()
-            ghost_root.visible = False
-            preview.disabled = True
-            execute.disabled = True
-
-        def make_plan(goal_q, opening_goal):
+        def set_goal(goal_q, opening_goal):
+            nonlocal goal, plan
             control.validate_joints(goal_q, target_limits)
             goal_xyz = kinematics.forward_kinematics(np.array(goal_q))[:3, 3]
+            goal = (tuple(map(float, goal_q)), None if opening is None else float(opening_goal), tuple(map(float, goal_xyz)))
+            plan = None  # A new goal makes any earlier plan stale.
+            clear_trail()
+            ghost_root.visible = True
+            ghost_model.update_cfg(np.array(viewer_configuration(names, goal[0])))
+            gizmo.position = goal[2]
+            for slider, name, value in zip(sliders, control.JOINTS, goal[0]):
+                if abs(float(slider.value) - value) >= SLIDER_STEP_DEG / 2:
+                    slider.value = slider_value(value, bounds[name])
+            goal_text.content = f"**{copy('目标', 'Goal')}**: " + joints_line(goal[0], goal[1])
+            refresh_buttons()
+
+        def drop_goal():
+            nonlocal goal, plan
+            goal = plan = None
+            clear_trail()
+            ghost_root.visible = False
+            goal_text.content = ""
+            refresh_buttons()
+
+        def make_plan():
+            goal_q, opening_goal, goal_xyz = goal
             gripper_change = 0.0 if opening is None else float(opening_goal) - float(opening)
             duration = motion_duration(current, goal_q, gripper_change, ANIMATION_MIN_SECONDS)
-            return Plan(tuple(map(float, current)), tuple(map(float, goal_q)),
-                        None if opening is None else float(opening), None if opening is None else float(opening_goal),
-                        tuple(map(float, goal_xyz)), duration)
+            clear_trail()
+            if lag(current, goal_q) > SLIDER_STEP_DEG / 2:  # A gripper-only goal has no path to draw.
+                path = trail_points(kinematics, current, goal_q)
+                trail.append(server.scene.add_spline_catmull_rom("/trail/path", path, color=TRAIL_COLOR, thickness=0.004))
+                trail.append(server.scene.add_point_cloud("/trail/waypoints", path[::6], np.tile(TRAIL_COLOR, (len(path[::6]), 1)),
+                                                         point_size=0.008, point_shape="circle"))
+            return Plan(tuple(map(float, current)), goal_q, None if opening is None else float(opening),
+                        None if opening is None else float(opening_goal), goal_xyz, duration)
 
         def abort_and_hold(reason):
-            nonlocal phase, last_command
+            nonlocal phase, last_command, plan
             if arm and armed:
                 hold_here(current, opening)
             phase = "idle"
             last_command = None
-            stop.disabled = True
-            drop_plan()
+            plan = None
+            clear_trail()
+            gizmo.visible = True
+            refresh_buttons()
             status.content = f"{copy('已停止并保持', 'Stopped and holding')}: {reason}"
             print(f"STOP-HOLD: {reason}", file=sys.stderr)
+
+        def emergency_stop():
+            """Cut torque now. The arm drops; the operator restarts the program to continue."""
+            nonlocal phase, last_command, armed, estopped, plan
+            phase = "idle"
+            last_command = None
+            plan = None
+            estopped = True
+            if arm:
+                arm.bus.disable_torque()
+                armed = False
+            clear_trail()
+            gizmo.visible = True
+            refresh_buttons()
+            status.content = copy("紧急停止：力矩已切断。检查手臂，然后重开程序。", "EMERGENCY STOP: torque cut. Check the arm, then restart the program.")
+            print("EMERGENCY STOP: torque cut on all motors.", file=sys.stderr)
 
         print(f"Open http://{LOOPBACK}:{args.web_port}; mode={mode_label()}")
         while True:
@@ -393,15 +468,13 @@ def run(args):
             actual_model.update_cfg(np.array(viewer_configuration(names, current)))
             xyz = kinematics.forward_kinematics(current)[:3, 3].copy()
             coordinates = ", ".join(f"{axis} {value * 1000:.1f}" for axis, value in zip("XYZ", xyz))
-            joints_text = " · ".join(f"F{i + 1} {value:.1f}°" for i, value in enumerate(current))
-            readout.content = f"**{copy('当前', 'Current')} / mm**: {coordinates}\n\n{joints_text}" + (
-                f"\n\n{copy('夹爪回读', 'Gripper readback')}: {opening:.1f}%" if opening is not None else "")
+            readout.content = f"**{copy('当前', 'Current')} / mm**: {coordinates}\n\n" + joints_line(current, opening)
 
             batch = []
             for _ in range(requests.qsize()):
                 batch.append(requests.get_nowait())
             with lock:
-                for pending in (latest_joints, latest_drag):  # A drag after a slider move wins, and vice versa.
+                for pending in (latest_joints, latest_drag):
                     if pending is not None:
                         batch.append(pending)
                 latest_drag = latest_joints = None
@@ -413,6 +486,9 @@ def run(args):
                     else:
                         print("A second browser connected; only the first one is in control.", file=sys.stderr)
                     continue
+                if request.kind == "estop":
+                    emergency_stop()
+                    continue
                 if request.client_id is not None and request.client_id != owner:
                     continue
                 try:
@@ -421,100 +497,106 @@ def run(args):
                         continue
                     if request.kind == "stop":
                         if phase == "executing":
-                            abort_and_hold(copy("操作者按下停止", "operator pressed stop"))
+                            abort_and_hold(copy("操作者按下停止", "operator pressed Stop"))
                         continue
                     if phase == "executing":
-                        status.content = copy("执行中：先按“停止并保持”，再改目标。", "Executing: press Stop and hold before changing the target.")
+                        status.content = copy("执行中：先按“停止并保持”。", "Executing: press Stop and hold first.")
                         continue
                     if request.kind in ("drag", "joints", "reset"):
-                        if phase == "previewing":
+                        if phase == "planning":
                             phase = "idle"
                         if request.kind == "drag":
-                            if plan is not None and np.linalg.norm(np.asarray(request.payload) - np.asarray(plan.xyz)) < 1e-4:
-                                continue  # Echo of a gizmo position we just synchronised.
-                            goal_q, _, error = control.solve_position(kinematics, current, np.asarray(request.payload, dtype=float), target_limits)
-                            show_plan(make_plan(goal_q, gripper_slider.value if gripper_slider else None))
-                            status.content = copy(f"已规划：模型误差 {error:.3f} mm，用时约 {plan.duration:.1f} s。橙色是目标，不是实机反馈。",
-                                                  f"Planned: model residual {error:.3f} mm, about {plan.duration:.1f} s. Orange is the target, not hardware feedback.")
+                            seed = ik_seed(current, goal[0] if goal is not None else None, target_limits)
+                            try:
+                                goal_q, _, error = control.solve_position(kinematics, seed, np.asarray(request.payload, dtype=float), target_limits)
+                            except ValueError:
+                                # Out of reach or outside the joint range: keep the last reachable goal and snap back.
+                                gizmo.position = goal[2] if goal is not None else tuple(xyz)
+                                status.content = copy("够不到或超出关节范围，操纵柄退回上一个可达位置。", "Out of reach or outside the joint range; the handle snapped back to the last reachable position.")
+                                continue
+                            set_goal(goal_q, gripper_slider.value if gripper_slider else None)
+                            status.content = copy(f"目标已设定，模型误差 {error:.3f} mm。点“计划轨迹”。", f"Goal set, model residual {error:.3f} mm. Press Plan trajectory.")
                         elif request.kind == "joints":
-                            goal_q = np.asarray(request.payload, dtype=float)
-                            if plan is not None and lag(goal_q, plan.goal) < SLIDER_STEP_DEG / 2:
+                            goal_q = np.asarray(request.payload[:5], dtype=float)
+                            opening_goal = float(request.payload[5]) if len(request.payload) > 5 else None
+                            if goal is not None and lag(goal_q, goal[0]) < SLIDER_STEP_DEG / 2 and (opening_goal is None or abs(opening_goal - goal[1]) < 0.5):
                                 continue  # Echo of a slider we just synchronised.
-                            show_plan(make_plan(goal_q, gripper_slider.value if gripper_slider else None))
-                            status.content = copy(f"已规划：关节目标来自滑杆，用时约 {plan.duration:.1f} s。", f"Planned from the sliders, about {plan.duration:.1f} s.")
+                            set_goal(goal_q, opening_goal)
+                            status.content = copy("目标来自滑杆。点“计划轨迹”。", "Goal set from the sliders. Press Plan trajectory.")
                         else:
-                            drop_plan()
+                            drop_goal()
                             gizmo.position = tuple(xyz)
                             for slider, name, value in zip(sliders, control.JOINTS, current):
                                 slider.value = slider_value(value, bounds[name])
                             if gripper_slider:
                                 gripper_slider.value = float(round(opening))
-                            status.content = copy("目标已回到当前姿态。", "Target reset to the current pose.")
-                    elif request.kind == "preview":
-                        if plan is None:
-                            raise ValueError("No plan; set a target first")
-                        if lag(current, plan.start) > REPLAN_TOLERANCE_DEG:
-                            raise ValueError("The arm moved since planning; set the target again")
-                        phase, step = "previewing", 0
-                        status.content = copy("预览中：橙色模型沿轨迹走一遍，实物不动。", "Previewing: the orange model runs the path; the arm does not move.")
+                            status.content = copy("目标已回到当前姿态。", "Goal reset to the current pose.")
+                    elif request.kind == "plan":
+                        if estopped:
+                            raise ValueError("Emergency stop is latched; restart the program")
+                        if goal is None:
+                            raise ValueError("No goal; drag the target or move a slider first")
+                        plan = make_plan()
+                        phase, step = "planning", 0
+                        refresh_buttons()
+                        status.content = copy(f"已计划：约 {plan.duration:.1f} s，橙色模型正在走这条路。满意就点“执行运动”。", f"Planned: about {plan.duration:.1f} s; the orange model is running the path. Press Execute if it looks right.")
                     elif request.kind == "execute":
                         check_request(request, owner, time.monotonic(), server.get_clients())
+                        if estopped:
+                            raise ValueError("Emergency stop is latched; restart the program")
                         if plan is None:
-                            raise ValueError("No plan; set a target first")
+                            raise ValueError("No plan; press Plan trajectory first")
                         if arm and not armed:
                             raise ValueError("Torque is off; enable and hold first")
                         if lag(current, plan.start) > REPLAN_TOLERANCE_DEG:
-                            raise ValueError("The arm moved since planning; set the target again")
+                            plan = None
+                            refresh_buttons()
+                            raise ValueError("The arm moved since planning; plan again")
                         phase, step = "executing", 0
                         last_command = tuple(plan.start)
-                        stop.disabled = False
                         gizmo.visible = False
+                        refresh_buttons()
                         status.content = copy("执行中……", "Executing…")
                     elif request.kind == "arm":
                         check_request(request, owner, time.monotonic(), server.get_clients())
+                        if estopped:
+                            raise ValueError("Emergency stop is latched; restart the program")
                         if not arming_requested(str(request.payload)):
                             raise ValueError(f"Type {ARM_WORD} in the text box first")
-                        control.validate_joints(current, target_limits)  # Off a stop, inside the model: motion can start from here.
                         from lerobot.motors.feetech import OperatingMode
                         control.configure_and_hold(arm, OperatingMode.POSITION.value)
                         armed = True
                         arm_word.value = ""
-                        release_button.disabled = False
-                        mode_text.content = f"### {mode_label()}"
-                        if plan is not None:
-                            execute.disabled = False
+                        refresh_buttons()
                         status.content = copy("力矩已启用，手臂保持当前姿态。可以松手，但断电开关要在手边。", "Torque on; the arm holds this pose. You may let go, but keep the power cutoff within reach.")
                     elif request.kind == "release":
-                        if phase == "executing":
-                            abort_and_hold(copy("释放力矩前先停止", "stopped before releasing torque"))
                         arm.bus.disable_torque()
                         armed = False
-                        release_button.disabled = True
-                        execute.disabled = True
-                        mode_text.content = f"### {mode_label()}"
+                        refresh_buttons()
                         status.content = copy("力矩已释放，手臂现在可以用手搬动。", "Torque released; the arm can be moved by hand.")
                 except (ValueError, RuntimeError) as exc:
                     if request.kind == "arm" and not armed:
                         status.content = f"{copy('未启用', 'Not enabled')}: {exc}"
-                    elif request.kind in ("drag", "joints"):
-                        drop_plan()
-                        status.content = f"{copy('目标不可用', 'Target unavailable')}: {exc}"
+                    elif request.kind == "joints":
+                        drop_goal()
+                        status.content = copy(f"目标不可用：{exc}", f"Goal unavailable: {exc}")
                     else:
                         status.content = f"{copy('未执行', 'Not executed')}: {exc}"
 
-            if phase == "previewing" and plan is not None:
-                step = min(step + 1, motion_steps(plan.duration))
-                fraction = eased(step / motion_steps(plan.duration))
-                ghost_model.update_cfg(np.array(viewer_configuration(names, interpolation(plan.start, plan.goal, fraction))))
-                if fraction >= 1.0:
-                    phase = "idle"
-                    status.content = copy("预览结束。要让实物或模型真的过去，点“执行运动”。", "Preview finished. Press Execute motion to move the model or the arm.")
-            elif phase == "executing" and plan is not None:
-                step = min(step + 1, motion_steps(plan.duration) + int(SETTLE_TIMEOUT_SECONDS / UPDATE_SECONDS))
-                fraction = eased(min(step / motion_steps(plan.duration), 1.0))
+            if phase in ("planning", "executing") and plan is not None:
+                # One fixed step per tick: a slow tick slows the motion, it never enlarges a step.
+                steps = max(1, math.ceil(plan.duration / UPDATE_SECONDS))
+                step = min(step + 1, steps)
+                fraction = eased(step / steps)
                 waypoint = interpolation(plan.start, plan.goal, fraction)
-                control.validate_joints(waypoint, target_limits)
-                if arm:
+                control.validate_joints(waypoint, reading_limits)  # The start may sit on a stop outside the model.
+                if phase == "planning":
+                    ghost_model.update_cfg(np.array(viewer_configuration(names, waypoint)))
+                    if step >= steps:
+                        phase = "idle"
+                        refresh_buttons()
+                        status.content = copy("计划演示完毕。要真的过去，点“执行运动”；改目标就要重新计划。", "Plan shown. Press Execute to move; changing the goal requires planning again.")
+                elif arm:
                     if lag(current, last_command) > TRACKING_ABORT_DEG:
                         abort_and_hold(copy(f"实物落后指令 {lag(current, last_command):.1f}°", f"arm lags its command by {lag(current, last_command):.1f}°"))
                         continue
@@ -525,21 +607,25 @@ def run(args):
                         abort_and_hold(copy("LeRobot 截短了关节目标", "LeRobot clipped the joint target"))
                         continue
                     last_command = tuple(waypoint)
-                    if fraction >= 1.0:
+                    if step >= steps:
                         if lag(current, plan.goal) <= SETTLE_TOLERANCE_DEG:
-                            phase, last_command = "idle", None
-                            stop.disabled, gizmo.visible = True, True
-                            drop_plan()
-                            status.content = copy("已到达目标并保持。", "Target reached and holding.")
-                        elif step >= motion_steps(plan.duration) + int(SETTLE_TIMEOUT_SECONDS / UPDATE_SECONDS):
+                            phase, last_command, plan = "idle", None, None
+                            gizmo.visible = True
+                            clear_trail()
+                            refresh_buttons()
+                            status.content = copy("已到达目标并保持。", "Goal reached and holding.")
+                        elif step > steps + SETTLE_TIMEOUT_SECONDS / UPDATE_SECONDS:
                             abort_and_hold(copy("到位超时", "did not settle in time"))
+                        else:
+                            step += 1  # Keep counting while the arm settles at the final command.
                 else:
                     current = np.array(waypoint)
-                    if fraction >= 1.0:
-                        phase = "idle"
-                        stop.disabled, gizmo.visible = True, True
-                        drop_plan()
-                        status.content = copy("模型已到达目标。", "The model reached the target.")
+                    if step >= steps:
+                        phase, plan = "idle", None
+                        gizmo.visible = True
+                        clear_trail()
+                        refresh_buttons()
+                        status.content = copy("模型已到达目标。", "The model reached the goal.")
             time.sleep(max(0.0, UPDATE_SECONDS - (time.monotonic() - tick)))
     finally:
         try:

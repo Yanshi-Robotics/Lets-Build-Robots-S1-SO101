@@ -169,6 +169,23 @@ class VisualControlTests(unittest.TestCase):
         self.assertEqual(visual.slider_value(12.26, bounds), 12.5)
         self.assertEqual(visual.slider_value(200, bounds), 96.5)
 
+    def test_ik_seed_clamps_a_resting_arm_into_the_model(self):
+        limits = {name: (-100.0, 100.0) for name in demo.JOINTS}
+        resting = [9.1, -103.5, 96.9, -97.3, 6.5]
+        self.assertEqual(list(visual.ik_seed(resting, None, limits)), [9.1, -100.0, 96.9, -97.3, 6.5])
+        self.assertEqual(list(visual.ik_seed(resting, (1, 2, 3, 4, 5), limits)), [1, 2, 3, 4, 5])
+        self.assertEqual(list(visual.ik_seed([0] * 5, None, limits)), [0] * 5)
+
+    def test_encoder_counts_match_the_calibration_table(self):
+        # Follower shoulder_lift recorded 929..3306: the middle reads 0 deg, the rest pose 940 reads -103.5 deg.
+        lift = SimpleNamespace(range_min=929, range_max=3306)
+        self.assertEqual(visual.counts_from_degrees(0, lift), 2118)
+        self.assertEqual(visual.counts_from_degrees(-103.5, lift), 940)
+        gripper = SimpleNamespace(range_min=2000, range_max=3539)
+        self.assertEqual(visual.counts_from_percent(0, gripper), 2000)
+        self.assertEqual(visual.counts_from_percent(100, gripper), 3539)
+        self.assertEqual(visual.counts_from_percent(3.6387, gripper), 2056)
+
     def test_arming_needs_the_exact_word(self):
         self.assertTrue(visual.arming_requested(" ENABLE "))
         for text in ("enable", "", "ENABLE now", "yes"):
