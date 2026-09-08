@@ -41,6 +41,38 @@ class VisualControlTests(unittest.TestCase):
         self.assertEqual(visual.interpolation(start, goal, 1), goal)
         self.assertEqual(visual.interpolation(start, goal, 0.5), [1, -1, 2, -2, 0])
 
+    def test_eased_animation_keeps_endpoints_and_order(self):
+        self.assertEqual(visual.eased(0), 0)
+        self.assertAlmostEqual(visual.eased(1), 1)
+        self.assertAlmostEqual(visual.eased(0.5), 0.5)
+        samples = [visual.eased(i / 20) for i in range(21)]
+        self.assertEqual(samples, sorted(samples))
+        for value in (-0.1, 1.1, math.nan):
+            with self.assertRaises(ValueError):
+                visual.eased(value)
+
+    def test_trail_follows_the_animated_interpolation(self):
+        import numpy as np
+        def forward(q):
+            pose = np.eye(4)
+            pose[:3, 3] = np.asarray(q)[:3] / 100  # a fake FK: the first three joints as metres
+            return pose
+        kinematics = SimpleNamespace(forward_kinematics=forward)
+        path = visual.trail_points(kinematics, [0, 0, 0, 0, 0], [10, -20, 30, 0, 0], samples=11)
+        self.assertEqual(path.shape, (11, 3))
+        np.testing.assert_allclose(path[0], [0, 0, 0])
+        np.testing.assert_allclose(path[-1], [0.1, -0.2, 0.3])
+        np.testing.assert_allclose(path[5], [0.05, -0.1, 0.15])
+        with self.assertRaises(ValueError):
+            visual.trail_points(kinematics, [0] * 5, [1] * 5, samples=1)
+
+    def test_model_preview_is_watchable_and_hardware_bounds_untouched(self):
+        self.assertGreaterEqual(visual.ANIMATION_MIN_SECONDS, 1.0)
+        self.assertGreater(visual.MODEL_STEP_MM, demo.STEP_MM)
+        self.assertGreater(visual.MODEL_XYZ_ENVELOPE_MM, demo.SESSION_XYZ_ENVELOPE_MM)
+        self.assertEqual(demo.STEP_MM, 2.0)
+        self.assertEqual(demo.SESSION_JOINT_ENVELOPE_DEG, 8.0)
+
     def test_no_extrapolation_or_nonfinite_interpolation(self):
         for value in (-0.1, 1.1, math.nan):
             with self.assertRaises(ValueError):
@@ -199,7 +231,7 @@ class HoldTests(unittest.TestCase):
 
     def test_enable_only_after_final_read_and_hold(self):
         arm, limits, events = self.fixture()
-        demo.configure_and_hold(arm, limits, position_mode=0)
+        demo.configure_and_hold(arm, position_mode=0)
         self.assertEqual(events[0], "disable")
         self.assertEqual(events[-1], "enable")
         self.assertEqual(events.count("confirm-hold"), 6)
@@ -212,29 +244,35 @@ class HoldTests(unittest.TestCase):
             with self.subTest(stage=stage):
                 arm, limits, events = self.fixture(fail_at=stage)
                 with self.assertRaises(RuntimeError):
-                    demo.configure_and_hold(arm, limits, position_mode=0)
+                    demo.configure_and_hold(arm, position_mode=0)
                 self.assertNotIn("enable", events)
 
     def test_undelivered_hold_target_never_enables(self):
         arm, limits, events = self.fixture()
         arm.bus.read = Mock(return_value=0)
         with self.assertRaises(RuntimeError):
-            demo.configure_and_hold(arm, limits, position_mode=0)
+            demo.configure_and_hold(arm, position_mode=0)
         self.assertNotIn("enable", events)
 
     def test_post_configuration_position_rechecked(self):
         arm, limits, events = self.fixture(bad_raw=True)
         with self.assertRaises(ValueError):
-            demo.configure_and_hold(arm, limits, position_mode=0)
+            demo.configure_and_hold(arm, position_mode=0)
         self.assertNotIn("hold-target", events)
         self.assertNotIn("enable", events)
 
-    def test_calibration_and_model_limit_intersection(self):
-        arm, limits, _ = self.fixture()
+    def test_calibrated_limits_cover_the_recorded_travel(self):
+        # Readings are checked against the arm's own recorded range plus a small margin,
+        # so an arm resting on a real mechanical stop is not refused by the URDF limit.
+        arm, _, _ = self.fixture()
         arm.calibration["shoulder_pan"] = SimpleNamespace(range_min=2000, range_max=2100)
-        bound = demo.calibrated_limits(arm, limits)["shoulder_pan"]
-        self.assertAlmostEqual(bound[1], 100 * 180 / 4095)
-        self.assertLess(bound[1], limits["shoulder_pan"][1])
+        low, high = demo.calibrated_limits(arm)["shoulder_pan"]
+        self.assertAlmostEqual(high, 100 * 180 / 4095 + demo.LIMIT_MARGIN_DEG)
+        self.assertAlmostEqual(low, -high)
+        arm.calibration["shoulder_lift"] = SimpleNamespace(range_min=803, range_max=3185)  # real Follower, ±104.7°
+        low, high = demo.calibrated_limits(arm)["shoulder_lift"]
+        self.assertGreater(high, 100)  # the pinned URDF stops at 100°; the reading at the stop must pass
+        demo.validate_joints([0, -(3185 - 803) * 180 / 4095, 0, 0, 0], demo.calibrated_limits(arm))
 
 
 class BoundaryTests(unittest.TestCase):

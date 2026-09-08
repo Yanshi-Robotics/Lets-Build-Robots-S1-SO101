@@ -28,6 +28,9 @@ URDF_SHA256 = "3a65d2d35e68a8d2f0c2cc176d19b884506543c93ba72980145b80abe276022c"
 PREVIEW_JOINTS_DEG = (0.0, -30.0, 60.0, -30.0, 0.0)
 # Conservative teaching bounds, not measured hardware safety guarantees.
 STEP_MM = 2.0
+# A reading taken on a mechanical stop equals the recorded bound up to float rounding
+# and a little mechanical slack; without this margin every honest rest pose is refused.
+LIMIT_MARGIN_DEG = 1.0
 MAX_JOINT_STEP_DEG = 2.0
 SESSION_JOINT_ENVELOPE_DEG = 8.0
 SESSION_XYZ_ENVELOPE_MM = 20.0
@@ -134,18 +137,25 @@ def check_step(current, proposed, startup, xyz, startup_xyz, args):
         raise ValueError("Cartesian session envelope reached")
 
 
-def calibrated_limits(arm, model_limits):
+def calibrated_limits(arm):
+    """Validate hardware readings against the arm's own recorded travel, not the URDF.
+
+    The pinned URDF stops shoulder_lift at ±100°, while an arm calibrated to its real
+    mechanical stops records about ±105°; a resting arm sits on a stop, so checking
+    readings against the URDF refused every honest rest pose. Zero is the middle of the
+    recorded range, exactly as LeRobot's degree normalisation defines it. IK targets are
+    still confined to the URDF: the solver enforces those limits itself.
+    """
     limits = {}
     for name in JOINTS:
         calibration = arm.calibration[name]
         resolution = arm.bus.model_resolution_table[arm.bus.motors[name].model] - 1
         half_range_deg = (calibration.range_max - calibration.range_min) * 180 / resolution
-        low, high = model_limits[name]
-        limits[name] = (max(low, -half_range_deg), min(high, half_range_deg))
+        limits[name] = (-half_range_deg - LIMIT_MARGIN_DEG, half_range_deg + LIMIT_MARGIN_DEG)
     return limits
 
 
-def configure_and_hold(arm, model_limits, position_mode):
+def configure_and_hold(arm, position_mode):
     """Configure without an auto-reenabling context; enable only after all checks."""
     arm.bus.disable_torque()
     arm.bus.configure_motors()
@@ -165,7 +175,7 @@ def configure_and_hold(arm, model_limits, position_mode):
         calibration = arm.calibration[name]
         resolution = arm.bus.model_resolution_table[arm.bus.motors[name].model] - 1
         degrees.append((raw[name] - (calibration.range_min + calibration.range_max) / 2) * 360 / resolution)
-    validate_joints(degrees, calibrated_limits(arm, model_limits))
+    validate_joints(degrees, calibrated_limits(arm))
     gripper = arm.calibration["gripper"]
     if not gripper.range_min <= raw["gripper"] <= gripper.range_max:
         raise ValueError("Gripper is outside its calibrated range")
@@ -197,24 +207,24 @@ def jog(args):
     from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
     from lerobot.motors.feetech import OperatingMode
 
-    kinematics, model_limits = load_kinematics(args.model_dir)
+    kinematics, _model_limits = load_kinematics(args.model_dir)
 
     class HoldCurrentFollower(SO101Follower):
         def configure(self):
             # connect(calibrate=False) still invokes configure(). Check calibration
             # before writes, then replace stale targets before base configure enables torque.
             if not self.calibration or not self.is_calibrated:
-                raise RuntimeError("Calibration is missing or does not match motors; return to Lesson 8")
+                raise RuntimeError("Calibration is missing or does not match motors; return to Communication and Calibration")
             if any(self.bus.read("Torque_Enable", name, normalize=False) != 0 for name in self.bus.motors):
                 raise RuntimeError("Torque already enabled. Cut power and investigate before starting")
             observation = self.get_observation()
             q = [observation[f"{name}.pos"] for name in JOINTS]
-            validate_joints(q, model_limits)
+            validate_joints(q, calibrated_limits(self))
             print("Current joint degrees:", dict(zip(JOINTS, q)))
             print("Clear the workspace. Enabling torque can move the arm; support it without entering pinch points.")
             if input("Type ENABLE to hold the current pose, or anything else to exit: ").strip() != "ENABLE":
                 raise KeyboardInterrupt
-            configure_and_hold(self, model_limits, OperatingMode.POSITION.value)
+            configure_and_hold(self, OperatingMode.POSITION.value)
 
     arm = HoldCurrentFollower(SO101FollowerConfig(
         port=args.port, id=args.robot_id, calibration_dir=Path(args.calibration_dir),
@@ -223,7 +233,7 @@ def jog(args):
     ))
     try:
         arm.connect(calibrate=False)
-        limits = calibrated_limits(arm, model_limits)
+        limits = calibrated_limits(arm)
         def read_joints():
             observation = arm.get_observation()
             q = np.array([observation[f"{name}.pos"] for name in JOINTS], dtype=float)

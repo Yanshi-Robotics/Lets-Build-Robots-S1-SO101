@@ -4,7 +4,8 @@
 Default mode is model-only. --readback opens the Follower bus read-only for an
 operator to compare measured joint positions with the model. This program never
 enables torque or sends motor targets. Execute animates only the model-only mode.
-There is no collision detection or hardware control in this viewer.
+Animation draws the gripper path first, then moves the model along it, the way a
+planner preview does; there is no collision detection or hardware control in this viewer.
 Keep so101_cartesian_demo.py in the same directory.
 """
 from __future__ import annotations
@@ -26,7 +27,15 @@ import so101_cartesian_demo as control
 VISER_VERSION = "1.1.0"
 LOOPBACK = "127.0.0.1"  # Hardware control must never bind a LAN/public interface.
 UPDATE_SECONDS = 0.05  # 20 Hz UI/readback loop; not a real-time safety guarantee.
-JOINT_TARGET_RATE_DEG_S = 5.0  # Interpolated command rate, not measured motor speed.
+JOINT_TARGET_RATE_DEG_S = 10.0  # Model animation speed, not measured motor speed.
+ANIMATION_MIN_SECONDS = 2.0  # Even a small move plays long enough to be watched.
+TRAIL_SAMPLES = 48  # Gripper path samples drawn before the model moves.
+TRAIL_COLOR = (255, 156, 31)
+# Model-only bounds: nothing physical stands behind them, so a reader can drag far
+# enough to see the arm move. Readback mode keeps the hardware teaching bounds.
+MODEL_STEP_MM = 20.0
+MODEL_JOINT_ENVELOPE_DEG = 60.0
+MODEL_XYZ_ENVELOPE_MM = 150.0
 MAX_REQUEST_AGE_SECONDS = 0.5  # Reject queued execution requests, rather than replay them.
 MAX_PREVIEW_SEED_CHANGE_DEG = 0.5  # A moved arm requires a newly inspected preview.
 PREVIEW_GRIPPER_RAD = 0.0  # Geometry reference only: not mapped from LeRobot percent.
@@ -61,6 +70,22 @@ def check_preview(preview, current):
         raise ValueError("Invalid target position")
     if max(abs(a - b) for a, b in zip(preview.seed, current)) > MAX_PREVIEW_SEED_CHANGE_DEG:
         raise ValueError("Arm moved since preview; preview and confirm again")
+
+
+def eased(fraction):
+    """Smooth start and stop of the model animation; still 0 at 0 and 1 at 1."""
+    if not math.isfinite(fraction) or not 0 <= fraction <= 1:
+        raise ValueError("Invalid animation fraction")
+    return 0.5 - 0.5 * math.cos(math.pi * fraction)
+
+
+def trail_points(kinematics, start, goal, samples=TRAIL_SAMPLES):
+    """Gripper positions along the joint interpolation the animation will follow."""
+    if samples < 2:
+        raise ValueError("A trail needs at least two samples")
+    import numpy as np
+    return np.array([kinematics.forward_kinematics(np.array(interpolation(start, goal, i / (samples - 1))))[:3, 3]
+                     for i in range(samples)])
 
 
 def interpolation(start, target, fraction):
@@ -119,6 +144,12 @@ def run(args):
     latest_target = None
     target_revision = 0
     motion_active = False
+    trail = []
+
+    def clear_trail():
+        for handle in trail:
+            handle.remove()
+        trail.clear()
 
     def enqueue(kind, client_id=None, target=()):
         # Callbacks only enqueue immutable input. All IK, bus I/O and motion state
@@ -175,7 +206,7 @@ def run(args):
                 raise RuntimeError("Calibration missing or mismatched; return to Communication and Calibration")
             if any(arm.bus.read("Torque_Enable", name, normalize=False) != 0 for name in arm.bus.motors):
                 raise RuntimeError("Torque already enabled; cut power and investigate")
-            limits = control.calibrated_limits(arm, model_limits)
+            limits = control.calibrated_limits(arm)
             current, opening = read_pose()
         else:
             current = np.array(control.PREVIEW_JOINTS_DEG)
@@ -211,13 +242,15 @@ def run(args):
         mode_label = copy("实机只读 · 不发送动作", "Hardware readback only · no motor commands") if arm else copy("模型预览 · 未连接硬件", "Model preview · no hardware")
         mode_text = server.gui.add_markdown(f"### {mode_label}")
         server.gui.add_markdown(copy(
-            "蓝色：当前五轴姿态。橙色：待执行目标。拖动红、绿、蓝轴改变 X、Y、Z；旋转视角不会改变底座坐标。",
-            "Blue: current five-joint pose. Orange: target preview. Drag the red, green, or blue axis for X, Y, Z. Camera rotation does not change the base frame.",
+            "蓝色：当前五轴姿态。橙色：待执行目标。预览运动时先画出夹爪轨迹，蓝色模型再沿轨迹移动。拖动红、绿、蓝轴改变 X、Y、Z；旋转视角不会改变底座坐标。",
+            "Blue: current five-joint pose. Orange: target preview. Animation draws the gripper path first, then moves the blue model along it. Drag the red, green, or blue axis for X, Y, Z. Camera rotation does not change the base frame.",
         ))
         feedback = server.gui.add_markdown("")
-        status = server.gui.add_markdown(copy("拖动目标，或用下方按钮沿 Z 轴增加 2 mm。", "Drag the target, or use the button for a 2 mm Z offset."))
-        nudge = server.gui.add_button(copy("目标 Z +2 mm", "Target Z +2 mm"))
-        execute = server.gui.add_button(copy("预览模型运动", "Animate model target"), disabled=bool(arm))
+        nudge_mm = control.STEP_MM if arm else MODEL_STEP_MM
+        status = server.gui.add_markdown(copy(f"拖动目标，或用下方按钮沿 Z 轴增加 {nudge_mm:g} mm。", f"Drag the target, or use the button for a {nudge_mm:g} mm Z offset."))
+        nudge = server.gui.add_button(copy(f"目标 Z +{nudge_mm:g} mm", f"Target Z +{nudge_mm:g} mm"))
+        # Enabled only once a preview has been solved and inspected.
+        execute = server.gui.add_button(copy("预览模型运动", "Animate model target"), disabled=True)
         reset = server.gui.add_button(copy("目标回到当前姿态", "Reset target to current pose"))
         quit_button = server.gui.add_button(copy("关闭预览", "Close preview"))
         server.gui.add_markdown(copy(
@@ -293,7 +326,8 @@ def run(args):
                         control.check_step(current, current, startup, actual, startup_xyz, args)
                         if max(abs(target_q - startup)) > args.session_joint_envelope_deg:
                             raise ValueError("Joint session envelope reached")
-                        duration = max(float(max(abs(target_q - current))) / JOINT_TARGET_RATE_DEG_S, UPDATE_SECONDS)
+                        duration = max(float(max(abs(target_q - current))) / JOINT_TARGET_RATE_DEG_S, ANIMATION_MIN_SECONDS)
+                        path = trail_points(kinematics, current, target_q)
                         with preview_lock:
                             # Claim only after the possibly blocking fresh read.
                             # A drag during that read invalidates this request.
@@ -306,14 +340,18 @@ def run(args):
                             target_revision += 1
                         execute.disabled = True
                         gizmo.visible = False
+                        clear_trail()
+                        trail.append(server.scene.add_spline_catmull_rom("/trail/path", path, color=TRAIL_COLOR, thickness=0.004))
+                        trail.append(server.scene.add_point_cloud("/trail/waypoints", path[::6], np.tile(TRAIL_COLOR, (len(path[::6]), 1)), point_size=0.008, point_shape="circle"))
                     except (ValueError, RuntimeError) as exc:
                         status.content = f"{copy('目标未执行', 'Target not executed')}: {exc}"
                     continue
+                clear_trail()  # A new target makes the drawn path stale.
                 if request.kind == "reset":
                     target_xyz = xyz.copy()
                     gizmo.position = tuple(target_xyz)
                 elif request.kind == "nudge":
-                    target_xyz = xyz + np.array([0, 0, control.STEP_MM / 1000])
+                    target_xyz = xyz + np.array([0, 0, nudge_mm / 1000])
                     gizmo.position = tuple(target_xyz)
                 elif request.kind == "target":
                     target_xyz = np.asarray(request.target, dtype=float)
@@ -343,7 +381,7 @@ def run(args):
                     status.content = f"{copy('目标未执行', 'Target not executed')}: {exc}"
             if job is not None:
                 initial, goal, began, duration = job
-                proposed = np.array(interpolation(initial, goal, min((time.monotonic() - began) / duration, 1.0)))
+                proposed = np.array(interpolation(initial, goal, eased(min((time.monotonic() - began) / duration, 1.0))))
                 require_connected_operator()
                 if arm:
                     current, opening = read_pose()
@@ -384,8 +422,8 @@ def main(argv=None):
     parser.add_argument("--confirm-model-match", action="store_true")
     args = parser.parse_args(argv)
     args.max_joint_step_deg = control.MAX_JOINT_STEP_DEG
-    args.session_joint_envelope_deg = control.SESSION_JOINT_ENVELOPE_DEG
-    args.session_xyz_envelope_mm = control.SESSION_XYZ_ENVELOPE_MM
+    args.session_joint_envelope_deg = control.SESSION_JOINT_ENVELOPE_DEG if args.readback else MODEL_JOINT_ENVELOPE_DEG
+    args.session_xyz_envelope_mm = control.SESSION_XYZ_ENVELOPE_MM if args.readback else MODEL_XYZ_ENVELOPE_MM
     if args.readback and not all((args.port, args.robot_id, args.calibration_dir, args.confirm_model_match)):
         parser.error("Readback mode requires port, robot-id, calibration-dir, and confirm-model-match")
     if not args.readback and any((args.port, args.robot_id, args.calibration_dir, args.confirm_model_match)):
