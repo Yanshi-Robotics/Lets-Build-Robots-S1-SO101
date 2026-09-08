@@ -161,7 +161,7 @@ def run(args):
 
     if version("viser") != VISER_VERSION:
         raise RuntimeError(f"Use viser[urdf]=={VISER_VERSION}")
-    zh = args.locale == "zh"
+    zh = args.locale == "cn"
     copy = lambda chinese, english: chinese if zh else english
     kinematics, model_limits = control.load_kinematics(args.model_dir)
     reading_limits = target_limits = model_limits
@@ -292,7 +292,8 @@ def run(args):
             with server.gui.add_folder(copy("力矩", "Torque")):
                 arm_word = server.gui.add_text(copy(f"输入 {ARM_WORD} 再点启用", f"Type {ARM_WORD}, then enable"), "")
                 arm_button = server.gui.add_button(copy("启用力矩并保持当前姿态", "Enable torque and hold this pose"))
-                release_button = server.gui.add_button(copy("释放力矩（先托住手臂）", "Release torque (support the arm first)"), disabled=True)
+                release_button = server.gui.add_button(copy("释放力矩", "Release torque"), disabled=True,
+                                                       hint=copy("先托住手臂：释放后六个电机不再出力，手臂会下落", "Support the arm first: after release the six motors stop driving and the arm drops"))
         quit_button = server.gui.add_button(copy("关闭程序", "Close program"))
         server.gui.add_markdown(copy(
             "执行时每次只发送一小步关节目标，速度上限每秒 10°；实物落后指令超过 8° 即停止并保持。力矩开着时不能关闭程序，要先托住手臂、释放力矩；终端里按 Ctrl+C 会直接释放力矩，手臂会下落。软件不是物理断电。",
@@ -556,7 +557,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--web-port", type=int, required=True, help="Explicitly allocated local web port; no automatic choice")
-    parser.add_argument("--locale", choices=("zh", "en"), default="zh")
+    parser.add_argument("--locale", choices=("cn", "en"), default="cn", help="Interface language: cn (Chinese, default) or en (English)")
     parser.add_argument("--hardware", action="store_true", help="Connect the Follower bus: live readings; motion only after arming with ENABLE")
     parser.add_argument("--port")
     parser.add_argument("--robot-id")

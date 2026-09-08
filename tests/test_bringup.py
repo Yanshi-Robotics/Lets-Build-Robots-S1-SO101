@@ -107,7 +107,13 @@ class VisualControlTests(unittest.TestCase):
                 visual.main(["--model-dir", "not-a-device", "--web-port", "4602", "--hardware"])
             with self.assertRaises(SystemExit):
                 visual.main(["--model-dir", "not-a-device", "--web-port", "4602", "--port", "x"])
+            with self.assertRaises(SystemExit):  # interface languages are cn and en only
+                visual.main(["--model-dir", "not-a-device", "--web-port", "4602", "--locale", "zh"])
             run.assert_not_called()
+            visual.main(["--model-dir", "not-a-device", "--web-port", "4602", "--locale", "cn"])
+            self.assertEqual(run.call_args.args[0].locale, "cn")
+            visual.main(["--model-dir", "not-a-device", "--web-port", "4602"])
+            self.assertEqual(run.call_args.args[0].locale, "cn")
 
     def test_visual_torque_only_through_the_checked_hold_and_explicit_release(self):
         # Torque is enabled only by control.configure_and_hold (validated snapshot, hold, then enable);
