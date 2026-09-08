@@ -206,6 +206,16 @@ class VisualControlTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     visual.main(["--model-dir", "not-a-device", "--web-port", "4602", *bad])
 
+    def test_emergency_stop_never_releases_torque(self):
+        # The only functions allowed to switch torque off are the explicit release and the exit path.
+        tree = ast.parse(Path(visual.__file__).read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in ("emergency_stop", "abort_and_hold", "clear_emergency_stop"):
+                calls = {n.func.attr for n in ast.walk(node) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+                self.assertNotIn("disable_torque", calls, node.name)
+        for phrase in ("紧急停止", "EMERGENCY STOP", "解除紧急停止", "Clear emergency stop"):
+            self.assertIn(phrase, Path(visual.__file__).read_text())
+
     def test_arming_needs_the_exact_word(self):
         self.assertTrue(visual.arming_requested(" ENABLE "))
         for text in ("enable", "", "ENABLE now", "yes"):

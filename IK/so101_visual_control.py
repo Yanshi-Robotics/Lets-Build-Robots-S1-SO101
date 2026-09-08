@@ -6,8 +6,9 @@ a joint slider sets the orange goal; Plan trajectory computes the path and runs 
 orange model along it; Execute follows it. Model mode (default) moves the model only.
 --hardware connects the Follower bus: readings are live from the start, motion is sent
 only after the operator arms the arm by typing ENABLE, every command is a small joint
-step at a limited rate, the arm is watched for lag, Stop holds the current position, and
-EMERGENCY STOP cuts torque. There is no collision detection: the operator watches the
+step at a limited rate, the arm is watched for lag and load, and every stop, the
+emergency one included, holds position with torque on; only Release torque switches
+the motors off. There is no collision detection: the operator watches the
 arm and keeps the DC cutoff within reach. Keep so101_cartesian_demo.py in the same directory.
 """
 from __future__ import annotations
@@ -208,6 +209,61 @@ def validate_web_port(port):
         probe.bind((LOOPBACK, port))
 
 
+def help_markdown(zh, args):
+    e, l = f"{args.contact_error_deg:g}", f"{args.contact_load_pct:g}"
+    if zh:
+        return f"""#### 颜色与手柄
+- **蓝色手臂**：当前姿态。实机模式下来自电机回读；每个关节显示度数，括号里是编码器格数，就是校准表里那种读数。
+- **橙色手臂**：目标姿态，尚未执行。橙色线和圆点是计划好的夹爪路径。
+- **操纵柄**：三根箭头沿底座 X、Y、Z 单轴拖，三个平面手柄在两轴平面里拖。拖到够不到的地方会弹回上一个可达位置。
+- **滑杆**：直接给五个关节和夹爪设目标；和操纵柄是同一个目标的两种给法。
+
+#### 三步走
+1. **目标**：拖操纵柄或拨滑杆，橙色手臂出现。
+2. **计划轨迹**：算出从当前到目标的路径并画出来，橙色模型走一遍演示（每秒 {PREVIEW_RATE_DEG_S:g}°，只是演示）。改了目标就要重新计划。
+3. **执行运动**：沿计划的轨迹过去。模型模式动蓝色模型；实机模式动真机，速度上限每秒 {MOTION_RATE_DEG_S:g}°，每个周期只发一小步。
+
+#### 力矩（实机模式）
+- **启用力矩并保持当前姿态**：先输入 {ARM_WORD}。程序核对读数在校准范围内，把六个电机的目标设成当前位置，再开力矩。可以在休息姿态直接启用。
+- **释放力矩**：六个电机同时停止出力，手臂会失去支撑，先托住再点。这是唯一让电机松开的按钮。
+
+#### 四种停
+- **停止并保持**：执行中随时可按，停在原地，电机继续出力。
+- **自动停止**：执行中某关节落后指令超过 {e}° 且负载超过 {l}%（判定为碰到东西）、落后超过 {TRACKING_ABORT_DEG:g}°、LeRobot 截短了目标、浏览器断开，程序都自动停止并保持，状态行写明原因。
+- **紧急停止**：任何时候都能按，比如执行中看到手臂快撞到东西。立刻停在原地并保持力矩，绝不卸力；之后界面锁住，检查完点“解除紧急停止”继续，或托住手臂后点“释放力矩”。
+- **终端 Ctrl+C**：程序退出，退出前释放力矩，手臂会掉。只作最后手段。
+
+#### 边界
+- 程序不识别障碍物，也不规划避障；碰撞检测是碰上之后才停，不是提前避开。
+- “负载”一行实时显示六个电机的负载百分比，用它来调 `--contact-error-deg` 和 `--contact-load-pct`。
+- 力矩开着时不能关闭程序，先释放。软件停止不是物理断电，直流电源开关必须在手边。"""
+    return f"""#### Colours and handles
+- **Blue arm**: current pose. In hardware mode it comes from the motors; each joint shows degrees with the encoder count in brackets, the same number as in the calibration table.
+- **Orange arm**: goal pose, not yet executed. The orange line and dots are the planned gripper path.
+- **Handle**: three arrows drag along base X, Y or Z; three plane handles drag in a two-axis plane. Dragged out of reach it snaps back to the last reachable position.
+- **Sliders**: set the five joints and the gripper directly; the handle and the sliders are two ways of giving the same goal.
+
+#### Three steps
+1. **Goal**: drag the handle or move a slider; the orange arm appears.
+2. **Plan trajectory**: computes and draws the path from the current pose to the goal and runs the orange model along it ({PREVIEW_RATE_DEG_S:g}° per second, a demonstration only). Changing the goal requires planning again.
+3. **Execute**: follows the planned trajectory. Model mode moves the blue model; hardware mode moves the arm at no more than {MOTION_RATE_DEG_S:g}° per second, one small step per cycle.
+
+#### Torque (hardware mode)
+- **Enable torque and hold this pose**: type {ARM_WORD} first. The program checks the readings are inside the calibrated range, sets all six motor targets to the present position, then switches torque on. It may be done in the rest pose.
+- **Release torque**: all six motors stop driving and the arm loses its support, so hold it before pressing. This is the only button that lets the motors go.
+
+#### Four kinds of stop
+- **Stop and hold**: available at any moment during execution; the arm stops in place with the motors still driving.
+- **Automatic stop**: during execution a joint more than {e}° behind its command at over {l}% load (taken as contact), a lag over {TRACKING_ABORT_DEG:g}°, a target clipped by LeRobot, or a browser disconnect all stop and hold, and the status line states why.
+- **EMERGENCY STOP**: available at any moment, for example when you see the arm about to hit something during execution. It stops in place at once with torque kept on and never releases; the interface then locks until you press Clear emergency stop after checking, or Release torque with the arm supported.
+- **Ctrl+C in the terminal**: the program exits and releases torque first, so the arm drops. Last resort only.
+
+#### Boundaries
+- The program does not recognise obstacles or plan around them; contact detection stops after contact, it does not avoid it.
+- The Load line shows the six motor loads live; use it to tune `--contact-error-deg` and `--contact-load-pct`.
+- The program cannot be closed while torque is on; release first. A software stop is not a physical power cutoff; keep the DC switch within reach."""
+
+
 def run(args):
     import viser
     from viser.extras import ViserUrdf
@@ -329,7 +385,7 @@ def run(args):
 
         def mode_label():
             if estopped:
-                return copy("紧急停止 · 力矩已切断，重开程序才能再启用", "Emergency stop · torque cut, restart the program to enable again")
+                return copy("紧急停止 · 停在原地并保持力矩，解除后才能继续", "Emergency stop · holding in place with torque on; clear it to continue")
             if not arm:
                 return copy("模型模式 · 未连接硬件", "Model mode · no hardware")
             return copy("实机模式 · 力矩已启用，执行会动真机", "Hardware mode · torque on, Execute moves the arm") if armed \
@@ -363,12 +419,14 @@ def run(args):
                 release_button = server.gui.add_button(copy("释放力矩", "Release torque"), disabled=True,
                                                        hint=copy("先托住手臂：释放后六个电机不再出力，手臂会下落", "Support the arm first: after release the six motors stop driving and the arm drops"))
         estop_button = server.gui.add_button(copy("紧急停止", "EMERGENCY STOP"), color="red",
-                                             hint=copy("立刻停止并切断力矩，手臂会下落；之后要重开程序", "Stop at once and cut torque; the arm drops; restart the program afterwards"))
+                                             hint=copy("任何时候可按：立刻停在原地并保持力矩，绝不卸力；之后界面锁住，检查完再解除", "Press at any moment: stops in place with torque kept on, never releases; the interface then locks until you clear it"))
+        clear_estop_button = server.gui.add_button(copy("解除紧急停止", "Clear emergency stop"), disabled=True,
+                                                   hint=copy("检查过手臂和周围之后再点；力矩保持不变", "Press after checking the arm and its surroundings; torque stays as it is"))
+        help_button = server.gui.add_button(copy("说明", "Help"), hint=copy("展开或收起完整说明", "Show or hide the full explanation"))
         quit_button = server.gui.add_button(copy("关闭程序", "Close program"))
-        server.gui.add_markdown(copy(
-            f"三种停法：“停止并保持”停在原地、电机继续出力；“释放力矩”是单独的一步，先托住手臂再点；“紧急停止”立刻切断全部力矩，手臂会掉。执行时每次只发一小步，速度上限每秒 10°；某个关节落后指令超过 {args.contact_error_deg:g}° 且负载超过 {args.contact_load_pct:g}%，判定为碰到东西，自动停止并保持；落后超过 8° 同样停。它只能在碰上之后停，不会提前避开。力矩开着时不能关闭程序；终端 Ctrl+C 会直接卸力。软件不是物理断电。",
-            f"Three ways to stop: Stop and hold keeps the motors driving in place; Release torque is a separate step, support the arm first; EMERGENCY STOP cuts all torque at once and the arm drops. Execution sends one small step at a time, at most 10° per second; a joint more than {args.contact_error_deg:g}° behind its command at over {args.contact_load_pct:g}% load counts as contact and stops and holds, as does lagging by more than 8°. It stops after contact; it does not avoid it. The program cannot be closed while torque is on; Ctrl+C in the terminal releases torque at once. Software is not a physical power cutoff.",
-        ))
+        server.gui.add_markdown(copy("完整说明在“说明”按钮里。软件停止不是物理断电，直流电源开关要在手边。",
+                                     "The full explanation is behind the Help button. A software stop is not a physical power cutoff; keep the DC switch within reach."))
+        help_text = server.gui.add_markdown(help_markdown(zh, args), visible=False)
 
         @server.on_client_connect
         def connected(client):
@@ -397,6 +455,8 @@ def run(args):
         stop.on_click(lambda event: enqueue("stop", event.client_id))
         reset.on_click(lambda event: enqueue("reset", event.client_id))
         estop_button.on_click(lambda event: enqueue("estop", event.client_id))
+        clear_estop_button.on_click(lambda event: enqueue("clear-estop", event.client_id))
+        help_button.on_click(lambda event: enqueue("help", event.client_id))
         if arm:
             arm_button.on_click(lambda event: enqueue("arm", event.client_id, arm_word.value))
             release_button.on_click(lambda event: enqueue("release", event.client_id))
@@ -411,9 +471,10 @@ def run(args):
             plan_button.disabled = estopped or goal is None or phase != "idle"
             execute.disabled = estopped or plan is None or phase != "idle" or (bool(arm) and not armed)
             stop.disabled = phase != "executing"
+            clear_estop_button.disabled = not estopped
             if arm:
                 arm_button.disabled = estopped or armed
-                release_button.disabled = estopped or not armed
+                release_button.disabled = not armed  # Always a way out, latched or not: support the arm first.
             mode_text.content = f"### {mode_label()}"
 
         def set_goal(goal_q, opening_goal):
@@ -467,20 +528,26 @@ def run(args):
             print(f"STOP-HOLD: {reason}", file=sys.stderr)
 
         def emergency_stop():
-            """Cut torque now. The arm drops; the operator restarts the program to continue."""
-            nonlocal phase, last_command, armed, estopped, plan
+            """Freeze in place with torque kept on, then latch. Releasing torque here would drop the arm."""
+            nonlocal phase, last_command, estopped, plan
+            if arm and armed:
+                hold_here(current, opening)
             phase = "idle"
             last_command = None
             plan = None
             estopped = True
-            if arm:
-                arm.bus.disable_torque()
-                armed = False
             clear_trail()
             gizmo.visible = True
             refresh_buttons()
-            status.content = copy("紧急停止：力矩已切断。检查手臂，然后重开程序。", "EMERGENCY STOP: torque cut. Check the arm, then restart the program.")
-            print("EMERGENCY STOP: torque cut on all motors.", file=sys.stderr)
+            status.content = copy("紧急停止：已停在原地并保持力矩。检查手臂和周围，然后点“解除紧急停止”继续，或托住手臂后“释放力矩”。",
+                                  "EMERGENCY STOP: holding in place with torque on. Check the arm and its surroundings, then press Clear emergency stop to continue, or Release torque with the arm supported.")
+            print("EMERGENCY STOP: holding in place; torque unchanged.", file=sys.stderr)
+
+        def clear_emergency_stop():
+            nonlocal estopped
+            estopped = False
+            refresh_buttons()
+            status.content = copy("紧急停止已解除。目标和计划需要重新给。", "Emergency stop cleared. Set the goal and plan again.")
 
         print(f"Open http://{LOOPBACK}:{args.web_port}; mode={mode_label()}")
         while True:
@@ -510,7 +577,7 @@ def run(args):
                     if pending is not None:
                         batch.append(pending)
                 latest_drag = latest_joints = None
-            batch.sort(key=lambda r: r.created)
+            batch.sort(key=lambda r: (r.kind != "estop", r.created))  # An emergency stop goes first.
             for request in batch:
                 if request.kind == "connected":
                     if owner is None:
@@ -522,6 +589,13 @@ def run(args):
                     emergency_stop()
                     continue
                 if request.client_id is not None and request.client_id != owner:
+                    continue
+                if request.kind == "help":
+                    help_text.visible = not help_text.visible
+                    continue
+                if request.kind == "clear-estop":
+                    if estopped:
+                        clear_emergency_stop()
                     continue
                 try:
                     if request.kind == "quit-refused":
@@ -565,7 +639,7 @@ def run(args):
                             status.content = copy("目标已回到当前姿态。", "Goal reset to the current pose.")
                     elif request.kind == "plan":
                         if estopped:
-                            raise ValueError("Emergency stop is latched; restart the program")
+                            raise ValueError("Emergency stop is latched; clear it first")
                         if goal is None:
                             raise ValueError("No goal; drag the target or move a slider first")
                         plan = make_plan()
@@ -575,7 +649,7 @@ def run(args):
                     elif request.kind == "execute":
                         check_request(request, owner, time.monotonic(), server.get_clients())
                         if estopped:
-                            raise ValueError("Emergency stop is latched; restart the program")
+                            raise ValueError("Emergency stop is latched; clear it first")
                         if plan is None:
                             raise ValueError("No plan; press Plan trajectory first")
                         if arm and not armed:
@@ -592,7 +666,7 @@ def run(args):
                     elif request.kind == "arm":
                         check_request(request, owner, time.monotonic(), server.get_clients())
                         if estopped:
-                            raise ValueError("Emergency stop is latched; restart the program")
+                            raise ValueError("Emergency stop is latched; clear it first")
                         if not arming_requested(str(request.payload)):
                             raise ValueError(f"Type {ARM_WORD} in the text box first")
                         from lerobot.motors.feetech import OperatingMode

@@ -21,7 +21,7 @@ Season 1 starts with printing and assembling two SO-101 arms and ends with a tra
 
 - **`Bringup/`**: `so101_bus_check.py` reads all six motors on one bus; `so101_calibrate.py` records each joint's mid position and range. Used in Lesson 6.
 - **`IK/`**: `so101_cartesian_demo.py` solves inverse kinematics for a gripper target; `so101_visual_control.py` shows the arm in a browser, plans a path to a dragged target, and in hardware mode reads the arm and executes the path after you arm it with ENABLE. Used in Lesson 7. The two files import each other and stay in the same folder.
-- **`tests/`**: 43 tests that run the programs against fake hardware.
+- **`tests/`**: 44 tests that run the programs against fake hardware.
 - **`tools/`**: `build_control_poses.py` computes the poses drawn in the lesson illustrations.
 
 The lessons print these paths, so files here are not moved or renamed. Later tasks get their own folders, such as `ACT-1-Pick`.
