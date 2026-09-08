@@ -230,6 +230,13 @@ class VisualControlTests(unittest.TestCase):
         self.assertNotIn("get_observation()", source)
         self.assertGreaterEqual(visual.READ_RETRIES, 2)
 
+    def test_reading_margin_covers_a_motor_holding_against_a_stop(self):
+        # Measured: torque on against the shoulder_lift stop read 1.7 deg past the hand-recorded minimum.
+        self.assertGreaterEqual(demo.LIMIT_MARGIN_DEG, 3.0)
+        self.assertLess(demo.LIMIT_MARGIN_DEG, 15.0)  # still small next to a wrong-file mismatch
+        source = Path(visual.__file__).read_text()
+        self.assertIn("except ValueError as exc:", source)  # an out-of-range reading stops and holds, it never exits
+
     def test_arming_needs_the_exact_word(self):
         self.assertTrue(visual.arming_requested(" ENABLE "))
         for text in ("enable", "", "ENABLE now", "yes"):

@@ -28,9 +28,12 @@ URDF_SHA256 = "3a65d2d35e68a8d2f0c2cc176d19b884506543c93ba72980145b80abe276022c"
 PREVIEW_JOINTS_DEG = (0.0, -30.0, 60.0, -30.0, 0.0)
 # Conservative teaching bounds, not measured hardware safety guarantees.
 STEP_MM = 2.0
-# A reading taken on a mechanical stop equals the recorded bound up to float rounding
-# and a little mechanical slack; without this margin every honest rest pose is refused.
-LIMIT_MARGIN_DEG = 1.0
+# A reading taken on a mechanical stop can sit past the recorded bound: the range was
+# recorded by hand with torque off, and a motor holding against the same stop compresses
+# the printed part further. Measured 2026-09-08 on a Follower: 1.7 deg past the recorded
+# shoulder_lift minimum with torque on. The margin still catches a wrong calibration file,
+# which is tens of degrees off, without refusing an honest rest pose.
+LIMIT_MARGIN_DEG = 5.0
 MAX_JOINT_STEP_DEG = 2.0
 SESSION_JOINT_ENVELOPE_DEG = 8.0
 SESSION_XYZ_ENVELOPE_MM = 20.0

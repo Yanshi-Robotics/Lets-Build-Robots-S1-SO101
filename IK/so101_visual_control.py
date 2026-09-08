@@ -300,6 +300,7 @@ def run(args):
     step = 0
     settle_ticks = 0
     comm_failures = 0
+    read_failures = 0
     last_command = None
     trail = []
 
@@ -527,7 +528,10 @@ def run(args):
         def abort_and_hold(reason):
             nonlocal phase, last_command, plan
             if arm and armed:
-                hold_here(current, opening)
+                try:
+                    hold_here(current, opening)
+                except (ConnectionError, RuntimeError, OSError) as exc:
+                    print(f"hold command failed ({exc}); the servos keep their last goal", file=sys.stderr)
             phase = "idle"
             last_command = None
             plan = None
@@ -541,7 +545,10 @@ def run(args):
             """Freeze in place with torque kept on, then latch. Releasing torque here would drop the arm."""
             nonlocal phase, last_command, estopped, plan
             if arm and armed:
-                hold_here(current, opening)
+                try:
+                    hold_here(current, opening)
+                except (ConnectionError, RuntimeError, OSError) as exc:
+                    print(f"hold command failed ({exc}); the servos keep their last goal", file=sys.stderr)
             phase = "idle"
             last_command = None
             plan = None
@@ -571,8 +578,26 @@ def run(args):
                     abort_and_hold(copy("浏览器断开", "browser disconnected"))
                 print("Controlling browser disconnected; the next page to connect takes control. Ctrl+C releases torque and exits.", file=sys.stderr)
             if arm:
-                current, opening = read_pose()
-                raw_loads = arm.bus.sync_read("Present_Load", normalize=False, num_retry=LOAD_READ_RETRIES)
+                try:
+                    current, opening = read_pose()
+                    raw_loads = arm.bus.sync_read("Present_Load", normalize=False, num_retry=LOAD_READ_RETRIES)
+                    read_failures = 0
+                except ValueError as exc:
+                    # A reading outside the calibrated range. Once running this is never fatal: exiting
+                    # would release torque and drop the arm. Stop, hold, report, keep the last good pose.
+                    if phase == "executing":
+                        abort_and_hold(copy("读数超出校准范围", "reading outside the calibrated range"))
+                    status.content = copy(f"读数超出校准范围：{exc}。反复出现就检查标定文件是否属于这只臂。", f"Reading outside the calibrated range: {exc}. If it persists, check that the calibration file belongs to this arm.")
+                    time.sleep(UPDATE_SECONDS)
+                    continue
+                except (ConnectionError, RuntimeError, OSError) as exc:
+                    read_failures += 1
+                    print(f"bus read failed ({read_failures}): {exc}", file=sys.stderr)
+                    if phase == "executing" and read_failures >= COMM_FAILURE_LIMIT:
+                        abort_and_hold(copy("总线通信连续失败", "bus communication failed repeatedly"))
+                    status.content = copy(f"总线读取失败 {read_failures} 次，正在重试；电机仍保持上一个目标。", f"Bus read failed {read_failures} times, retrying; the motors still hold their last target.")
+                    time.sleep(UPDATE_SECONDS)
+                    continue
                 loads = [load_percent(raw_loads[name]) for name in control.JOINTS]
                 load_text.content = f"**{copy('负载', 'Load')} / %**: " + " · ".join(f"F{i + 1} {v:.0f}" for i, v in enumerate(loads)) + f" · {copy('夹爪', 'gripper')} {load_percent(raw_loads['gripper']):.0f}"
             actual_model.update_cfg(np.array(viewer_configuration(names, current)))
