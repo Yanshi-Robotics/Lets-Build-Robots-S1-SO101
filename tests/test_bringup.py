@@ -216,6 +216,20 @@ class VisualControlTests(unittest.TestCase):
         for phrase in ("紧急停止", "EMERGENCY STOP", "解除紧急停止", "Clear emergency stop"):
             self.assertIn(phrase, Path(visual.__file__).read_text())
 
+    def test_settling_ends_by_tolerance_or_by_timeout_never_hangs(self):
+        self.assertEqual(visual.settle_state(0.5, 0), "done")
+        self.assertEqual(visual.settle_state(1.2, 0), "wait")
+        ticks_to_timeout = int(visual.SETTLE_TIMEOUT_SECONDS / visual.UPDATE_SECONDS)
+        self.assertEqual(visual.settle_state(1.2, ticks_to_timeout - 1), "wait")
+        self.assertEqual(visual.settle_state(1.2, ticks_to_timeout), "timeout")
+        self.assertGreaterEqual(visual.REPLAN_TOLERANCE_DEG, 1.0)  # holding sag must not force endless re-planning
+
+    def test_pose_reads_are_retried(self):
+        source = Path(visual.__file__).read_text()
+        self.assertIn('sync_read("Present_Position", num_retry=READ_RETRIES)', source)
+        self.assertNotIn("get_observation()", source)
+        self.assertGreaterEqual(visual.READ_RETRIES, 2)
+
     def test_arming_needs_the_exact_word(self):
         self.assertTrue(visual.arming_requested(" ENABLE "))
         for text in ("enable", "", "ENABLE now", "yes"):

@@ -46,7 +46,9 @@ CONTACT_LOAD_PCT = 60.0
 LOAD_READ_RETRIES = 2
 SETTLE_TOLERANCE_DEG = 0.8
 SETTLE_TIMEOUT_SECONDS = 2.0
-REPLAN_TOLERANCE_DEG = 0.5  # The arm moved since planning: plan again.
+REPLAN_TOLERANCE_DEG = 1.0  # The arm moved since planning: plan again. Holding sag stays well under this.
+READ_RETRIES = 3  # Bus reads retry before a failure counts; one bad packet must not drop the arm.
+COMM_FAILURE_LIMIT = 3  # Consecutive failed cycles during execution before stopping and holding.
 MAX_REQUEST_AGE_SECONDS = 0.5  # Reject queued execution requests rather than replay them.
 SLIDER_STEP_DEG = 0.5
 ARM_WORD = "ENABLE"
@@ -129,6 +131,13 @@ def blocked_joints(current, commanded, loads_pct, error_deg, load_pct):
     return [(name, abs(float(c) - float(g)), float(load))
             for name, c, g, load in zip(control.JOINTS, current, commanded, loads_pct)
             if abs(float(c) - float(g)) > error_deg and float(load) > load_pct]
+
+
+def settle_state(residual_deg, settle_ticks):
+    """After the last command: done when close enough, otherwise wait, then accept with a note."""
+    if residual_deg <= SETTLE_TOLERANCE_DEG:
+        return "done"
+    return "timeout" if settle_ticks * UPDATE_SECONDS >= SETTLE_TIMEOUT_SECONDS else "wait"
 
 
 def lag(current, commanded):
@@ -289,6 +298,8 @@ def run(args):
     plan = None  # Plan: how to get there, computed on request
     phase = "idle"  # idle | planning (ghost runs the path) | executing
     step = 0
+    settle_ticks = 0
+    comm_failures = 0
     last_command = None
     trail = []
 
@@ -316,10 +327,11 @@ def run(args):
             pass  # Dropped input is safer than a replayed backlog.
 
     def read_pose():
-        observation = arm.get_observation()
-        q = np.array([observation[f"{name}.pos"] for name in control.JOINTS], dtype=float)
+        # Same normalisation as get_observation, but retried: a single bad packet must not end the program.
+        positions = arm.bus.sync_read("Present_Position", num_retry=READ_RETRIES)
+        q = np.array([positions[name] for name in control.JOINTS], dtype=float)
         control.validate_joints(q, reading_limits)
-        opening = float(observation["gripper.pos"])
+        opening = float(positions["gripper"])
         if not math.isfinite(opening) or not 0 <= opening <= 100:
             raise ValueError("Gripper readback is outside its calibrated range")
         return q, opening
@@ -650,6 +662,8 @@ def run(args):
                         refresh_buttons()
                         status.content = copy(f"已计划，橙色模型正在走这条路；真正执行约需 {plan.duration:.1f} s。满意就点“执行运动”。", f"Planned; the orange model is running the path. Execution will take about {plan.duration:.1f} s. Press Execute if it looks right.")
                     elif request.kind == "execute":
+                        if len(server.get_clients()) > 1:
+                            raise ValueError(copy("有第二个浏览器页面连着，关掉它再执行", "A second browser page is connected; close it before executing"))
                         check_request(request, owner, time.monotonic(), server.get_clients())
                         if estopped:
                             raise ValueError("Emergency stop is latched; clear it first")
@@ -661,12 +675,14 @@ def run(args):
                             plan = None
                             refresh_buttons()
                             raise ValueError("The arm moved since planning; plan again")
-                        phase, step = "executing", 0
+                        phase, step, settle_ticks, comm_failures = "executing", 0, 0, 0
                         last_command = tuple(plan.start)
                         gizmo.visible = False
                         refresh_buttons()
                         status.content = copy("执行中……", "Executing…")
                     elif request.kind == "arm":
+                        if len(server.get_clients()) > 1:
+                            raise ValueError(copy("有第二个浏览器页面连着，关掉它再启用", "A second browser page is connected; close it before enabling torque"))
                         check_request(request, owner, time.monotonic(), server.get_clients())
                         if estopped:
                             raise ValueError("Emergency stop is latched; clear it first")
@@ -718,22 +734,30 @@ def run(args):
                         continue
                     action = {f"{name}.pos": float(v) for name, v in zip(control.JOINTS, waypoint)}
                     action["gripper.pos"] = float(plan.gripper_start + (plan.gripper_goal - plan.gripper_start) * fraction)
-                    sent = arm.send_action(action)
+                    try:
+                        sent = arm.send_action(action)
+                        comm_failures = 0
+                    except (ConnectionError, RuntimeError, OSError) as exc:
+                        comm_failures += 1  # Skip this cycle; the previous command is still held by the servos.
+                        print(f"bus error during execution ({comm_failures}/{COMM_FAILURE_LIMIT}): {exc}", file=sys.stderr)
+                        if comm_failures >= COMM_FAILURE_LIMIT:
+                            abort_and_hold(copy("总线通信连续失败", "bus communication failed repeatedly"))
+                        continue
                     if any(abs(sent[key] - value) > control.SENT_TARGET_TOLERANCE_DEG for key, value in action.items()):
                         abort_and_hold(copy("LeRobot 截短了关节目标", "LeRobot clipped the joint target"))
                         continue
                     last_command = tuple(waypoint)
                     if step >= steps:
-                        if lag(current, plan.goal) <= SETTLE_TOLERANCE_DEG:
+                        residual = lag(current, plan.goal)
+                        state = settle_state(residual, settle_ticks)
+                        settle_ticks += 1
+                        if state != "wait":
                             phase, last_command, plan = "idle", None, None
                             gizmo.visible = True
                             clear_trail()
                             refresh_buttons()
-                            status.content = copy("已到达目标并保持。", "Goal reached and holding.")
-                        elif step > steps + SETTLE_TIMEOUT_SECONDS / UPDATE_SECONDS:
-                            abort_and_hold(copy("到位超时", "did not settle in time"))
-                        else:
-                            step += 1  # Keep counting while the arm settles at the final command.
+                            status.content = copy("已到达目标并保持。", "Goal reached and holding.") if state == "done" else \
+                                copy(f"已发出最终目标并保持，剩余误差 {residual:.1f}°。", f"Final target sent and holding; residual error {residual:.1f}°.")
                 else:
                     current = np.array(waypoint)
                     if step >= steps:
@@ -748,7 +772,10 @@ def run(args):
             if arm and arm.bus.is_connected:
                 if armed:
                     print("Releasing torque; support the arm.", file=sys.stderr)
-                    arm.bus.disable_torque()
+                    try:
+                        arm.bus.disable_torque()
+                    except Exception as exc:  # noqa: BLE001 - report, then still disconnect
+                        print(f"Torque release failed ({exc}); the motors may still be holding. Cut DC power to release.", file=sys.stderr)
                 arm.bus.disconnect(disable_torque=False)
         finally:
             if server:
