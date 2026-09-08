@@ -302,8 +302,6 @@ def run(args):
             else:
                 stop_requested.set()
                 return
-        if client_id is not None and client_id != owner and kind not in ("connected", "estop"):
-            return
         if kind in ("drag", "joints"):
             with lock:  # Coalesce: only the latest slider or drag position matters.
                 request = Request(kind, client_id, time.monotonic(), tuple(payload))
@@ -556,9 +554,10 @@ def run(args):
                 return
             if owner_lost:
                 owner_lost = False
+                owner = None  # The next page to connect, a refresh included, takes over.
                 if phase == "executing":
                     abort_and_hold(copy("浏览器断开", "browser disconnected"))
-                print("Browser disconnected; the program keeps holding. Ctrl+C releases torque and exits.", file=sys.stderr)
+                print("Controlling browser disconnected; the next page to connect takes control. Ctrl+C releases torque and exits.", file=sys.stderr)
             if arm:
                 current, opening = read_pose()
                 raw_loads = arm.bus.sync_read("Present_Load", normalize=False, num_retry=LOAD_READ_RETRIES)
@@ -582,13 +581,17 @@ def run(args):
                 if request.kind == "connected":
                     if owner is None:
                         owner = request.client_id
+                        status.content = copy("这个页面已接管控制。", "This page is now in control.")
                     else:
                         print("A second browser connected; only the first one is in control.", file=sys.stderr)
                     continue
                 if request.kind == "estop":
                     emergency_stop()
                     continue
+                if request.client_id is not None and owner is None:
+                    owner = request.client_id  # Input arrived before the connect notice was processed.
                 if request.client_id is not None and request.client_id != owner:
+                    status.content = copy("输入被忽略：另一个浏览器页面先连上了。关掉那个页面，或刷新本页接管。", "Input ignored: another browser page connected first. Close that page, or refresh this one to take over.")
                     continue
                 if request.kind == "help":
                     help_text.visible = not help_text.visible
