@@ -37,6 +37,12 @@ ANIMATION_MIN_SECONDS = 2.0  # Execution of even a tiny move takes at least this
 PREVIEW_RATE_DEG_S = 45.0  # The orange model only: fast enough to watch, nothing physical behind it.
 PREVIEW_MIN_SECONDS = 1.0
 TRACKING_ABORT_DEG = 8.0  # The arm lags its command by more than this: stop and hold.
+# Contact stop: a joint that falls behind its command while its motor load climbs has met
+# something. Defaults are conservative starting points; tune them on the real arm with
+# --contact-error-deg and --contact-load-pct. The gripper is excluded: grasping stalls by design.
+CONTACT_ERROR_DEG = 4.0
+CONTACT_LOAD_PCT = 60.0
+LOAD_READ_RETRIES = 2
 SETTLE_TOLERANCE_DEG = 0.8
 SETTLE_TIMEOUT_SECONDS = 2.0
 REPLAN_TOLERANCE_DEG = 0.5  # The arm moved since planning: plan again.
@@ -110,6 +116,18 @@ def trail_points(kinematics, start, goal, samples=TRAIL_SAMPLES):
 def motion_steps(duration):
     """Ticks a motion takes; steps, not wall-clock, so a slow tick cannot enlarge a step."""
     return max(1, math.ceil(float(duration) / UPDATE_SECONDS))
+
+
+def load_percent(raw_signed):
+    """Feetech Present_Load after LeRobot's sign decoding: tenths of a percent of full torque, signed."""
+    return abs(float(raw_signed)) / 10.0
+
+
+def blocked_joints(current, commanded, loads_pct, error_deg, load_pct):
+    """Arm joints that lag their command by more than error_deg while loaded above load_pct."""
+    return [(name, abs(float(c) - float(g)), float(load))
+            for name, c, g, load in zip(control.JOINTS, current, commanded, loads_pct)
+            if abs(float(c) - float(g)) > error_deg and float(load) > load_pct]
 
 
 def lag(current, commanded):
@@ -323,6 +341,7 @@ def run(args):
             "Blue: current pose, read from the motors in hardware mode. Orange: goal pose. Drag the axes or plane handles, or move the joint sliders, to set a goal; Plan trajectory computes the path and runs the orange model along it; Execute is what actually moves. Camera rotation does not change the base frame.",
         ))
         readout = server.gui.add_markdown("")
+        load_text = server.gui.add_markdown("")
         goal_text = server.gui.add_markdown("")
         status = server.gui.add_markdown(copy("拖动目标或拨动滑杆，先出现橙色目标。", "Drag the target or move a slider; the orange goal appears first."))
         bounds = slider_bounds(target_limits)
@@ -347,8 +366,8 @@ def run(args):
                                              hint=copy("立刻停止并切断力矩，手臂会下落；之后要重开程序", "Stop at once and cut torque; the arm drops; restart the program afterwards"))
         quit_button = server.gui.add_button(copy("关闭程序", "Close program"))
         server.gui.add_markdown(copy(
-            "三种停法：“停止并保持”停在原地、电机继续出力；“释放力矩”是单独的一步，先托住手臂再点；“紧急停止”立刻切断全部力矩，手臂会掉。执行时每次只发一小步，速度上限每秒 10°，实物落后指令超过 8° 自动停止并保持。力矩开着时不能关闭程序；终端 Ctrl+C 会直接卸力。软件不是物理断电。",
-            "Three ways to stop: Stop and hold keeps the motors driving in place; Release torque is a separate step, support the arm first; EMERGENCY STOP cuts all torque at once and the arm drops. Execution sends one small step at a time, at most 10° per second, and stops and holds if the arm lags by more than 8°. The program cannot be closed while torque is on; Ctrl+C in the terminal releases torque at once. Software is not a physical power cutoff.",
+            f"三种停法：“停止并保持”停在原地、电机继续出力；“释放力矩”是单独的一步，先托住手臂再点；“紧急停止”立刻切断全部力矩，手臂会掉。执行时每次只发一小步，速度上限每秒 10°；某个关节落后指令超过 {args.contact_error_deg:g}° 且负载超过 {args.contact_load_pct:g}%，判定为碰到东西，自动停止并保持；落后超过 8° 同样停。它只能在碰上之后停，不会提前避开。力矩开着时不能关闭程序；终端 Ctrl+C 会直接卸力。软件不是物理断电。",
+            f"Three ways to stop: Stop and hold keeps the motors driving in place; Release torque is a separate step, support the arm first; EMERGENCY STOP cuts all torque at once and the arm drops. Execution sends one small step at a time, at most 10° per second; a joint more than {args.contact_error_deg:g}° behind its command at over {args.contact_load_pct:g}% load counts as contact and stops and holds, as does lagging by more than 8°. It stops after contact; it does not avoid it. The program cannot be closed while torque is on; Ctrl+C in the terminal releases torque at once. Software is not a physical power cutoff.",
         ))
 
         @server.on_client_connect
@@ -475,6 +494,9 @@ def run(args):
                 print("Browser disconnected; the program keeps holding. Ctrl+C releases torque and exits.", file=sys.stderr)
             if arm:
                 current, opening = read_pose()
+                raw_loads = arm.bus.sync_read("Present_Load", normalize=False, num_retry=LOAD_READ_RETRIES)
+                loads = [load_percent(raw_loads[name]) for name in control.JOINTS]
+                load_text.content = f"**{copy('负载', 'Load')} / %**: " + " · ".join(f"F{i + 1} {v:.0f}" for i, v in enumerate(loads)) + f" · {copy('夹爪', 'gripper')} {load_percent(raw_loads['gripper']):.0f}"
             actual_model.update_cfg(np.array(viewer_configuration(names, current)))
             xyz = kinematics.forward_kinematics(current)[:3, 3].copy()
             coordinates = ", ".join(f"{axis} {value * 1000:.1f}" for axis, value in zip("XYZ", xyz))
@@ -608,6 +630,12 @@ def run(args):
                         refresh_buttons()
                         status.content = copy("计划演示完毕。要真的过去，点“执行运动”；改目标就要重新计划。", "Plan shown. Press Execute to move; changing the goal requires planning again.")
                 elif arm:
+                    blocked = blocked_joints(current, last_command, loads, args.contact_error_deg, args.contact_load_pct)
+                    if blocked:
+                        name, error, load = blocked[0]
+                        joint = f"F{control.JOINTS.index(name) + 1}"
+                        abort_and_hold(copy(f"{joint} 受阻：落后指令 {error:.1f}°，负载 {load:.0f}%，像是碰到了东西", f"{joint} blocked: {error:.1f}° behind its command at {load:.0f}% load; it has probably met something"))
+                        continue
                     if lag(current, last_command) > TRACKING_ABORT_DEG:
                         abort_and_hold(copy(f"实物落后指令 {lag(current, last_command):.1f}°", f"arm lags its command by {lag(current, last_command):.1f}°"))
                         continue
@@ -660,7 +688,11 @@ def main(argv=None):
     parser.add_argument("--robot-id")
     parser.add_argument("--calibration-dir")
     parser.add_argument("--confirm-model-match", action="store_true")
+    parser.add_argument("--contact-error-deg", type=float, default=CONTACT_ERROR_DEG, help="Contact stop: a joint this far behind its command, while loaded, stops the motion")
+    parser.add_argument("--contact-load-pct", type=float, default=CONTACT_LOAD_PCT, help="Contact stop: motor load in percent that counts as pushing against something")
     args = parser.parse_args(argv)
+    if not (0 < args.contact_error_deg <= TRACKING_ABORT_DEG) or not (0 < args.contact_load_pct <= 100):
+        parser.error(f"contact thresholds must be within (0, {TRACKING_ABORT_DEG}] deg and (0, 100] percent")
     if args.hardware and not all((args.port, args.robot_id, args.calibration_dir, args.confirm_model_match)):
         parser.error("Hardware mode requires port, robot-id, calibration-dir, and confirm-model-match")
     if not args.hardware and any((args.port, args.robot_id, args.calibration_dir, args.confirm_model_match)):

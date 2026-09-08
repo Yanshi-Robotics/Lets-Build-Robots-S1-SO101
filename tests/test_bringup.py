@@ -193,6 +193,19 @@ class VisualControlTests(unittest.TestCase):
         self.assertEqual(visual.preview_duration(start, [1, 0, 0, 0, 0]), visual.PREVIEW_MIN_SECONDS)
         self.assertEqual(visual.MOTION_RATE_DEG_S, 10.0)  # Hardware speed is untouched by the preview speed.
 
+    def test_contact_stop_needs_both_position_error_and_load(self):
+        self.assertEqual(visual.load_percent(-437), 43.7)  # sign-decoded tenths of a percent
+        current, commanded = [0, -60, 30, 0, 0], [0, -55, 30, 0, 0]  # F2 is 5 deg behind
+        heavy = [5, 72, 10, 3, 2]
+        self.assertEqual(visual.blocked_joints(current, commanded, heavy, 4.0, 60.0), [("shoulder_lift", 5.0, 72.0)])
+        self.assertEqual(visual.blocked_joints(current, commanded, [5, 30, 10, 3, 2], 4.0, 60.0), [])  # behind but lightly loaded: gravity, not contact
+        self.assertEqual(visual.blocked_joints(commanded, commanded, heavy, 4.0, 60.0), [])  # loaded but following: lifting, not contact
+        from unittest.mock import patch
+        with patch.object(visual, "run"), patch("sys.stderr"):
+            for bad in (["--contact-error-deg", "0"], ["--contact-error-deg", "9"], ["--contact-load-pct", "101"]):
+                with self.assertRaises(SystemExit):
+                    visual.main(["--model-dir", "not-a-device", "--web-port", "4602", *bad])
+
     def test_arming_needs_the_exact_word(self):
         self.assertTrue(visual.arming_requested(" ENABLE "))
         for text in ("enable", "", "ENABLE now", "yes"):
