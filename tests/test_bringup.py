@@ -153,6 +153,27 @@ class ViserPageTests(unittest.TestCase):
         self.assertEqual(visual.gripper_command(None, 80.0), visual.GRIPPER_HOLD)
         self.assertEqual(visual.gripper_command(50.0, float("nan")), visual.GRIPPER_HOLD)
 
+    def test_a_released_left_ctrl_is_not_a_gripper_command(self):
+        # ⚠️ Upstream, reproduced 2026-09-09: KeyboardEndEffectorTeleop computes `int(val) - 1`
+        # for ctrl_l, so releasing it reports -1 rather than 1, and the key stays in
+        # current_pressed as False for the rest of the session. GripperVelocityToJoint maps -1 to
+        # twice the close command, so the gripper would run one way at 2 % of travel per frame.
+        from pynput import keyboard as keys
+        from lerobot.teleoperators.keyboard import KeyboardEndEffectorTeleop, KeyboardEndEffectorTeleopConfig
+        device = KeyboardEndEffectorTeleop(KeyboardEndEffectorTeleopConfig(id="t", use_gripper=True))
+        device._on_press(keys.Key.ctrl_l)
+        device._drain_pressed_keys()
+        held = KeyboardEndEffectorTeleop.get_action.__wrapped__(device)
+        self.assertEqual(visual.gripper_from_keyboard(held), visual.GRIPPER_CLOSE)
+        device._on_release(keys.Key.ctrl_l)
+        device._drain_pressed_keys()
+        released = KeyboardEndEffectorTeleop.get_action.__wrapped__(device)
+        self.assertEqual(released["gripper"], -1, "the upstream behaviour this guards against")
+        self.assertEqual(visual.gripper_from_keyboard(released), visual.GRIPPER_HOLD)
+        for command in (visual.GRIPPER_CLOSE, visual.GRIPPER_HOLD, visual.GRIPPER_OPEN):
+            self.assertEqual(visual.gripper_from_keyboard({"gripper": command}), command)
+        self.assertEqual(visual.gripper_from_keyboard({}), visual.GRIPPER_HOLD)
+
     def test_the_page_says_which_keys_it_believes_are_down(self):
         # A keyboard that reaches nothing looks exactly like a program that does nothing.
         self.assertEqual(visual.held_keys_text({}), "no key held")
@@ -1032,6 +1053,29 @@ class NumericalTests(unittest.TestCase):
         try:
             page.armed(visual.LEADER)
             self.assertEqual(page.get_action(), reading)
+        finally:
+            page.disconnect()
+
+    def test_holding_the_gripper_resists_instead_of_following_the_jaw(self):
+        # 2026-09-09 on hardware: the gripper opened by itself the moment a mode was enabled.
+        # GripperVelocityToJoint adds its step to the gripper's *measured* position, so a hold
+        # command asks the motor to go exactly where the jaw already is: zero error, zero force,
+        # and anything pushing the jaw open is followed rather than resisted.
+        page = self.live_page(keyboard=SimpleNamespace(
+            get_action=lambda: {"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": 1},
+            current_pressed={}), armed=visual.KEYBOARD)
+        try:
+            observation = dict(zip((f"{name}.pos" for name in demo.MOTORS),
+                                   (0.0, -30.0, 60.0, -30.0, 0.0, 50.0)))
+            commanded = None
+            for _ in range(8):
+                action = page.get_action()
+                commanded = float(action["gripper.pos"])
+                observation = {key: float(value) for key, value in action.items()}
+                observation["gripper.pos"] -= 0.4  # the jaw drifting open under its own weight
+                page.seed(observation)
+            self.assertAlmostEqual(commanded, 50.0, places=6,
+                                   msg="the command followed the jaw instead of holding it")
         finally:
             page.disconnect()
 

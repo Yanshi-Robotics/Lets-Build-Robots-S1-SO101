@@ -135,6 +135,19 @@ def steps_towards(target_xyz, gripper_xyz, step_m):
     return np.where(np.abs(delta) < NOISE_UNITS, 0.0, delta)
 
 
+def gripper_from_keyboard(action):
+    """The keyboard device's gripper command, with anything that is not close/hold/open taken as hold.
+
+    ⚠️ LeRobot's KeyboardEndEffectorTeleop reports -1 once left ctrl has been pressed and
+    released: its get_action computes `int(val) - 1` for that key, so a release gives -1 instead
+    of 1, and the value sticks because the key stays in current_pressed as False for the rest of
+    the session. Downstream that is not a no-op -- GripperVelocityToJoint maps -1 to twice the
+    close command, 2 % of travel per frame in one direction. Reproduced 2026-09-09.
+    """
+    command = action.get("gripper", GRIPPER_HOLD)
+    return command if command in (GRIPPER_CLOSE, GRIPPER_HOLD, GRIPPER_OPEN) else GRIPPER_HOLD
+
+
 def gripper_command(reported_pct, wanted_pct):
     """Close, hold or open: the three-way command LeRobot's own keyboard device sends.
 
@@ -223,6 +236,7 @@ class ViserControlPage:
         self._arm_request = None      # set by an Enable button, taken by the read-only loop
         self._end_requested = False   # set by an End button, taken by get_action
         self._plan = None             # (target_xyz, solved_joints, residual_mm)
+        self._gripper_setpoint = None # what the gripper was last told, not where the jaw is
         self._executing = False
         self._connected = False
         self.server = None
@@ -267,8 +281,34 @@ class ViserControlPage:
         if armed == LEADER:
             # No IK at all: the leader reports joint positions and they go straight through.
             return self.leader.get_action()
-        delta = self.keyboard.get_action() if armed == KEYBOARD else self._ik_delta(observation)
-        return self.pipeline((delta, observation))
+        if armed == KEYBOARD:
+            delta = dict(self.keyboard.get_action())
+            delta["gripper"] = gripper_from_keyboard(delta)
+        else:
+            delta = self._ik_delta(observation)
+        return self._drive(delta, observation)
+
+    def _drive(self, delta, observation):
+        """Run the official pipeline with the gripper integrated from what was last commanded.
+
+        ⚠️ GripperVelocityToJoint adds its step to `q_raw[-1]`, which is the gripper's *measured*
+        position, so a hold command asks the motor to go exactly where the jaw already is. The
+        error is then zero, the force is zero, and anything pushing the jaw open is followed
+        rather than resisted: torque is on and the gripper is limp, drifting one way for ever.
+        Measured 2026-09-09 with a jaw moving 0.4 % per frame -- the command tracked it all the
+        way down. Seeding the step with the last commanded position instead makes it integrate
+        from its own output, which is what a setpoint is. Nothing in the pipeline changes, and
+        only the gripper element is substituted: the five arm joints stay measured, because the
+        end-effector reference has to follow the real arm.
+        """
+        with self._lock:
+            setpoint = self._gripper_setpoint
+        if setpoint is None:
+            setpoint = float(observation["gripper.pos"])
+        action = self.pipeline((delta, {**observation, "gripper.pos": setpoint}))
+        with self._lock:
+            self._gripper_setpoint = float(action["gripper.pos"])
+        return action
 
     # -- Arming ---------------------------------------------------------------------------
     def take_arm_request(self):
@@ -281,6 +321,7 @@ class ViserControlPage:
         """Called once the motors are powered and teleop_loop is about to run this mode."""
         with self._lock:
             self._armed, self._end_requested, self._plan, self._executing = mode, False, None, False
+            self._gripper_setpoint = None  # re-seeded from the arm on the first frame
         self.pipeline.reset()
         self._refresh_controls()
 
@@ -288,6 +329,7 @@ class ViserControlPage:
         """Called once the mode has stopped and the motors have been released."""
         with self._lock:
             self._armed, self._end_requested, self._plan, self._executing = None, False, None, False
+            self._gripper_setpoint = None
         self._refresh_controls()
         if note:
             self.notice.content = note
@@ -296,8 +338,11 @@ class ViserControlPage:
     def _ik_delta(self, observation):
         """Steps towards the planned target while executing, and nothing otherwise."""
         with self._lock:
-            plan, executing = self._plan, self._executing
-        wanted = gripper_command(observation["gripper.pos"], self.gripper_slider.value)
+            plan, executing, setpoint = self._plan, self._executing, self._gripper_setpoint
+        # Against the setpoint, not the measurement: comparing with the jaw's own position would
+        # call it arrived wherever it happened to drift to.
+        here_pct = observation["gripper.pos"] if setpoint is None else setpoint
+        wanted = gripper_command(here_pct, self.gripper_slider.value)
         still = {"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": wanted}
         if not executing or plan is None:
             return still
