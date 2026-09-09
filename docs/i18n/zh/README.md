@@ -20,10 +20,10 @@
 ## 仓库里有什么
 
 - **`Bringup/`**：`so101_bus_check.py` 读一条总线上的六台电机；`so101_calibrate.py` 记录每个关节的中位和活动范围。第 6 课用。
-- **`IK/`**：`so101_cartesian_demo.py` 由夹爪目标位置反求关节角度；`so101_visual_control.py` 在浏览器里显示机械臂、为拖出的目标规划轨迹，实机模式下读回姿态，输入 ENABLE 启用力矩后执行轨迹。第 8 课用。两个文件互相调用，必须放在同一个文件夹。
+- **`IK/`**：`so101_cartesian_demo.py` 下载锁定模型，并用 LeRobot 自带的 IK 解一步笛卡尔位移；`so101_ee_teleop.py` 用方向键、`so101_visual_control.py` 用浏览器里的手柄驱动机械臂，两者都走 LeRobot 的末端流水线。第 8 课用。三个文件必须放在同一个文件夹：两个遥操作程序从第一个里取模型相关的函数。
 - **`Teleop/`**：`so101_teleop_log.py` 打印两只臂的保护与校准寄存器、把两只臂对着读，并给 `lerobot-record` 录下的数据打分。遥操作本身仍然用官方的 `lerobot-teleoperate`。第 7 课用。
-- **`tests/`**：69 条测试，用假硬件跑这些程序。
-- **`IK/logs/`** 与 `Teleop/logs/`（不进 git）：每次运行一份调试日志，只留最近 20 份，`lerobot-record` 录下的数据也放这里。出问题时把最新那份发出来。
+- **`tests/`**：47 条测试，用假硬件跑这些程序。
+- **`Teleop/logs/`**（不进 git）：诊断程序每次运行一份调试日志，只留最近 20 份，`lerobot-record` 录下的数据也放这里。出问题时把最新那份发出来。
 - **`tools/`**：`build_control_poses.py` 计算课程原理图里画的姿态。
 
 课程正文印着这些路径，所以这里的文件不会移动或改名。以后的任务各占一个新文件夹，例如 `ACT-1-Pick`。
@@ -68,12 +68,12 @@ source .venv/bin/activate
 python IK/so101_cartesian_demo.py preview --model-dir models/so101 --delta-mm 0 0 2
 ```
 
-这条命令算出让夹爪上移 2 mm 所需的关节角度，以 JSON 打印出来，`position_error_mm` 应小于 0.1；它不碰硬件。`Bringup/` 里的程序，以及 `IK/` 的 `jog`、`--hardware` 两种模式会打开串口，上电与安全步骤写在第 6、8 课里，这里不重复。
+这条命令算出让夹爪上移 2 mm 所需的关节角度，以 JSON 打印出来，`position_error_mm` 应小于 0.1；它不碰硬件。`Bringup/` 里的程序，以及 `IK/` 的两个遥操作程序会打开串口，上电与安全步骤写在第 6、7、8 课里，这里不重复。
 
 改过程序，提交前先跑测试：
 
 ```bash
-python tests/test_bringup.py                            # 只用假硬件，末行是 OK (skipped=3)
+python tests/test_bringup.py                            # 只用假硬件，末行是 OK (skipped=7)
 python tests/test_bringup.py --model-dir models/so101   # 加上数值 IK 检查，末行是 OK
 ```
 
