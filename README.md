@@ -20,9 +20,9 @@ Season 1 starts with printing and assembling two SO-101 arms and ends with a tra
 ## What's in the repository
 
 - **`Bringup/`**: `so101_bus_check.py` reads all six motors on one bus; `so101_calibrate.py` records each joint's mid position and range. Used in Lesson 6.
-- **`IK/`**: `so101_cartesian_demo.py` downloads the pinned model and solves one Cartesian step with LeRobot's own IK; `so101_ee_teleop.py` drives the arm from the arrow keys and `so101_visual_control.py` from a handle in a browser, both through LeRobot's end-effector pipeline. Used in Lesson 8. All three stay in the same folder: the two teleoperation programs import the model helpers from the first.
+- **`IK/`**: `so101_cartesian_demo.py` downloads the pinned model and solves one Cartesian step with LeRobot's own IK; `so101_visual_control.py` is a browser page with three ways to drive the arm (LeRobot's keyboard device, a leader arm, or a dragged target solved by IK); `so101_ee_teleop.py` is the same keyboard control with no page, as the smallest thing that runs. Used in Lesson 8. All three stay in the same folder: the two control programs import the model helpers from the first.
 - **`Teleop/`**: `so101_teleop_log.py` dumps both arms' protection and calibration registers, checks the two arms against each other, and grades a recording made by `lerobot-record`. Teleoperation itself stays with the official `lerobot-teleoperate`. Used in Lesson 7.
-- **`tests/`**: 47 tests that run the programs against fake hardware.
+- **`tests/`**: 60 tests that run the programs against fake hardware.
 - **`Teleop/logs/`** (git-ignored): one debug log per diagnostics run, the last 20 kept, plus anything `lerobot-record` writes there. Send the newest one when something goes wrong.
 - **`tools/`**: `build_control_poses.py` computes the poses drawn in the lesson illustrations.
 
@@ -73,7 +73,7 @@ This computes the joint angles that move the gripper 2 mm up and prints them as 
 Before committing a change to a program, run the tests:
 
 ```bash
-python tests/test_bringup.py                            # fake hardware only, ends with OK (skipped=7)
+python tests/test_bringup.py                            # fake hardware only, ends with OK (skipped=14)
 python tests/test_bringup.py --model-dir models/so101   # adds the numerical IK checks, ends with OK
 ```
 

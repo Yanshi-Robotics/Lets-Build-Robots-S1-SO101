@@ -63,7 +63,7 @@ def run(args):
     from lerobot.scripts.lerobot_teleoperate import teleop_loop
     from lerobot.teleoperators.keyboard import KeyboardEndEffectorTeleop, KeyboardEndEffectorTeleopConfig
 
-    kinematics, _limits = model.load_kinematics(args.model_dir)
+    kinematics, limits = model.load_kinematics(args.model_dir)
     bounds = model.bounds_dict(args.bounds_min_m, args.bounds_max_m)
     robot_action_processor = model.build_robot_action_processor(
         kinematics, bounds, step_m=args.step_mm / 1000
@@ -91,7 +91,7 @@ def run(args):
         raise
 
     try:
-        here = model.check_start_pose(robot.get_observation(), kinematics, bounds)
+        here = model.check_start_pose(robot.get_observation(), kinematics, bounds, limits)
         print(f"\nFollower on {args.port} is live. Gripper at "
               f"x={here[0]:.3f} y={here[1]:.3f} z={here[2]:.3f} m, inside the workspace.")
         print(f"{KEY_MAP}\n\nA held key moves the gripper {args.step_mm:g} mm per frame, "

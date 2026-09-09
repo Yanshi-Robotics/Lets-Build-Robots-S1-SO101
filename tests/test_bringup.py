@@ -109,45 +109,64 @@ class EndEffectorPipelineTests(unittest.TestCase):
 
 
 class ViserPageTests(unittest.TestCase):
-    """The page is an input device: it reports deltas and never commands a joint."""
+    """The page is one teleoperator with three modes; only the mode picks who fills in a frame."""
 
-    def test_the_page_reports_what_the_official_keyboard_device_reports(self):
-        page = visual.ViserEndEffectorTeleop(visual.ViserTeleopConfig(id="t", model_dir="."), None)
-        from lerobot.teleoperators.keyboard import KeyboardEndEffectorTeleop
-        official = KeyboardEndEffectorTeleop.action_features.fget(
-            SimpleNamespace(config=SimpleNamespace(use_gripper=True)))
-        self.assertEqual(page.action_features["names"], official["names"])
+    def page(self, keyboard=None, leader=None, kinematics=None, pipeline=None):
+        """The page without a browser. `connect()` is exercised separately, on a real server."""
+        return visual.ViserControlPage(
+            visual.ViserTeleopConfig(id="t", model_dir="."), kinematics, pipeline,
+            keyboard=keyboard, leader=leader)
+
+    def test_the_page_reports_what_a_leader_arm_reports(self):
+        # The identity processors carry the action through untouched, so its shape has to be the
+        # one SO101Follower.send_action consumes: one target per motor.
+        from lerobot.teleoperators.so_leader import SO101Leader
+        self.assertEqual(sorted(self.page().action_features),
+                         sorted(f"{name}.pos" for name in demo.MOTORS))
+        self.assertEqual(SO101Leader.action_features.fget.__annotations__["return"],
+                         dict[str, type])
 
     def test_the_page_is_a_lerobot_teleoperator(self):
         from lerobot.teleoperators import Teleoperator
-        self.assertTrue(issubclass(
-            type(visual.build(visual.ViserTeleopConfig(id="t", model_dir="."), None)), Teleoperator))
+        self.assertTrue(issubclass(type(visual.build(
+            visual.ViserTeleopConfig(id="t", model_dir="."), None, None)), Teleoperator))
 
-    def test_a_thrown_handle_still_asks_for_one_step(self):
+    def test_a_distant_target_still_asks_for_one_step(self):
         step = 0.002
-        far = visual.drag_to_units([10.0, -10.0, 10.0], [0, 0, 0], step)
+        far = visual.steps_towards([10.0, -10.0, 10.0], [0, 0, 0], step)
         self.assertTrue((abs(far) <= visual.MAX_UNITS_PER_FRAME).all())
-        half = visual.drag_to_units([step / 2, 0, 0], [0, 0, 0], step)
-        self.assertAlmostEqual(float(half[0]), 0.5)
+        self.assertAlmostEqual(float(visual.steps_towards([step / 2, 0, 0], [0, 0, 0], step)[0]), 0.5)
         for noisy in ([1e-12, 0, 0], [float("nan"), 0, 0], [float("inf"), 0, 0]):
-            self.assertEqual(list(visual.drag_to_units(noisy, [0, 0, 0], step)), [0.0, 0.0, 0.0])
+            self.assertEqual(list(visual.steps_towards(noisy, [0, 0, 0], step)), [0.0, 0.0, 0.0])
         with self.assertRaises(ValueError):
-            visual.drag_to_units([0, 0, 0], [0, 0, 0], 0.0)
+            visual.steps_towards([0, 0, 0], [0, 0, 0], 0.0)
 
-    def test_an_undragged_handle_commands_nothing(self):
-        page = visual.ViserEndEffectorTeleop(visual.ViserTeleopConfig(id="t", model_dir="."), None)
-        page.handle = SimpleNamespace(position=(9.0, 9.0, 9.0))
-        self.assertEqual(page.get_action(), {"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0,
-                                             "gripper": visual.GRIPPER_HOLD})
+    def test_the_gripper_command_follows_lerobots_own_direction(self):
+        # 2026-09-09: this was inverted, and a slider set to 80 drove the gripper to 0.
+        # GripperVelocityToJoint maps command 0 (close) to a positive step, because "joint
+        # position increases on close" -- so reaching a larger figure means commanding CLOSE.
+        self.assertEqual(visual.gripper_command(20.0, 80.0), visual.GRIPPER_CLOSE)
+        self.assertEqual(visual.gripper_command(80.0, 20.0), visual.GRIPPER_OPEN)
+        self.assertEqual(visual.gripper_command(50.0, 50.0), visual.GRIPPER_HOLD)
+        self.assertEqual(visual.gripper_command(50.0, 50.0 + visual.GRIPPER_TOLERANCE_PCT),
+                         visual.GRIPPER_HOLD, "a tolerance under one frame would oscillate")
+        self.assertEqual(visual.gripper_command(None, 80.0), visual.GRIPPER_HOLD)
+        self.assertEqual(visual.gripper_command(50.0, float("nan")), visual.GRIPPER_HOLD)
 
-    def test_a_gripper_click_is_one_frame_long(self):
-        page = visual.ViserEndEffectorTeleop(visual.ViserTeleopConfig(id="t", model_dir="."), None)
-        page.handle = SimpleNamespace(position=(0.0, 0.0, 0.0))
-        page._set_gripper(visual.GRIPPER_CLOSE)
-        self.assertEqual(page.get_action()["gripper"], visual.GRIPPER_CLOSE)
-        self.assertEqual(page.get_action()["gripper"], visual.GRIPPER_HOLD)
+    def test_the_page_says_which_keys_it_believes_are_down(self):
+        # A keyboard that reaches nothing looks exactly like a program that does nothing.
+        self.assertEqual(visual.held_keys_text({}), "no key held")
+        self.assertEqual(visual.held_keys_text({"Key.up": True, "Key.down": False}), "held: `up`")
 
-    def test_the_visual_joint_mapping_uses_names_radians_and_the_reported_opening(self):
+    def test_the_leader_panel_shows_the_gap_joint_by_joint(self):
+        leader = {f"{name}.pos": 10.0 for name in demo.MOTORS}
+        follower = {f"{name}.pos": 7.5 for name in demo.MOTORS}
+        text = visual.following_text(leader, follower)
+        self.assertEqual(text.count("diff"), len(demo.MOTORS))
+        self.assertIn("+2.5", text)
+        self.assertEqual(visual.following_text({}, follower), "No leader reading.")
+
+    def test_the_visual_joint_mapping_uses_names_radians_and_the_reported_figure(self):
         names = ("gripper", "wrist_roll", "wrist_flex", "elbow_flex", "shoulder_lift", "shoulder_pan")
         values = visual.viewer_configuration(names, (10, -20, 30, -40, 50), 0)
         self.assertAlmostEqual(values[names.index("shoulder_pan")], math.radians(10))
@@ -161,11 +180,16 @@ class ViserPageTests(unittest.TestCase):
 
     def test_the_display_tap_returns_the_action_untouched(self):
         seen = []
-        page = SimpleNamespace(observe=seen.append)
-        action = {"delta_x": 0.25, "delta_y": 0.0, "delta_z": 0.0, "gripper": 1}
+        action = {"shoulder_pan.pos": 1.0}
         observation = {f"{name}.pos": 0.0 for name in demo.MOTORS}
-        self.assertEqual(visual.display_tap(page)((dict(action), observation)), action)
+        tap = visual.display_tap(SimpleNamespace(observe=seen.append))
+        self.assertEqual(tap((dict(action), observation)), action)
         self.assertEqual(seen, [observation])
+
+    def test_a_page_with_no_arm_reading_yet_commands_nothing(self):
+        # Frame one runs before the display tap, so the page is seeded from the observation the
+        # caller already read. Until then it must ask for nothing at all.
+        self.assertEqual(self.page().get_action(), {})
 
     def test_the_page_binds_loopback_only_and_needs_an_explicit_port(self):
         self.assertEqual(visual.LOOPBACK, "127.0.0.1")
@@ -174,9 +198,8 @@ class ViserPageTests(unittest.TestCase):
                 visual.validate_web_port(port)
 
     def test_a_port_left_in_time_wait_does_not_block_the_next_run(self):
-        # The port table records this: closing the page and restarting within a minute used to
-        # fail with Errno 98 while the last connection sat in TIME_WAIT. A live listener must
-        # still be reported; only the lingering socket is forgiven.
+        # The port table records this: restarting within a minute used to fail with Errno 98
+        # while the last connection sat in TIME_WAIT. A live listener must still be reported.
         import socket
         with socket.socket() as listener:
             listener.bind((visual.LOOPBACK, 0))
@@ -186,21 +209,36 @@ class ViserPageTests(unittest.TestCase):
                 visual.validate_web_port(port)
         visual.validate_web_port(port)
 
-    def test_the_keyboard_program_only_assembles_official_parts(self):
-        # It exists because no lerobot command wires the end-effector pipeline; it must add
-        # nothing else. Everything it calls comes from lerobot or from the model helpers.
-        tree = ast.parse((ROOT / "IK/so101_ee_teleop.py").read_text(encoding="utf-8"))
-        run = next(node for node in ast.walk(tree)
-                   if isinstance(node, ast.FunctionDef) and node.name == "run")
-        modules = {node.module for node in ast.walk(run) if isinstance(node, ast.ImportFrom)}
-        self.assertTrue(all(module.startswith("lerobot.") for module in modules), modules)
-        called = {node.func.id for node in ast.walk(run)
-                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
-        # The two names that are not LeRobot's both run before the loop and touch no action.
-        self.assertEqual(called - {"SO101Follower", "SO101FollowerConfig", "teleop_loop", "Path",
-                                   "KeyboardEndEffectorTeleop", "KeyboardEndEffectorTeleopConfig",
-                                   "make_default_processors", "wait_for_a_key", "print"}, set())
-        self.assertNotIn("class ", (ROOT / "IK/so101_ee_teleop.py").read_text(encoding="utf-8"))
+
+class ProgramShapeTests(unittest.TestCase):
+    """What the two programs are allowed to be, read off their source."""
+
+    def test_neither_program_adds_a_target_clamp(self):
+        # 2026-09-08: --robot.max_relative_target=2 was read as a speed limit. On a proportional
+        # servo it clamps the goal-to-present gap, which is what makes the force, so it capped
+        # output at about a tenth and the shoulder could not lift its own weight.
+        for name in ("IK/so101_ee_teleop.py", "IK/so101_visual_control.py"):
+            self.assertNotIn("max_relative_target=", (ROOT / name).read_text(encoding="utf-8"), name)
+
+    def test_the_page_keeps_holding_when_the_program_stops(self):
+        # 2026-09-09, Jeff: an arm under IK has to stay held, or it drops at the end of a move.
+        # disable_torque_on_disconnect defaults to True, which releases every motor on exit.
+        source = (ROOT / "IK/so101_visual_control.py").read_text(encoding="utf-8")
+        self.assertIn("disable_torque_on_disconnect=False", source)
+        self.assertIn("Cut DC power", source, "the lesson and the program must say how to release it")
+
+    def test_no_control_loop_of_our_own(self):
+        # Every frame comes from LeRobot's teleop_loop. A while loop around send_action here
+        # would be a second control path with none of its timing or its stop behaviour.
+        for name in ("IK/so101_ee_teleop.py", "IK/so101_visual_control.py"):
+            tree = ast.parse((ROOT / name).read_text(encoding="utf-8"))
+            self.assertIn("teleop_loop", {node.func.id for node in ast.walk(tree)
+                                          if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)})
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.For, ast.While)):
+                    calls = {child.func.attr for child in ast.walk(node)
+                             if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)}
+                    self.assertNotIn("send_action", calls, f"{name} drives the robot itself")
 
     def test_nothing_is_powered_until_the_operator_has_working_controls(self):
         # 2026-09-09: the first version connected the follower -- which enables torque -- before
@@ -213,35 +251,37 @@ class ViserPageTests(unittest.TestCase):
             self.assertLess(source.index(gate + "("), source.rindex("robot.connect()"), name)
             self.assertLess(source.index("robot.connect()"), source.index("check_start_pose"), name)
 
-    def test_every_pose_the_arm_was_actually_found_in_starts(self):
-        # Both measured from register dumps on 2026-09-09. A default box that excludes either of
-        # them is the bug this test exists for: EEBoundsAndSafety would clip the first target to
-        # the nearest face and walk the arm there. The first parks the gripper 11 mm above the
-        # base plane, which is what set the floor; the second folds it back over the base.
-        kinematics, _limits = demo.load_kinematics(args.model_dir) if args.model_dir else (None, None)
-        if kinematics is None:
-            self.skipTest("needs the pinned model")
-        bounds = demo.bounds_dict(demo.DEFAULT_BOUNDS_M["min"], demo.DEFAULT_BOUNDS_M["max"])
-        for parked in ((-30.95, -100.09, 85.32, 85.93, 6.20), (13.98, -103.69, 97.01, -102.29, 6.37),
-                       demo.PREVIEW_JOINTS_DEG):
-            observation = dict(zip((f"{name}.pos" for name in demo.MOTORS), (*parked, 33.0)))
-            demo.check_start_pose(observation, kinematics, bounds)  # raises if the box excludes it
-
     def test_a_start_pose_outside_the_workspace_is_refused_not_corrected(self):
         # 2026-09-09: Rest folds the gripper to about x=0.04, and the first workspace started at
         # x=0.10. EEBoundsAndSafety does not reject an out-of-box pose, it clips the target to
-        # the nearest face -- so the arm would walk 58 mm to the edge before anyone touched a key.
-        kinematics, _limits = demo.load_kinematics(args.model_dir) if args.model_dir else (None, None)
-        if kinematics is None:
+        # the nearest face -- so the arm would walk to the edge before anyone touched a control.
+        if not args.model_dir:
             self.skipTest("needs the pinned model")
-        rest = (13.98, -103.69, 97.01, -102.29, 6.37)
-        observation = dict(zip((f"{name}.pos" for name in demo.MOTORS), (*rest, 50.0)))
-        inside = demo.check_start_pose(observation, kinematics,
-                                       demo.bounds_dict(demo.DEFAULT_BOUNDS_M["min"], demo.DEFAULT_BOUNDS_M["max"]))
-        self.assertEqual(len(inside), 3)
+        kinematics, _limits = demo.load_kinematics(args.model_dir)
+        observation = dict(zip((f"{name}.pos" for name in demo.MOTORS),
+                               (13.98, -103.69, 97.01, -102.29, 6.37, 50.0)))
         with self.assertRaises(RuntimeError) as refused:
-            demo.check_start_pose(observation, kinematics, demo.bounds_dict((0.10, -0.2, 0.02), (0.35, 0.2, 0.35)))
+            demo.check_start_pose(observation, kinematics,
+                                  demo.bounds_dict((0.10, -0.2, 0.02), (0.35, 0.2, 0.35)))
         self.assertIn("outside the workspace on x", str(refused.exception))
+
+    def test_a_joint_resting_on_its_stop_is_refused(self):
+        # 2026-09-08 measured: torque enabled with shoulder_lift and wrist_flex past their travel
+        # drove both at 100 % load 2.5 deg deeper into the stops, and the servos' overload
+        # protection cut them to 20 % two seconds later.
+        if not args.model_dir:
+            self.skipTest("needs the pinned model")
+        kinematics, limits = demo.load_kinematics(args.model_dir)
+        bounds = demo.bounds_dict(demo.DEFAULT_BOUNDS_M["min"], demo.DEFAULT_BOUNDS_M["max"])
+        on_a_stop = dict(zip((f"{name}.pos" for name in demo.MOTORS),
+                             (-30.95, -100.09, 85.32, 85.93, 6.20, 33.0)))
+        with self.assertRaises(RuntimeError) as refused:
+            demo.check_start_pose(on_a_stop, kinematics, bounds, limits)
+        self.assertIn("shoulder_lift", str(refused.exception))
+        self.assertIn("resting on a stop", str(refused.exception))
+        clear = dict(zip((f"{name}.pos" for name in demo.MOTORS),
+                         (*demo.PREVIEW_JOINTS_DEG, 33.0)))
+        demo.check_start_pose(clear, kinematics, bounds, limits)  # raises if this one is refused
 
     def test_the_keyboard_gate_gives_up_instead_of_powering_the_arm(self):
         import so101_ee_teleop as keyboard_program
@@ -254,8 +294,8 @@ class ViserPageTests(unittest.TestCase):
         finally:
             keyboard_program.KEY_CHECK_SECONDS = original
         self.assertIn("the arm was never powered", str(gave_up.exception))
-        pressed = SimpleNamespace(get_action=lambda: {"delta_x": 0.0, "delta_y": -1.0, "delta_z": 0.0})
-        keyboard_program.wait_for_a_key(pressed)
+        keyboard_program.wait_for_a_key(
+            SimpleNamespace(get_action=lambda: {"delta_x": 0.0, "delta_y": -1.0, "delta_z": 0.0}))
 
 
 class BusReadTests(unittest.TestCase):
@@ -672,6 +712,135 @@ class NumericalTests(unittest.TestCase):
         self.assertIn("no hardware", report["mode"])
         self.assertLess(report["position_error_mm"], 0.1)
         self.assertEqual(report["solved_degrees"][4], 0.0)
+
+    def fake_leader(self, values=(5.0, -25.0, 55.0, -25.0, 1.0, 40.0)):
+        """Only get_action() is needed to stand in for SO101Leader; no serial port is opened."""
+        reading = dict(zip((f"{name}.pos" for name in demo.MOTORS), values))
+        return SimpleNamespace(get_action=lambda: dict(reading)), reading
+
+    def live_page(self, keyboard=None, leader=None):
+        """A real Viser server on a free loopback port. No browser, no serial port, no robot."""
+        import socket
+        with socket.socket() as probe:
+            probe.bind((visual.LOOPBACK, 0))
+            port = probe.getsockname()[1]
+        pipeline = demo.build_robot_action_processor(self.kinematics, self.bounds)
+        page = visual.build(visual.ViserTeleopConfig(
+            id="test", model_dir=str(args.model_dir), web_port=port), self.kinematics, pipeline,
+            keyboard=keyboard, leader=leader)
+        page.connect()
+        page.seed(dict(zip((f"{name}.pos" for name in demo.MOTORS),
+                           (*demo.PREVIEW_JOINTS_DEG, 50.0))))
+        return page
+
+    def assert_joints_close(self, action, expected, places=6, message=""):
+        for name in demo.MOTORS:
+            self.assertAlmostEqual(float(action[f"{name}.pos"]), float(expected[f"{name}.pos"]),
+                                   places=places, msg=f"{name}: {message}")
+
+    def gripper_of(self, action):
+        return self.kinematics.forward_kinematics(
+            self.np.array([action[f"{name}.pos"] for name in demo.JOINTS]))[:3, 3]
+
+    def test_every_panel_is_actually_built(self):
+        # 2026-09-09: every other page test stubs the widgets, so a NameError inside connect()
+        # survived the whole suite and only appeared on hardware.
+        leader, _reading = self.fake_leader()
+        page = self.live_page(keyboard=SimpleNamespace(get_action=dict, current_pressed={}),
+                              leader=leader)
+        try:
+            self.assertEqual(len(page.mode_dropdown.options), 3)
+            self.assertTrue(page.keyboard_panel.visible)
+            self.assertFalse(page.ik_panel.visible)
+            self.assertFalse(page.handle.visible)
+            page.mode_dropdown.value = visual.MODE_LABELS[visual.IK]
+            page._choose_mode()
+            self.assertTrue(page.ik_panel.visible)
+            self.assertTrue(page.handle.visible)
+            self.assertFalse(page.keyboard_panel.visible)
+            self.assertEqual(page.gripper_slider.value, visual.GRIPPER_INITIAL_PCT)
+        finally:
+            page.disconnect()
+
+    def test_the_leader_mode_passes_joints_through_without_touching_ik(self):
+        leader, reading = self.fake_leader()
+        page = self.live_page(leader=leader)
+        try:
+            page.mode_dropdown.value = visual.MODE_LABELS[visual.LEADER]
+            page._choose_mode()
+            self.assertEqual(page.get_action(), reading)
+        finally:
+            page.disconnect()
+
+    def test_the_keyboard_mode_moves_the_gripper_one_step_per_frame(self):
+        from pynput import keyboard as keys
+        from lerobot.teleoperators.keyboard import KeyboardEndEffectorTeleop, KeyboardEndEffectorTeleopConfig
+        device = KeyboardEndEffectorTeleop(KeyboardEndEffectorTeleopConfig(id="t", use_gripper=True))
+        device.connect()
+        if not device.is_connected:
+            self.skipTest("pynput cannot capture keys in this session")
+        page = self.live_page(keyboard=device)
+        try:
+            before = self.gripper_of(page.get_action())
+            device._on_press(keys.Key.left)  # left is +x in LeRobot's own mapping
+            after = self.gripper_of(page.get_action())
+            self.assertAlmostEqual(float((after - before)[0]) * 1000, demo.STEP_MM, places=1)
+        finally:
+            device.disconnect()
+            page.disconnect()
+
+    def test_ik_mode_holds_until_execute_then_arrives_and_stops(self):
+        page = self.live_page()
+        try:
+            page.mode_dropdown.value = visual.MODE_LABELS[visual.IK]
+            page._choose_mode()
+            observation = dict(zip((f"{name}.pos" for name in demo.MOTORS),
+                                   (*demo.PREVIEW_JOINTS_DEG, 50.0)))
+            target = (0.34, 0.06, 0.22)
+            page.handle.position = target
+            page._make_plan()
+            self.assertIn("solver residual", page.plan_state.content)
+            self.assert_joints_close(page.get_action(), observation,
+                                     message="a plan alone must move nothing")
+
+            page._start_executing()
+            for frame in range(400):
+                observation = {key: float(value) for key, value in page.get_action().items()}
+                page.seed(observation)
+                if not page._executing:
+                    break
+            reached = self.gripper_of(observation)
+            self.assertLess(float(self.np.linalg.norm(reached - self.np.array(target))) * 1000,
+                            visual.ARRIVED_MM + demo.STEP_MM)
+            self.assertIn("Arrived", page.plan_state.content)
+            self.assertAlmostEqual(observation["wrist_roll.pos"], 0.0, places=6)
+            # Having arrived, it must stay put rather than creep.
+            self.assert_joints_close(page.get_action(), observation, message="it crept after arriving")
+        finally:
+            page.disconnect()
+
+    def test_stop_halts_an_execution_in_progress(self):
+        page = self.live_page()
+        try:
+            page.mode_dropdown.value = visual.MODE_LABELS[visual.IK]
+            page._choose_mode()
+            page.handle.position = (0.34, 0.06, 0.22)
+            page._make_plan()
+            page._start_executing()
+            observation = {key: float(value) for key, value in page.get_action().items()}
+            page.seed(observation)
+            page._stop_executing("Stopped by the operator.")
+            # EEReferenceAndDelta holds the last command it was given while disabled, so the arm
+            # finishes the step already in flight and then stands still. Twenty frames of doing
+            # nothing must not add up to more than that one step.
+            here = self.gripper_of(observation)
+            for _ in range(20):
+                observation = {key: float(value) for key, value in page.get_action().items()}
+                page.seed(observation)
+            travelled_mm = float(self.np.linalg.norm(self.gripper_of(observation) - here)) * 1000
+            self.assertLess(travelled_mm, demo.STEP_MM, f"kept moving after Stop: {travelled_mm:.2f} mm")
+        finally:
+            page.disconnect()
 
     def test_viser_urdf_meshes_and_fk_match_the_solver(self):
         # Real Viser/yourdfpy loading; only scene transport is a test fixture.

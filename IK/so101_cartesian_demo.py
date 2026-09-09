@@ -200,16 +200,41 @@ def build_robot_action_processor(kinematics, bounds, step_m=EE_STEP_M, max_step_
     )
 
 
-def check_start_pose(observation, kinematics, bounds):
-    """Where the gripper is now, refusing to start if the workspace does not contain it.
+# A joint this close to either end of its modelled travel is treated as sitting on the stop.
+STOP_MARGIN_DEG = 3.0
+
+
+def check_start_pose(observation, kinematics, bounds, limits=None, margin=STOP_MARGIN_DEG):
+    """Where the gripper is now, refusing to start from a pose the arm cannot leave.
 
     This runs once, before the loop, and reads nothing but the observation the caller already
-    has. It is not in the control chain. Without it an arm parked outside the box is not
-    rejected but *corrected*: EEBoundsAndSafety clips the first target to the nearest face and
-    the arm walks there on its own, which is the one motion nobody asked for.
+    has. It is not in the control chain. Two things make a pose unusable:
+
+    A pose outside the workspace is not rejected downstream but *corrected*: EEBoundsAndSafety
+    clips the first target to the nearest face and the arm walks there on its own, which is the
+    one motion nobody asked for.
+
+    A joint resting on its stop has nowhere to go in one direction, and the first command out of
+    there is the hardest one the arm will ever be asked for: on 2026-09-08 a follower folded onto
+    its shoulder stop drove at full load into that stop and tripped the servo's overload
+    protection. Fold the arm to a pose it can hold before powering it.
     """
     import numpy as np
     joints = np.array([float(observation[f"{name}.pos"]) for name in JOINTS])
+    if limits:
+        on_a_stop = [
+            f"{name} at {value:+.1f} deg, against its {low:+.1f}..{high:+.1f} travel"
+            for name, value, (low, high) in ((n, float(v), limits[n]) for n, v in zip(JOINTS, joints))
+            if value < low + margin or value > high - margin
+        ]
+        if on_a_stop:
+            raise RuntimeError(
+                "These joints are resting on a stop, so the arm was never powered:\n    "
+                + "\n    ".join(on_a_stop)
+                + "\nWith motor power off, move the arm to a pose it can hold clear of its ends, "
+                "then run this again. Starting on a stop asks the first command to lift the arm "
+                "straight off it."
+            )
     here = kinematics.forward_kinematics(joints)[:3, 3]
     low, high = np.asarray(bounds["min"], dtype=float), np.asarray(bounds["max"], dtype=float)
     outside = [axis for index, axis in enumerate("xyz") if not low[index] <= here[index] <= high[index]]
