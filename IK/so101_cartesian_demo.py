@@ -47,10 +47,12 @@ POWER_ON_MARGIN_DEG = 5.0
 # far below what compresses a stop or trips overload.
 SOFT_START_TORQUE_LIMIT = 300  # of 1000
 SOFT_START_SECONDS = 1.0
-SOFT_START_STABLE_SECONDS = 0.3
-SOFT_START_DRIFT_COUNTS = 4  # about 0.35 deg: a joint that moves this far on its own is being driven
-SOFT_START_LOAD_PCT = 15.0  # between the 0-5 % of holding and the 30 % a capped push reads
-SOFT_START_REWRITES = 3  # goal rewrites granted to a driven joint before torque is released
+# What counts as a fault while watching. A gravity-loaded joint sags a little and then holds, because
+# a proportional servo only makes force from error; that is not a fault. Running away from the goal
+# is, and so is pinning the output at the lowered limit instead of settling.
+SOFT_START_RUNAWAY_STEPS = 120  # about 10.5 deg away from the goal it was given
+SOFT_START_SATURATED_PCT = 25.0  # against the 30 % limit: pushing as hard as it is allowed to
+SOFT_START_SATURATED_SECONDS = 0.5
 # Hold and goal commands never point at the very end of the recorded travel.
 HOLD_MARGIN_DEG = 2.0
 WRIST_ROLL_LOCK_WEIGHT = 1.0  # Soft joints task: position-only IK must not drift the roll axis.
@@ -60,8 +62,6 @@ SESSION_XYZ_ENVELOPE_MM = 20.0
 IK_TOLERANCE_MM = 0.1
 IK_MAX_ITERATIONS = 100
 TRACKING_TOLERANCE_DEG = 0.8
-# Floating-point comparison of requested vs returned API targets, not FK error.
-SENT_TARGET_TOLERANCE_DEG = 1e-6
 TRACKING_TIMEOUT_SECONDS = 2.0
 READ_INTERVAL_SECONDS = 0.05
 DOWNLOAD_TIMEOUT_SECONDS = 45
@@ -216,10 +216,8 @@ def solve_position(kinematics, current, target_xyz, limits):
 def check_step(current, proposed, startup, xyz, startup_xyz, args):
     """Pure checks used before every hardware action; no clamping of bad solutions.
 
-    A step is measured from where the arm is now, but the loop accepts an arm that stopped
-    TRACKING_TOLERANCE_DEG short of the last target, and max_relative_target measures the next goal
-    against the real reading. Step plus that residual therefore has to stay inside the cap, or
-    LeRobot clips a target that passed every check here.
+    The step limit leaves room for the settling tolerance: the loop accepts an arm that stopped
+    TRACKING_TOLERANCE_DEG short of its last target, and the next step is measured from there.
     """
     step_limit = args.max_joint_step_deg - TRACKING_TOLERANCE_DEG
     if max(abs(float(a) - float(b)) for a, b in zip(proposed, current)) > step_limit:
@@ -257,14 +255,20 @@ class SoftStartFailed(RuntimeError):
 
 
 def _watch_soft_start(arm, reference, log):
-    """Torque is on at the lowered limit. Rewrite the goal, then watch until the arm is still.
+    """Torque is on at the lowered limit. Write the goal once more, then watch it for a second.
 
-    A joint that moves or loads on its own gets its goal rewritten to where it now is, up to
-    SOFT_START_REWRITES times; one that keeps driving has torque released and is named.
+    The goal is never rewritten while watching. A proportional servo makes force only from error, so
+    a joint carrying its own weight has to sag a few degrees before it holds; rewriting the goal to
+    wherever it has sagged sets that error back to zero and it sags again. Doing that a few times in
+    a row made a healthy arm look like it was driving itself, and the earlier version released torque
+    and dropped it. Sagging and settling is what this arm is supposed to do.
+
+    Torque is released only for the two things that are not that: a joint that runs away from the goal
+    it was given, and one that holds its output at the lowered limit instead of settling.
     """
-    # A goal written with torque off is what the incident showed the servos not to follow.
+    # A goal written with torque off is what the 2026-09-08 incident showed the servos not to follow.
     arm.bus.sync_write("Goal_Position", reference, normalize=False)
-    rewrites = stable = 0
+    saturated = dict.fromkeys(arm.bus.motors, 0.0)
     deadline = time.monotonic() + SOFT_START_SECONDS
     while time.monotonic() < deadline:
         time.sleep(READ_INTERVAL_SECONDS)
@@ -274,23 +278,17 @@ def _watch_soft_start(arm, reference, log):
             log("soft start present=%s goal2=%s load=%s current=%s",
                 present, arm.bus.sync_read("Goal_Position_2", normalize=False, num_retry=2),
                 load, arm.bus.sync_read("Present_Current", normalize=False, num_retry=2))
-        driven = {name: (present[name] - reference[name], abs(load[name]) / 10) for name in arm.bus.motors
-                  if abs(present[name] - reference[name]) > SOFT_START_DRIFT_COUNTS or abs(load[name]) / 10 > SOFT_START_LOAD_PCT}
-        if not driven:
-            stable += 1
-            if stable * READ_INTERVAL_SECONDS >= SOFT_START_STABLE_SECONDS:
-                return
-            continue
-        stable = 0
-        rewrites += 1
-        if rewrites > SOFT_START_REWRITES:
+        runaway = {name: present[name] - reference[name] for name in arm.bus.motors
+                   if abs(present[name] - reference[name]) > SOFT_START_RUNAWAY_STEPS}
+        for name in arm.bus.motors:
+            saturated[name] = saturated[name] + READ_INTERVAL_SECONDS if abs(load[name]) / 10 >= SOFT_START_SATURATED_PCT else 0.0
+        pinned = [name for name, seconds in saturated.items() if seconds >= SOFT_START_SATURATED_SECONDS]
+        if runaway or pinned:
             unconfirmed = release_torque(arm.bus)
-            detail = ", ".join(f"{name} moved {counts * 360 / 4095:+.2f} deg at {pct:.0f} % load" for name, (counts, pct) in driven.items())
-            raise SoftStartFailed(f"a motor kept driving after {SOFT_START_REWRITES} goal rewrites; torque released. {detail}", unconfirmed)
-        reference = present
-        arm.bus.sync_write("Goal_Position", present, normalize=False)
-    unconfirmed = release_torque(arm.bus)
-    raise SoftStartFailed(f"the arm did not settle within {SOFT_START_SECONDS:g} s of power-on; torque released", unconfirmed)
+            detail = ", ".join(
+                [f"{name} ran {steps * 360 / 4095:+.1f} deg from its goal" for name, steps in runaway.items()]
+                + [f"{name} held its output at the soft-start limit" for name in pinned])
+            raise SoftStartFailed(f"a motor drove itself at power-on; torque released. {detail}", unconfirmed)
 
 
 def configure_and_hold(arm, position_mode, log=None):
@@ -384,7 +382,7 @@ def jog(args):
 
     arm = HoldCurrentFollower(SO101FollowerConfig(
         port=args.port, id=args.robot_id, calibration_dir=Path(args.calibration_dir),
-        use_degrees=True, max_relative_target=args.max_joint_step_deg,
+        use_degrees=True, max_relative_target=None,
         disable_torque_on_disconnect=True, cameras={},
     ))
     try:
@@ -418,9 +416,7 @@ def jog(args):
                 print(f"REJECTED: {exc}. Nothing sent; the previous hold remains active.")
                 continue
             # Send only the five arm joints: never convert gripper percentage to radians.
-            sent = arm.send_action({f"{name}.pos": float(value) for name, value in zip(JOINTS, proposed)})
-            if any(abs(sent[f"{name}.pos"] - proposed[i]) > SENT_TARGET_TOLERANCE_DEG for i, name in enumerate(JOINTS)):
-                raise RuntimeError("LeRobot clipped the joint target; stop rather than treating it as reached")
+            arm.send_action({f"{name}.pos": float(value) for name, value in zip(JOINTS, proposed)})
             deadline = time.monotonic() + TRACKING_TIMEOUT_SECONDS
             while max(abs(read_joints() - proposed)) > TRACKING_TOLERANCE_DEG:
                 if time.monotonic() > deadline:

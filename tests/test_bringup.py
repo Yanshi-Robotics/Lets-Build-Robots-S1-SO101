@@ -196,11 +196,14 @@ class VisualControlTests(unittest.TestCase):
         self.assertLess(visual.preview_duration(start, goal), visual.motion_duration(start, goal, 0, visual.ANIMATION_MIN_SECONDS))
         self.assertAlmostEqual(visual.preview_duration(start, goal), 60 / visual.PREVIEW_RATE_DEG_S)
         self.assertEqual(visual.preview_duration(start, [1, 0, 0, 0, 0]), visual.PREVIEW_MIN_SECONDS)
-        # Hardware speed is set by the servo, not by the preview: the eased peak (pi/2 times the rate)
-        # has to stay under the speed max_relative_target still lets the servo reach, or the arm runs
-        # against its own cap on every move. Lag fitted to the 2026-09-08 log: 2.04 deg behind at 15.7 deg/s.
-        SERVO_LAG_SECONDS_PER_DEG = 0.13
-        self.assertLess(visual.MOTION_RATE_DEG_S * math.pi / 2, demo.MAX_JOINT_STEP_DEG / SERVO_LAG_SECONDS_PER_DEG)
+        # Hardware speed is set here, not by the preview, and it has to leave the tracking guard room
+        # to mean something: the arm trails a moving target by about 0.13 s of travel (fitted to the
+        # 2026-09-08 log), and a gravity-loaded joint sags on top of that.
+        SERVO_LAG_SECONDS = 0.13
+        SAG_ALLOWANCE_DEG = 4.0
+        lag = visual.MOTION_RATE_DEG_S * math.pi / 2 * SERVO_LAG_SECONDS
+        self.assertLess(lag, visual.CONTACT_ERROR_DEG)
+        self.assertLess(lag + SAG_ALLOWANCE_DEG, visual.TRACKING_ABORT_DEG)
 
     def test_contact_stop_needs_both_position_error_and_load(self):
         self.assertEqual(visual.load_percent(-437), 43.7)  # sign-decoded tenths of a percent
@@ -506,13 +509,13 @@ class SoftStartTests(unittest.TestCase):
 
     NAMES = (*demo.JOINTS, "gripper")
 
-    def make_arm(self, push=(), cured_by_rewrite=True, fault_after_reads=None):
+    def make_arm(self, push=(), sag=(), fault_after_reads=None):
         from types import SimpleNamespace
         names = self.NAMES
         regs = {n: {"Present_Position": 2048, "Goal_Position": 0, "Torque_Enable": 0, "Lock": 0, "Torque_Limit": 1000,
                     "Max_Torque_Limit": 500 if n == "gripper" else 1000, "Present_Load": 0, "Present_Current": 0,
                     "Goal_Position_2": 0} for n in names}
-        state = SimpleNamespace(pushing=set(push), log=[], position_reads=0)
+        state = SimpleNamespace(pushing=set(push), sagging=set(sag), log=[], position_reads=0)
 
         class Bus:
             motors = {n: SimpleNamespace(model="sts3215") for n in names}
@@ -542,19 +545,25 @@ class SoftStartTests(unittest.TestCase):
                 for n, v in values.items():
                     regs[n][reg] = v
                 state.log.append(("sync_write", reg, dict(values)))
-                if reg == "Goal_Position" and cured_by_rewrite and any(regs[n]["Torque_Enable"] for n in values):
-                    state.pushing -= set(values)  # a goal written with torque on is the one the servo follows
 
             def sync_read(self, reg, normalize=True, num_retry=0):
                 if reg == "Present_Position":
                     state.position_reads += 1
                     if fault_after_reads is not None and state.position_reads > fault_after_reads and any(regs[n]["Torque_Enable"] for n in names):
                         raise ConnectionError("bad packet")
-                    # A pushing motor with torque on drives 3 counts per read at the capped load.
                     for n in names:
-                        if n in state.pushing and regs[n]["Torque_Enable"]:
-                            regs[n]["Present_Position"] -= 3
-                            regs[n]["Present_Load"] = -regs[n]["Torque_Limit"]  # tenths of a percent, signed
+                        if not regs[n]["Torque_Enable"]:
+                            regs[n]["Present_Load"] = 0
+                        elif n in state.pushing:
+                            # Driving itself: runs away from the goal with the output at the limit.
+                            regs[n]["Present_Position"] -= 40
+                            regs[n]["Present_Load"] = -regs[n]["Torque_Limit"]
+                        elif n in state.sagging:
+                            # Carrying its own weight: sags a few steps, then holds there.
+                            offset = regs[n]["Goal_Position"] - regs[n]["Present_Position"]
+                            if offset < 30:
+                                regs[n]["Present_Position"] -= 8
+                            regs[n]["Present_Load"] = -min(200, 4 * abs(regs[n]["Goal_Position"] - regs[n]["Present_Position"]))
                         else:
                             regs[n]["Present_Load"] = 0
                 return {n: regs[n][reg] for n in names}
@@ -582,18 +591,21 @@ class SoftStartTests(unittest.TestCase):
         self.assertEqual(regs["shoulder_lift"]["Torque_Limit"], 1000)  # restored to each motor's own ceiling
         self.assertEqual(regs["gripper"]["Torque_Limit"], 500)
 
-    def test_a_joint_that_drives_after_torque_on_is_given_its_goal_again_and_settles(self):
-        arm, regs, state = self.make_arm(push={"shoulder_lift"})
+    def test_a_joint_carrying_its_weight_sags_and_is_left_alone(self):
+        # 2026-09-08 regression: the watch rewrote the goal to wherever a joint had sagged to, which
+        # zeroes the error a proportional servo needs to hold, so it sagged again and after three
+        # rounds was called self-driving and dropped. Sagging and settling is not a fault.
+        arm, regs, state = self.make_arm(sag={"shoulder_lift", "elbow_flex"})
         self.run_hold(arm)
-        after_enable = state.log[state.log.index(("enable_torque",)) + 1:]
-        rewrites = [e for e in after_enable if e[0] == "sync_write" and e[1] == "Goal_Position"]
-        self.assertGreaterEqual(len(rewrites), 1)
         self.assertTrue(all(regs[n]["Torque_Enable"] == 1 for n in self.NAMES))
-        self.assertEqual(regs["shoulder_lift"]["Goal_Position"], regs["shoulder_lift"]["Present_Position"])
+        after_enable = state.log[state.log.index(("enable_torque",)) + 1:]
+        goal_writes = [e for e in after_enable if e[0] == "sync_write" and e[1] == "Goal_Position"]
+        self.assertEqual(len(goal_writes), 1, "the goal is written once after torque on, never rewritten")
+        self.assertLess(regs["shoulder_lift"]["Present_Position"], regs["shoulder_lift"]["Goal_Position"])
         self.assertEqual(regs["shoulder_lift"]["Torque_Limit"], 1000)
 
-    def test_a_joint_that_keeps_driving_has_torque_released_and_is_named(self):
-        arm, regs, state = self.make_arm(push={"shoulder_lift"}, cured_by_rewrite=False)
+    def test_a_joint_that_drives_itself_has_torque_released_and_is_named(self):
+        arm, regs, state = self.make_arm(push={"shoulder_lift"})
         with self.assertRaises(demo.SoftStartFailed) as raised:
             self.run_hold(arm)
         self.assertIn("shoulder_lift", str(raised.exception))
