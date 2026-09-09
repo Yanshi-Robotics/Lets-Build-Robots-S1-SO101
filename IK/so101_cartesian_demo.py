@@ -200,8 +200,13 @@ def build_robot_action_processor(kinematics, bounds, step_m=EE_STEP_M, max_step_
     )
 
 
-# A joint this close to either end of its modelled travel is treated as sitting on the stop.
+# A joint this close to either end of its own recorded travel counts as sitting on the stop.
 STOP_MARGIN_DEG = 3.0
+# How much further than the margin the operator is asked to move, so the arm does not come back
+# resting exactly on the boundary.
+STOP_CLEARANCE_DEG = 3.0
+# One turn minus one, matching LeRobot's model_resolution_table for the STS3215.
+ENCODER_STEPS = 4095
 
 
 def read_pose_before_power(robot):
@@ -210,83 +215,154 @@ def read_pose_before_power(robot):
     `Robot.connect()` ends in `configure()`, which leaves torque ON -- so any check made after
     connecting is made too late to prevent what it is checking for. `bus.connect()` only opens
     the port and handshakes, so the arm can be read first and the port handed back untouched.
+
+    Returns the pose, the motors that already had torque, and the calibration each motor is
+    actually holding, so all of it can be judged before anything is energised.
     """
     robot.bus.connect()
     try:
         reading = robot.bus.sync_read("Present_Position", num_retry=robot.config.num_read_retries)
         powered = [name for name, value in
                    robot.bus.sync_read("Torque_Enable", normalize=False).items() if value]
-        return {f"{motor}.pos": float(value) for motor, value in reading.items()}, powered
+        stored = {register: robot.bus.sync_read(register, normalize=False)
+                  for register in ("Homing_Offset", "Min_Position_Limit", "Max_Position_Limit")}
+        in_the_motors = {name: (stored["Homing_Offset"][name], stored["Min_Position_Limit"][name],
+                                stored["Max_Position_Limit"][name]) for name in reading}
+        return ({f"{motor}.pos": float(value) for motor, value in reading.items()},
+                powered, in_the_motors)
     finally:
         robot.bus.disconnect(disable_torque=False)
 
 
-def release_torque(robot, why):
-    """Let go of every motor, for a failure that happened before anything was commanded.
+def recorded_range(entry):
+    """(range_min, range_max) from a MotorCalibration or from the same fields read out of JSON."""
+    if hasattr(entry, "range_min"):
+        return float(entry.range_min), float(entry.range_max)
+    return float(entry["range_min"]), float(entry["range_max"])
 
-    ⚠️ Only safe there: between connecting and the first command the arm has not been asked to
-    move, so it is still in the self-supporting pose the operator left it in. ⛔ Never call this
-    to recover from a fault mid-motion -- releasing a raised arm drops it.
 
-    2026-09-09: a startup refusal used to leave the arm held, because the follower is configured
-    not to release on disconnect. The message told the operator to move the arm by hand, and the
-    arm would not move.
+def travel_degrees(calibration):
+    """Half of each joint's own recorded travel, in degrees: the distance from zero to a stop.
+
+    LeRobot reports a reading in degrees around the midpoint of the range recorded in Lesson 6,
+    so the reachable span is symmetric about zero and half of it is the distance to either end.
+
+    ⚠️ This is not the URDF's joint limit, and the two are not interchangeable. On the follower
+    measured 2026-09-09 the recorded travel is wider than the model on every joint (wrist_flex
+    ±104.75 against the model's ±95). The stop is a physical fact about this arm; the model
+    limit is what the solver can represent. Both are checked, separately.
     """
-    if not robot.bus.is_connected:
-        return False
-    print(f"Releasing every motor: {why}", file=sys.stderr, flush=True)
-    try:
-        robot.bus.disable_torque()
-        return True
-    except Exception as exc:  # a bus that has already gone cannot be asked to let go
-        print(f"    could not release over the bus ({exc}). Cut DC power.", file=sys.stderr)
-        return False
+    travel = {}
+    for name, entry in calibration.items():
+        low, high = recorded_range(entry)
+        travel[name] = (high - low) / 2 * 360 / ENCODER_STEPS
+    return travel
 
 
-def check_start_pose(observation, kinematics, bounds, limits=None, margin=STOP_MARGIN_DEG):
-    """Where the gripper is now, refusing to start from a pose the arm cannot leave.
+def calibration_disagrees(in_the_motors, calibration):
+    """Motors whose stored calibration is not the one in the file, named.
 
-    This runs once, before the loop, and reads nothing but the observation the caller already
-    has. It is not in the control chain. Two things make a pose unusable:
-
-    A pose outside the workspace is not rejected downstream but *corrected*: EEBoundsAndSafety
-    clips the first target to the nearest face and the arm walks there on its own, which is the
-    one motion nobody asked for.
-
-    A joint resting on its stop has nowhere to go in one direction, and the first command out of
-    there is the hardest one the arm will ever be asked for: on 2026-09-08 a follower folded onto
-    its shoulder stop drove at full load into that stop and tripped the servo's overload
-    protection. Fold the arm to a pose it can hold before powering it.
+    ⚠️ This says *that* they disagree, not why. Twelve disagreements usually mean the two serial
+    ports are the other way round rather than a broken calibration, and the Lesson 7 register
+    check is what tells the two apart -- so the message points there instead of guessing.
     """
+    disagreeing = []
+    for name, entry in calibration.items():
+        if name not in in_the_motors:
+            continue
+        low, high = recorded_range(entry)
+        offset = float(getattr(entry, "homing_offset", None)
+                       if hasattr(entry, "homing_offset") else entry["homing_offset"])
+        if tuple(float(v) for v in in_the_motors[name]) != (offset, low, high):
+            disagreeing.append(name)
+    return disagreeing
+
+
+def joints_on_a_stop(observation, calibration, margin=STOP_MARGIN_DEG):
+    """Joints resting against an end of their own travel, each with how far to move it back.
+
+    A joint on its stop has nowhere to go in one direction, and the first command out of there is
+    the hardest one the arm will ever be asked for. Measured 2026-09-08: a follower parked 0.8 deg
+    from its shoulder stop drove at 100 % load 2.5 deg deeper into that stop when torque came on,
+    and the servo's overload protection cut it to 20 % two seconds later.
+    """
+    half = travel_degrees(calibration)
+    complaints = []
+    for name in JOINTS:
+        if name not in half or f"{name}.pos" not in observation:
+            continue
+        value = float(observation[f"{name}.pos"])
+        end = -half[name] if value < 0 else half[name]
+        room = abs(end - value)
+        if room < margin:
+            move = margin + STOP_CLEARANCE_DEG - room
+            complaints.append(
+                f"{name} is {room:.1f} deg from the end of its travel "
+                f"({value:+.1f} of {end:+.1f}).\n"
+                f"        Move it at least {move:.1f} deg towards 0, with motor power off.")
+    return complaints
+
+
+def joints_outside_the_model(observation, limits):
+    """Joints the pinned URDF cannot represent, which is the space the solver works in.
+
+    Separate from a stop: the hardware reaches further than the model on every joint of this arm,
+    so a pose can be perfectly safe and still be one the IK has no way to express.
+    """
+    complaints = []
+    for name in JOINTS:
+        if name not in limits or f"{name}.pos" not in observation:
+            continue
+        value = float(observation[f"{name}.pos"])
+        low, high = limits[name]
+        if not low <= value <= high:
+            towards = high if value > high else low
+            complaints.append(
+                f"{name} at {value:+.1f} deg is outside the model's {low:+.1f}..{high:+.1f} range.\n"
+                f"        The solver cannot represent this pose; move it back inside "
+                f"{towards:+.1f} deg, with motor power off.")
+    return complaints
+
+
+def gripper_position(observation, kinematics):
+    """Where the gripper is now, from the joints in the observation."""
     import numpy as np
     joints = np.array([float(observation[f"{name}.pos"]) for name in JOINTS])
-    if limits:
-        on_a_stop = [
-            f"{name} at {value:+.1f} deg, against its {low:+.1f}..{high:+.1f} travel"
-            for name, value, (low, high) in ((n, float(v), limits[n]) for n, v in zip(JOINTS, joints))
-            if value < low + margin or value > high - margin
-        ]
-        if on_a_stop:
-            raise RuntimeError(
-                "These joints are resting on a stop, so the arm was never powered:\n    "
-                + "\n    ".join(on_a_stop)
-                + "\nWith motor power off, move the arm to a pose it can hold clear of its ends, "
-                "then run this again. Starting on a stop asks the first command to lift the arm "
-                "straight off it."
-            )
-    here = kinematics.forward_kinematics(joints)[:3, 3]
+    return kinematics.forward_kinematics(joints)[:3, 3]
+
+
+def outside_the_workspace(here, bounds):
+    """Whether the gripper starts outside the box, which the pipeline corrects rather than refuses.
+
+    EEBoundsAndSafety does not reject a pose outside its box: it clips the commanded target to the
+    nearest face, so the arm walks to the edge before anyone touches a control.
+    """
+    import numpy as np
     low, high = np.asarray(bounds["min"], dtype=float), np.asarray(bounds["max"], dtype=float)
     outside = [axis for index, axis in enumerate("xyz") if not low[index] <= here[index] <= high[index]]
-    if outside:
-        raise RuntimeError(
-            f"The gripper is at x={here[0]:.3f} y={here[1]:.3f} z={here[2]:.3f} m, outside the "
+    if not outside:
+        return []
+    return [f"the gripper is at x={here[0]:.3f} y={here[1]:.3f} z={here[2]:.3f} m, outside the "
             f"workspace on {', '.join(outside)}.\n"
-            f"    workspace  min {tuple(round(float(v), 3) for v in low)}  "
-            f"max {tuple(round(float(v), 3) for v in high)}\n"
-            "Move the arm into the workspace by hand with motor power off, or pass --bounds-min-m "
-            "and --bounds-max-m for a box that contains this pose. Starting here would have the "
-            "arm travel to the nearest edge before you touch anything."
-        )
+            f"        Workspace min {tuple(round(float(v), 3) for v in low)} "
+            f"max {tuple(round(float(v), 3) for v in high)}. Move the arm inside it with motor "
+            "power off, or pass --bounds-min-m and --bounds-max-m for a box that contains it."]
+
+
+def check_start_pose(observation, kinematics, bounds, limits=None, calibration=None):
+    """Every reason this pose cannot be driven from, raised together. Returns the gripper position.
+
+    Reads nothing but the observation the caller already has, and is not in the control chain.
+    """
+    here = gripper_position(observation, kinematics)
+    complaints = []
+    if calibration:
+        complaints += joints_on_a_stop(observation, calibration)
+    if limits:
+        complaints += joints_outside_the_model(observation, limits)
+    complaints += outside_the_workspace(here, bounds)
+    if complaints:
+        raise RuntimeError("This pose cannot be driven from:\n    " + "\n    ".join(complaints))
     return here
 
 

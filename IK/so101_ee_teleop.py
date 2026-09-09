@@ -87,12 +87,10 @@ def run(args):
         wait_for_a_key(teleop)
         # Judged with nothing energised: connect() ends by enabling torque, which is exactly what
         # a joint resting on its stop must not have (2026-09-08 logs).
-        observation, _already_powered = model.read_pose_before_power(robot)
-        here = model.check_start_pose(observation, kinematics, bounds, limits)
+        observation, _powered, _stored = model.read_pose_before_power(robot)
+        here = model.check_start_pose(observation, kinematics, bounds, limits, robot.calibration)
         robot.connect()
     except Exception:
-        # Nothing has been commanded yet, so the arm is still where the operator left it.
-        model.release_torque(robot, "startup stopped before any command was sent")
         teleop.disconnect()
         raise
 

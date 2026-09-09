@@ -168,15 +168,26 @@ class ViserPageTests(unittest.TestCase):
 
     def test_the_visual_joint_mapping_uses_names_radians_and_the_reported_figure(self):
         names = ("gripper", "wrist_roll", "wrist_flex", "elbow_flex", "shoulder_lift", "shoulder_pan")
-        values = visual.viewer_configuration(names, (10, -20, 30, -40, 50), 0)
+        travel = (-0.2, 1.7)
+        values = visual.viewer_configuration(names, (10, -20, 30, -40, 50), 0, travel)
         self.assertAlmostEqual(values[names.index("shoulder_pan")], math.radians(10))
         self.assertAlmostEqual(values[names.index("wrist_roll")], math.radians(50))
-        self.assertAlmostEqual(values[names.index("gripper")], visual.GRIPPER_URDF_RANGE_RAD[0])
+        self.assertAlmostEqual(values[names.index("gripper")], travel[0])
         self.assertAlmostEqual(
-            visual.viewer_configuration(names, (0, 0, 0, 0, 0), 100)[names.index("gripper")],
-            visual.GRIPPER_URDF_RANGE_RAD[1])
+            visual.viewer_configuration(names, (0, 0, 0, 0, 0), 100, travel)[names.index("gripper")],
+            travel[1])
         with self.assertRaises(ValueError):
-            visual.viewer_configuration(("shoulder_pan",), (10, -20, 30, -40, 50), 0)
+            visual.viewer_configuration(("shoulder_pan",), (10, -20, 30, -40, 50), 0, travel)
+
+    def test_the_gripper_travel_is_read_from_the_model_not_written_down(self):
+        # ⚠️ Which end is open has not been watched on hardware, so nothing claims it. This only
+        # maps LeRobot's 0-100 onto whatever the pinned model says the joint can do.
+        if not args.model_dir:
+            self.skipTest("needs the pinned model")
+        low, high = visual.gripper_urdf_range(str(args.model_dir))
+        self.assertLess(low, high)
+        self.assertNotIn("GRIPPER_URDF_RANGE_RAD",
+                         (ROOT / "IK/so101_visual_control.py").read_text(encoding="utf-8"))
 
     def test_the_display_tap_returns_the_action_untouched(self):
         seen = []
@@ -225,7 +236,8 @@ class ProgramShapeTests(unittest.TestCase):
         # disable_torque_on_disconnect defaults to True, which releases every motor on exit.
         source = (ROOT / "IK/so101_visual_control.py").read_text(encoding="utf-8")
         self.assertIn("disable_torque_on_disconnect=False", source)
-        self.assertIn("Cut DC power", source, "the lesson and the program must say how to release it")
+        self.assertIn("Cutting DC power", visual.SAFETY_NOTICE)
+        self.assertIn("--release-torque", visual.SAFETY_NOTICE)
 
     def test_no_control_loop_of_our_own(self):
         # Every frame comes from LeRobot's teleop_loop. A while loop around send_action here
@@ -240,15 +252,13 @@ class ProgramShapeTests(unittest.TestCase):
                              if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)}
                     self.assertNotIn("send_action", calls, f"{name} drives the robot itself")
 
-    def test_nothing_is_powered_until_the_operator_has_working_controls(self):
-        # 2026-09-09: the first version connected the follower -- which enables torque -- before
-        # the keyboard and before the browser. A silent input device then looked exactly like a
-        # dead program, with the arm live the whole time.
-        for name, device, gate in (("IK/so101_ee_teleop.py", "teleop.connect()", "wait_for_a_key"),
-                                   ("IK/so101_visual_control.py", "page.connect()", "wait_for_a_browser")):
-            source = (ROOT / name).read_text(encoding="utf-8")
-            self.assertLess(source.index(device), source.index("robot.connect()"), name)
-            self.assertLess(source.index(gate + "("), source.rindex("robot.connect()"), name)
+    def test_the_command_line_program_proves_its_keyboard_before_powering(self):
+        # 2026-09-09: it used to connect the follower -- which enables torque -- before the
+        # keyboard existed. A silent input device then looked exactly like a dead program, with
+        # the arm live the whole time.
+        source = (ROOT / "IK/so101_ee_teleop.py").read_text(encoding="utf-8")
+        self.assertLess(source.index("teleop.connect()"), source.index("robot.connect()"))
+        self.assertLess(source.index("wait_for_a_key("), source.rindex("robot.connect()"))
 
     def test_the_start_pose_is_judged_before_a_single_motor_is_powered(self):
         # 2026-09-09 on hardware: the check ran on robot.get_observation(), which is after
@@ -260,13 +270,25 @@ class ProgramShapeTests(unittest.TestCase):
             self.assertLess(source.index("check_start_pose"), source.index("robot.connect()"), name)
             self.assertNotIn("check_start_pose(robot.get_observation()", source, name)
 
-    def test_a_refused_startup_lets_go_of_the_arm(self):
-        # 2026-09-09 on hardware: the refusal message says to move the arm by hand, and the arm
-        # was still held, because the follower is configured not to release on disconnect.
-        for name in ("IK/so101_ee_teleop.py", "IK/so101_visual_control.py"):
-            source = (ROOT / name).read_text(encoding="utf-8")
-            self.assertIn("release_torque(robot", source, name)
-            self.assertLess(source.index("release_torque(robot"), source.index("teleop_loop("), name)
+    def test_the_self_check_runs_before_any_server_or_any_motor(self):
+        # Jeff, 2026-09-09: a page that opens looking healthy while none of its modes can work is
+        # worse than no page. The check has to precede both the server and the power.
+        source = (ROOT / "IK/so101_visual_control.py").read_text(encoding="utf-8")
+        body = source[source.index("def run(args):"):]
+        self.assertLess(body.index("self_check("), body.index("page.connect()"))
+        self.assertLess(body.index("self_check("), body.index("robot.connect()"))
+        self.assertLess(body.index("page.connect()"), body.index("robot.connect()"))
+
+    def test_only_ending_a_mode_releases_the_arm(self):
+        # Jeff, 2026-09-09: a crash must not let go, because releasing a raised arm drops it.
+        # Only the End path releases, and the program says so on any other way out.
+        source = (ROOT / "IK/so101_visual_control.py").read_text(encoding="utf-8")
+        body = source[source.index("def run(args):"):source.index("def main(")]
+        self.assertEqual(body.count("disable_torque()"), 1, "exactly one release, on the End path")
+        self.assertLess(body.index("except ModeEnded"), body.index("disable_torque()"))
+        self.assertIn("except BaseException", body, "Ctrl+C counts as an unsafe stop too")
+        self.assertIn("SAFETY_NOTICE", body)
+        self.assertIn("--release-torque", source)
 
     def test_the_pre_power_read_opens_and_hands_back_the_port_untouched(self):
         # It must read over bus.connect(), which only opens the port, and never over
@@ -277,7 +299,11 @@ class ProgramShapeTests(unittest.TestCase):
 
         def sync_read(data_name, motors=None, *, normalize=True, num_retry=0):
             events.append(f"read {data_name} normalize={normalize}")
-            return dict(reading) if data_name == "Present_Position" else dict(torque)
+            if data_name == "Present_Position":
+                return dict(reading)
+            if data_name == "Torque_Enable":
+                return dict(torque)
+            return dict.fromkeys(demo.MOTORS, 0)
 
         robot = SimpleNamespace(
             config=SimpleNamespace(num_read_retries=3),
@@ -285,58 +311,45 @@ class ProgramShapeTests(unittest.TestCase):
                 connect=lambda: events.append("bus.connect"),
                 disconnect=lambda disable_torque=True: events.append(f"bus.disconnect({disable_torque})"),
                 sync_read=sync_read))
-        observation, powered = demo.read_pose_before_power(robot)
+        observation, powered, stored = demo.read_pose_before_power(robot)
         self.assertEqual(observation, {f"{name}.pos": 1.0 for name in demo.MOTORS})
         self.assertEqual(powered, ["shoulder_pan"])
+        self.assertEqual(set(stored), set(demo.MOTORS), "the stored calibration is read too")
         self.assertEqual(events[0], "bus.connect")
         self.assertEqual(events[-1], "bus.disconnect(False)", "the port must be handed back closed")
         self.assertIn("read Torque_Enable normalize=False", events)
 
-    def test_release_torque_is_quiet_when_there_is_nothing_to_release(self):
-        released = []
-        closed = SimpleNamespace(bus=SimpleNamespace(is_connected=False))
-        self.assertFalse(demo.release_torque(closed, "no bus"))
-        powered = SimpleNamespace(bus=SimpleNamespace(
-            is_connected=True, disable_torque=lambda: released.append("let go")))
-        self.assertTrue(demo.release_torque(powered, "startup refused"))
-        self.assertEqual(released, ["let go"])
+    def test_the_release_command_reports_what_it_let_go_of(self):
+        # Jeff, 2026-09-09: after an unsafe stop the operator releases the arm themselves. The
+        # command reads first, so it can say nothing was held rather than pretend it did something.
+        events, deg = [], dict(zip(demo.MOTORS, (0.0, -30.0, 60.0, -30.0, 0.0, 50.0)))
+        torque = dict.fromkeys(demo.MOTORS, 1)
 
-        def broken():
-            raise RuntimeError("bus gone")
-        self.assertFalse(demo.release_torque(
-            SimpleNamespace(bus=SimpleNamespace(is_connected=True, disable_torque=broken)), "x"))
+        def sync_read(name, motors=None, *, normalize=True, num_retry=0):
+            events.append(f"read {name}")
+            return dict(deg) if name == "Present_Position" else dict(torque)
 
-    def test_a_start_pose_outside_the_workspace_is_refused_not_corrected(self):
-        # 2026-09-09: Rest folds the gripper to about x=0.04, and the first workspace started at
-        # x=0.10. EEBoundsAndSafety does not reject an out-of-box pose, it clips the target to
-        # the nearest face -- so the arm would walk to the edge before anyone touched a control.
-        if not args.model_dir:
-            self.skipTest("needs the pinned model")
-        kinematics, _limits = demo.load_kinematics(args.model_dir)
-        observation = dict(zip((f"{name}.pos" for name in demo.MOTORS),
-                               (13.98, -103.69, 97.01, -102.29, 6.37, 50.0)))
-        with self.assertRaises(RuntimeError) as refused:
-            demo.check_start_pose(observation, kinematics,
-                                  demo.bounds_dict((0.10, -0.2, 0.02), (0.35, 0.2, 0.35)))
-        self.assertIn("outside the workspace on x", str(refused.exception))
+        def disable():
+            events.append("disable_torque")
+            torque.update(dict.fromkeys(demo.MOTORS, 0))
 
-    def test_a_joint_resting_on_its_stop_is_refused(self):
-        # 2026-09-08 measured: torque enabled with shoulder_lift and wrist_flex past their travel
-        # drove both at 100 % load 2.5 deg deeper into the stops, and the servos' overload
-        # protection cut them to 20 % two seconds later.
-        if not args.model_dir:
-            self.skipTest("needs the pinned model")
-        kinematics, limits = demo.load_kinematics(args.model_dir)
-        bounds = demo.bounds_dict(demo.DEFAULT_BOUNDS_M["min"], demo.DEFAULT_BOUNDS_M["max"])
-        on_a_stop = dict(zip((f"{name}.pos" for name in demo.MOTORS),
-                             (-30.95, -100.09, 85.32, 85.93, 6.20, 33.0)))
-        with self.assertRaises(RuntimeError) as refused:
-            demo.check_start_pose(on_a_stop, kinematics, bounds, limits)
-        self.assertIn("shoulder_lift", str(refused.exception))
-        self.assertIn("resting on a stop", str(refused.exception))
-        clear = dict(zip((f"{name}.pos" for name in demo.MOTORS),
-                         (*demo.PREVIEW_JOINTS_DEG, 33.0)))
-        demo.check_start_pose(clear, kinematics, bounds, limits)  # raises if this one is refused
+        robot = SimpleNamespace(bus=SimpleNamespace(
+            connect=lambda: events.append("connect"), sync_read=sync_read,
+            disable_torque=disable, is_connected=True,
+            disconnect=lambda disable_torque=True: events.append(f"disconnect({disable_torque})")))
+        import contextlib, io as _io
+        with patch.object(visual, "make_follower", lambda _args: robot), \
+                contextlib.redirect_stdout(_io.StringIO()):
+            self.assertEqual(visual.release_only(SimpleNamespace()), 0)
+        self.assertIn("disable_torque", events)
+        self.assertEqual(events[-1], "disconnect(False)")
+        self.assertLess(events.index("read Torque_Enable"), events.index("disable_torque"),
+                        "it must look before it lets go")
+        events.clear()
+        with patch.object(visual, "make_follower", lambda _args: robot), \
+                contextlib.redirect_stdout(_io.StringIO()):
+            self.assertEqual(visual.release_only(SimpleNamespace()), 0)
+        self.assertNotIn("disable_torque", events, "already released means nothing to do")
 
     def test_the_keyboard_gate_gives_up_instead_of_powering_the_arm(self):
         import so101_ee_teleop as keyboard_program
@@ -819,7 +832,7 @@ class NumericalTests(unittest.TestCase):
         reading = dict(zip((f"{name}.pos" for name in demo.MOTORS), values))
         return SimpleNamespace(get_action=lambda: dict(reading)), reading
 
-    def live_page(self, keyboard=None, leader=None):
+    def live_page(self, keyboard=None, leader=None, armed=None, joints=None):
         """A real Viser server on a free loopback port. No browser, no serial port, no robot."""
         import socket
         with socket.socket() as probe:
@@ -829,9 +842,11 @@ class NumericalTests(unittest.TestCase):
         page = visual.build(visual.ViserTeleopConfig(
             id="test", model_dir=str(args.model_dir), web_port=port), self.kinematics, pipeline,
             keyboard=keyboard, leader=leader)
-        page.connect()
         page.seed(dict(zip((f"{name}.pos" for name in demo.MOTORS),
-                           (*demo.PREVIEW_JOINTS_DEG, 50.0))))
+                           (*(joints or demo.PREVIEW_JOINTS_DEG), 50.0))))
+        page.connect()
+        if armed:
+            page.armed(armed)
         return page
 
     def assert_joints_close(self, action, expected, places=6, message=""):
@@ -851,15 +866,73 @@ class NumericalTests(unittest.TestCase):
                               leader=leader)
         try:
             self.assertEqual(len(page.mode_dropdown.options), 3)
-            self.assertTrue(page.keyboard_panel.visible)
-            self.assertFalse(page.ik_panel.visible)
+            self.assertTrue(page.panels[visual.KEYBOARD].visible)
+            self.assertFalse(page.panels[visual.IK].visible)
             self.assertFalse(page.handle.visible)
             page.mode_dropdown.value = visual.MODE_LABELS[visual.IK]
-            page._choose_mode()
-            self.assertTrue(page.ik_panel.visible)
+            page._show_panel(visual.IK)
+            self.assertTrue(page.panels[visual.IK].visible)
             self.assertTrue(page.handle.visible)
-            self.assertFalse(page.keyboard_panel.visible)
+            self.assertFalse(page.panels[visual.KEYBOARD].visible)
             self.assertEqual(page.gripper_slider.value, visual.GRIPPER_INITIAL_PCT)
+        finally:
+            page.disconnect()
+
+    def test_the_page_opens_showing_the_arm_and_not_the_models_zero_pose(self):
+        # 2026-09-09 on hardware: observe() only ran inside the control loop, so the page sat at
+        # the URDF's zero configuration -- 384 mm from where the arm actually was -- for as long
+        # as it took to start. The seeded reading has to be painted by connect() itself.
+        folded = (-30.95, -95.0, 90.0, 60.0, 6.20)
+        page = self.live_page(joints=folded)
+        try:
+            expected = self.kinematics.forward_kinematics(self.np.array(folded))[:3, 3]
+            zero = self.kinematics.forward_kinematics(self.np.zeros(5))[:3, 3]
+            self.np.testing.assert_allclose(page.handle.position, expected, atol=1e-6)
+            self.assertGreater(float(self.np.linalg.norm(expected - zero)), 0.1,
+                               "the fixture must differ from the zero pose for this to mean anything")
+        finally:
+            page.disconnect()
+
+    def test_only_one_mode_can_be_live_and_end_stops_it(self):
+        leader, _reading = self.fake_leader()
+        page = self.live_page(keyboard=SimpleNamespace(get_action=dict, current_pressed={}),
+                              leader=leader)
+        try:
+            self.assertTrue(all(not b.disabled for b in page.enable_buttons.values()))
+            self.assertTrue(all(b.disabled for b in page.end_buttons.values()))
+            page._request_arm(visual.LEADER)
+            self.assertEqual(page.take_arm_request(), visual.LEADER)
+            self.assertIsNone(page.take_arm_request(), "the request is taken once")
+            page.armed(visual.LEADER)
+            self.assertTrue(all(b.disabled for b in page.enable_buttons.values()))
+            self.assertFalse(page.end_buttons[visual.LEADER].disabled)
+            self.assertTrue(page.end_buttons[visual.KEYBOARD].disabled)
+            self.assertTrue(page.mode_dropdown.disabled)
+            page._request_arm(visual.IK)
+            self.assertIsNone(page.take_arm_request(), "no second mode while one is live")
+            page._request_end()
+            with self.assertRaises(visual.ModeEnded) as ended:
+                page.get_action()
+            self.assertEqual(ended.exception.mode, visual.LEADER)
+            page.disarmed("done")
+            self.assertTrue(all(not b.disabled for b in page.enable_buttons.values()))
+        finally:
+            page.disconnect()
+
+    def test_the_read_only_loop_reads_and_sends_nothing(self):
+        page = self.live_page()
+        sent = []
+        bus = SimpleNamespace(
+            sync_read=lambda name, motors=None, **kw: dict(zip(demo.MOTORS, (0.0, -30.0, 60.0, -30.0, 0.0, 50.0))),
+            send_action=lambda action: sent.append(action))
+        robot = SimpleNamespace(bus=bus, config=SimpleNamespace(num_read_retries=3))
+        try:
+            import threading
+            threading.Timer(0.1, lambda: page._request_arm(visual.IK)).start()
+            mode, observation = visual.read_only_display(page, robot, fps=60)
+            self.assertEqual(mode, visual.IK)
+            self.assertEqual(observation["shoulder_lift.pos"], -30.0)
+            self.assertEqual(sent, [], "the read-only loop must command nothing")
         finally:
             page.disconnect()
 
@@ -867,8 +940,7 @@ class NumericalTests(unittest.TestCase):
         leader, reading = self.fake_leader()
         page = self.live_page(leader=leader)
         try:
-            page.mode_dropdown.value = visual.MODE_LABELS[visual.LEADER]
-            page._choose_mode()
+            page.armed(visual.LEADER)
             self.assertEqual(page.get_action(), reading)
         finally:
             page.disconnect()
@@ -880,7 +952,7 @@ class NumericalTests(unittest.TestCase):
         device.connect()
         if not device.is_connected:
             self.skipTest("pynput cannot capture keys in this session")
-        page = self.live_page(keyboard=device)
+        page = self.live_page(keyboard=device, armed=visual.KEYBOARD)
         try:
             before = self.gripper_of(page.get_action())
             device._on_press(keys.Key.left)  # left is +x in LeRobot's own mapping
@@ -891,10 +963,9 @@ class NumericalTests(unittest.TestCase):
             page.disconnect()
 
     def test_ik_mode_holds_until_execute_then_arrives_and_stops(self):
-        page = self.live_page()
+        page = self.live_page(armed=visual.IK)
         try:
-            page.mode_dropdown.value = visual.MODE_LABELS[visual.IK]
-            page._choose_mode()
+            page._show_panel(visual.IK)
             observation = dict(zip((f"{name}.pos" for name in demo.MOTORS),
                                    (*demo.PREVIEW_JOINTS_DEG, 50.0)))
             target = (0.34, 0.06, 0.22)
@@ -921,10 +992,9 @@ class NumericalTests(unittest.TestCase):
             page.disconnect()
 
     def test_stop_halts_an_execution_in_progress(self):
-        page = self.live_page()
+        page = self.live_page(armed=visual.IK)
         try:
-            page.mode_dropdown.value = visual.MODE_LABELS[visual.IK]
-            page._choose_mode()
+            page._show_panel(visual.IK)
             page.handle.position = (0.34, 0.06, 0.22)
             page._make_plan()
             page._start_executing()
@@ -954,13 +1024,15 @@ class NumericalTests(unittest.TestCase):
         loaded = yourdfpy.URDF.load(model_path, filename_handler=partial(yourdfpy.filename_handler_magic, dir=model_path.parent))
         scene = SimpleNamespace(add_frame=Mock(side_effect=lambda *a, **kw: SimpleNamespace(**kw)), add_mesh_simple=Mock())
         viewer = ViserUrdf(SimpleNamespace(scene=scene), loaded, root_node_name="/test", mesh_color_override=visual.ARM_COLOR)
+        travel = visual.gripper_urdf_range(str(args.model_dir))
         self.assertGreater(scene.add_mesh_simple.call_count, 0)
         for call in scene.add_mesh_simple.call_args_list:
             self.assertGreater(len(call.args[1]), 0)
             self.assertGreater(len(call.args[2]), 0)
             self.assertTrue(np.isfinite(call.args[1]).all())
         for seed in (demo.PREVIEW_JOINTS_DEG, [10, -25, 55, -25, 10]):
-            viewer.update_cfg(np.array(visual.viewer_configuration(viewer.get_actuated_joint_names(), seed, 0)))
+            viewer.update_cfg(np.array(visual.viewer_configuration(
+                viewer.get_actuated_joint_names(), seed, 0, travel)))
             np.testing.assert_allclose(loaded.get_transform("gripper_frame_link"),
                                        self.kinematics.forward_kinematics(seed), atol=1e-8)
 
