@@ -694,6 +694,41 @@ class TeleopLogTests(unittest.TestCase):
         self.assertTrue(any("overload" in problem for problem in problems))
         self.assertTrue(any("torque limit 300" in problem for problem in problems))
 
+    def test_swapped_ports_are_named_instead_of_twelve_mismatches(self):
+        # Linux reassigns serial device names between sessions, so the arm on a port changes.
+        # Calibration lives in the motors, so a swap looks like every motor mismatching its own
+        # file while matching the other one exactly. Measured on 2026-09-09.
+        leader_file = {name: {"homing_offset": -100 - index, "range_min": 800, "range_max": 3500}
+                       for index, name in enumerate(teleop.JOINT_NAMES)}
+        follower_file = {name: {"homing_offset": -200 - index, "range_min": 600, "range_max": 3300}
+                         for index, name in enumerate(teleop.JOINT_NAMES)}
+
+        def dump(source):
+            return {name: {"Homing_Offset": values["homing_offset"], "Min_Position_Limit": values["range_min"],
+                           "Max_Position_Limit": values["range_max"]} for name, values in source.items()}
+
+        calibrations = {"leader": leader_file, "follower": follower_file}
+        crossed = {"leader": dump(follower_file), "follower": dump(leader_file)}
+        straight = {"leader": dump(leader_file), "follower": dump(follower_file)}
+        self.assertTrue(teleop.swapped_ports(crossed, calibrations))
+        self.assertFalse(teleop.swapped_ports(straight, calibrations))
+        # One motor genuinely off is a calibration problem, not a swap.
+        partial = {"leader": dump(leader_file), "follower": dump(follower_file)}
+        partial["follower"]["elbow_flex"]["Homing_Offset"] = 7
+        self.assertFalse(teleop.swapped_ports(partial, calibrations))
+        self.assertFalse(teleop.swapped_ports({"leader": dump(leader_file)}, calibrations))
+
+    def test_a_power_cycled_arm_is_reported_once_not_six_times(self):
+        from unittest.mock import patch
+        rows = {name: dict.fromkeys(teleop.REGISTERS, 0) for name in teleop.JOINT_NAMES}
+        for values in rows.values():
+            values.update(Torque_Limit=1000, Max_Torque_Limit=1000, Goal_Position=0, Present_Position=2048)
+        with patch.object(teleop, "say", lambda text: None):
+            problems = teleop.summarise_registers(rows, "follower")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("goal of 0", problems[0])
+        self.assertIn("toward step 0", problems[0])
+
     def write_recording(self, directory, leader, follower, fps=30):
         """A dataset shaped the way lerobot-record writes one."""
         import pandas as pd

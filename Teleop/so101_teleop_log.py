@@ -206,12 +206,50 @@ def summarise_registers(rows, role):
         if values["Torque_Limit"] != values["Max_Torque_Limit"]:
             problems.append(f"{name}: torque limit {values['Torque_Limit']} below its maximum {values['Max_Torque_Limit']}"
                             " (it lives in RAM; cutting DC power reloads it)")
-        if abs(values["Goal_Position"] - values["Present_Position"]) > 100:
-            problems.append(f"{name}: stored goal is {values['Goal_Position'] - values['Present_Position']} steps from the"
-                            " present position; enabling torque would move it there")
+    # A goal far from the present position is worth one line for the arm, not six. Every motor
+    # reading a goal of 0 is what a DC power cycle leaves behind: enabling torque before writing a
+    # goal would send each motor toward step 0, which is a hard stop.
+    stale = [name for name, values in rows.items() if abs(values["Goal_Position"] - values["Present_Position"]) > 100]
+    if len(stale) == len(rows) and all(values["Goal_Position"] == 0 for values in rows.values()):
+        problems.append("every motor holds a goal of 0, which is what a DC power cycle leaves. Enabling torque "
+                        "before writing a goal would drive all six toward step 0. Write the present position first.")
+    elif stale:
+        problems.append(f"{', '.join(stale)}: the stored goal is far from the present position; enabling torque "
+                        "would move there")
     for problem in problems:
         say(f"  {role}: {problem}")
     return problems
+
+
+def calibration_triples(source, motors):
+    """(homing_offset, range_min, range_max) per motor, from a file or from a register dump."""
+    if all(isinstance(value, dict) and "homing_offset" in value for value in source.values()):
+        return {name: tuple(int(source[name][field]) for field in ("homing_offset", "range_min", "range_max"))
+                for name in motors if name in source}
+    return {name: tuple(int(source[name][register]) for register in CALIBRATED_REGISTERS)
+            for name in motors if name in source}
+
+
+def swapped_ports(rows, calibrations):
+    """True when each arm's registers are the other role's calibration file, motor for motor.
+
+    Linux does not keep serial device names stable, so the arm on a given port changes between
+    sessions. Calibration lives in the motors, so a swap shows up here as every motor mismatching
+    its own file while matching the other one exactly. Twelve MISMATCH lines mean this far more
+    often than they mean a broken calibration.
+    """
+    roles = ("leader", "follower")
+    if not all(rows.get(role) and calibrations.get(role) for role in roles):
+        return False
+    crossed = all(
+        calibration_triples(rows[role], JOINT_NAMES) == calibration_triples(calibrations[other], JOINT_NAMES)
+        for role, other in (roles, roles[::-1])
+    )
+    matched = any(
+        calibration_triples(rows[role], JOINT_NAMES) == calibration_triples(calibrations[role], JOINT_NAMES)
+        for role in roles
+    )
+    return crossed and not matched
 
 
 def run_registers(args):
@@ -221,19 +259,27 @@ def run_registers(args):
         calibrations[role] = json.loads(file.read_text(encoding="utf-8")) if file.is_file() else {}
         if not calibrations[role]:
             say(f"{role}: no calibration file at {file}; register comparison is skipped")
-    problems = []
-    for role, port in (("leader", args.leader_port), ("follower", args.follower_port)):
+    problems, dumps = [], {}
+    ports = {"leader": args.leader_port, "follower": args.follower_port}
+    for role, port in ports.items():
         bus = open_bus(role, port)
         try:
             bus.connect()
             refuse_if_powered(bus, role)
             say(f"=== {role} on {port} ===")
-            rows = dump_registers(bus, role, calibrations[role])
-            problems += summarise_registers(rows, role)
+            dumps[role] = dump_registers(bus, role, calibrations[role])
+            problems += summarise_registers(dumps[role], role)
         finally:
             if bus.is_connected:
                 bus.disconnect(disable_torque=False)
     say("")
+    if swapped_ports(dumps, calibrations):
+        say("PORTS ARE SWAPPED. Each arm holds the other one's calibration, motor for motor, so the two")
+        say(f"ports are the other way round: the Leader is on {ports['follower']} and the Follower is on {ports['leader']}.")
+        say("Serial device names are assigned in the order the boards enumerate, so they change between")
+        say("sessions. Swap the two --*-port arguments and run this again; every MISMATCH above should clear.")
+        say("Until they agree, any teleoperation command would read one arm through the other's calibration.")
+        return 1
     say("SUMMARY: nothing to flag." if not problems else f"SUMMARY: {len(problems)} thing(s) to look at, listed above.")
     return 0
 
