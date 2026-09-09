@@ -47,12 +47,14 @@ GRIPPER_MIN_PCT, GRIPPER_MAX_PCT = 0.0, 100.0
 # A teaching workspace, not a measured safety guarantee. Sampling the pinned model over its URDF
 # joint limits gives a reachable box of x [-0.34, 0.48], y [-0.44, 0.44], z [-0.22, 0.53] metres;
 # these bounds sit inside it and above the mounting plane.
-# ⚠️ The box must contain the pose the arm starts from. Rest folds the gripper back over the
-# base at about x=0.04, z=0.29 (2026-09-09, measured from the recorded Rest joint angles). An
-# earlier x minimum of 0.10 put Rest 58 mm outside, and EEBoundsAndSafety would then clip the
-# very first target to the edge and walk the arm there before anyone touched a key.
+# ⚠️ The box must contain the pose the arm is parked in, because EEBoundsAndSafety does not
+# reject a pose outside it -- it clips the commanded target to the nearest face, so the arm
+# walks to the edge before anyone touches a control. Two measurements from 2026-09-09 set the
+# floor and the near wall: a follower parked with the gripper down reads x=0.115, z=0.011, and
+# the recorded Rest angles fold it back over the base to x=0.042, z=0.291. z=0 is the base
+# mounting plane, which is the table, so the gripper cannot honestly be asked to go below it.
 # ⛔ Widening them does not make a rejected target safe. Override only with the arm watched.
-DEFAULT_BOUNDS_M = {"min": (0.00, -0.22, 0.02), "max": (0.38, 0.22, 0.42)}
+DEFAULT_BOUNDS_M = {"min": (0.00, -0.22, 0.00), "max": (0.38, 0.22, 0.42)}
 DOWNLOAD_TIMEOUT_SECONDS = 45
 DOWNLOAD_ATTEMPTS = 3
 

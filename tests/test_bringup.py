@@ -101,7 +101,7 @@ class EndEffectorPipelineTests(unittest.TestCase):
         for axis in range(3):
             self.assertGreater(demo.DEFAULT_BOUNDS_M["min"][axis], reach_min[axis])
             self.assertLess(demo.DEFAULT_BOUNDS_M["max"][axis], reach_max[axis])
-        self.assertGreater(demo.DEFAULT_BOUNDS_M["min"][2], 0.0, "the box must not reach below the base plane")
+        self.assertGreaterEqual(demo.DEFAULT_BOUNDS_M["min"][2], 0.0, "the box must not reach below the base plane")
 
     def test_one_frame_asks_for_one_step_at_most(self):
         self.assertGreaterEqual(demo.MAX_EE_STEP_M, demo.EE_STEP_M)
@@ -212,6 +212,20 @@ class ViserPageTests(unittest.TestCase):
             self.assertLess(source.index(device), source.index("robot.connect()"), name)
             self.assertLess(source.index(gate + "("), source.rindex("robot.connect()"), name)
             self.assertLess(source.index("robot.connect()"), source.index("check_start_pose"), name)
+
+    def test_every_pose_the_arm_was_actually_found_in_starts(self):
+        # Both measured from register dumps on 2026-09-09. A default box that excludes either of
+        # them is the bug this test exists for: EEBoundsAndSafety would clip the first target to
+        # the nearest face and walk the arm there. The first parks the gripper 11 mm above the
+        # base plane, which is what set the floor; the second folds it back over the base.
+        kinematics, _limits = demo.load_kinematics(args.model_dir) if args.model_dir else (None, None)
+        if kinematics is None:
+            self.skipTest("needs the pinned model")
+        bounds = demo.bounds_dict(demo.DEFAULT_BOUNDS_M["min"], demo.DEFAULT_BOUNDS_M["max"])
+        for parked in ((-30.95, -100.09, 85.32, 85.93, 6.20), (13.98, -103.69, 97.01, -102.29, 6.37),
+                       demo.PREVIEW_JOINTS_DEG):
+            observation = dict(zip((f"{name}.pos" for name in demo.MOTORS), (*parked, 33.0)))
+            demo.check_start_pose(observation, kinematics, bounds)  # raises if the box excludes it
 
     def test_a_start_pose_outside_the_workspace_is_refused_not_corrected(self):
         # 2026-09-09: Rest folds the gripper to about x=0.04, and the first workspace started at
