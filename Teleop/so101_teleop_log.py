@@ -258,6 +258,58 @@ def swapped_ports(rows, calibrations):
     return crossed and not matched
 
 
+RESULT_RULE = "-" * 78
+
+
+def port_verdict(rows, calibrations):
+    """One of READY, WRONG PORTS or CANNOT TELL, with the reason, from the MATCH lines above.
+
+    Everything printed before this is per motor and per register. This is the single judgement an
+    operator needs before running a teleoperation command, and it is deliberately conservative:
+    anything that is neither a clean match nor a clean swap is reported as undecided rather than
+    guessed at.
+    """
+    roles = ("leader", "follower")
+    unread = [role for role in roles if not rows.get(role)]
+    if unread:
+        return "CANNOT TELL", f"the {' and the '.join(unread)} could not be read"
+    without_file = [role for role in roles if not calibrations.get(role)]
+    if without_file:
+        return "CANNOT TELL", (f"there is no calibration file for the {' and the '.join(without_file)}"
+                               ", so the registers have nothing to be compared against")
+    own = {role: calibration_triples(rows[role], JOINT_NAMES)
+           == calibration_triples(calibrations[role], JOINT_NAMES) for role in roles}
+    if all(own.values()):
+        return "READY", "every motor on both arms matches its own calibration file"
+    if swapped_ports(rows, calibrations):
+        return "WRONG PORTS", "each arm matches the other one's calibration file, motor for motor"
+    disagreeing = [role for role in roles if not own[role]]
+    if len(disagreeing) == len(roles):
+        return "CANNOT TELL", ("neither arm matches its own calibration file, and they are not "
+                               "simply the other way round")
+    return "CANNOT TELL", (f"the {disagreeing[0]} does not match its own calibration file, and it "
+                           "does not match the other one either")
+
+
+def say_result(verdict, detail, ports):
+    """The verdict block: three fixed outcomes, ruled off so it is impossible to miss."""
+    say("")
+    say(RESULT_RULE)
+    say(f"RESULT: {verdict}")
+    say(f"    leader   {ports['leader']}")
+    say(f"    follower {ports['follower']}")
+    say(f"    Because {detail}.")
+    if verdict == "READY":
+        say("    These two ports are correct. The official teleoperation command can use them.")
+    elif verdict == "WRONG PORTS":
+        say(f"    Set them again:  --leader-port {ports['follower']}  --follower-port {ports['leader']}")
+        say("    Serial device names are handed out in the order the boards enumerate, so they")
+        say("    change between sessions. This is not a calibration fault.")
+    else:
+        say("    Read the lines above before running any teleoperation command.")
+    say(RESULT_RULE)
+
+
 def run_registers(args):
     calibrations = {}
     for role, path in (("leader", args.leader_calibration), ("follower", args.follower_calibration)):
@@ -279,14 +331,17 @@ def run_registers(args):
             if bus.is_connected:
                 bus.disconnect(disable_torque=False)
     say("")
-    if swapped_ports(dumps, calibrations):
+    verdict, detail = port_verdict(dumps, calibrations)
+    if verdict == "WRONG PORTS":
         say("PORTS ARE SWAPPED. Each arm holds the other one's calibration, motor for motor, so the two")
         say(f"ports are the other way round: the Leader is on {ports['follower']} and the Follower is on {ports['leader']}.")
         say("Serial device names are assigned in the order the boards enumerate, so they change between")
         say("sessions. Swap the two --*-port arguments and run this again; every MISMATCH above should clear.")
         say("Until they agree, any teleoperation command would read one arm through the other's calibration.")
+        say_result(verdict, detail, ports)
         return 1
     say("SUMMARY: nothing to flag." if not problems else f"SUMMARY: {len(problems)} thing(s) to look at, listed above.")
+    say_result(verdict, detail, ports)
     return 0
 
 

@@ -22,7 +22,7 @@
 - **`Bringup/`**：`so101_bus_check.py` 读一条总线上的六台电机；`so101_calibrate.py` 记录每个关节的中位和活动范围。第 6 课用。
 - **`IK/`**：`so101_cartesian_demo.py` 下载锁定模型，并用 LeRobot 自带的 IK 解一步笛卡尔位移；`so101_visual_control.py` 是浏览器页面，三种方式驱动机械臂（LeRobot 的键盘设备、示教臂、或拖出目标交给 IK 求解）；`so101_ee_teleop.py` 是同一套键盘控制的无界面版本，能跑起来的最小形态。第 8 课用。三个文件必须放在同一个文件夹：两个控制程序从第一个里取模型相关的函数。
 - **`Teleop/`**：`so101_teleop_log.py` 打印两只臂的保护与校准寄存器、把两只臂对着读，并给 `lerobot-record` 录下的数据打分。遥操作本身仍然用官方的 `lerobot-teleoperate`。第 7 课用。
-- **`tests/`**：64 条测试，用假硬件跑这些程序。
+- **`tests/`**：66 条测试，用假硬件跑这些程序。
 - **`Teleop/logs/`**（不进 git）：诊断程序每次运行一份调试日志，只留最近 20 份，`lerobot-record` 录下的数据也放这里。出问题时把最新那份发出来。
 - **`tools/`**：`build_control_poses.py` 计算课程原理图里画的姿态。
 

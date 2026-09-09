@@ -15,7 +15,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 # The course programs are loaded from their published paths; keep bytecode out of the tree.
 sys.dont_write_bytecode = True
@@ -544,6 +544,52 @@ class TeleopLogTests(unittest.TestCase):
         partial["follower"]["elbow_flex"]["Homing_Offset"] = 7
         self.assertFalse(teleop.swapped_ports(partial, calibrations))
         self.assertFalse(teleop.swapped_ports({"leader": dump(leader_file)}, calibrations))
+
+    def test_the_register_dump_ends_with_one_of_three_verdicts(self):
+        # Jeff, 2026-09-09: the per-motor MATCH lines are for reading afterwards; before running a
+        # teleoperation command the operator needs one judgement. Undecided is a real outcome and
+        # must never be dressed up as ready.
+        leader_file = {name: {"homing_offset": -100 - index, "range_min": 800, "range_max": 3500}
+                       for index, name in enumerate(teleop.JOINT_NAMES)}
+        follower_file = {name: {"homing_offset": -200 - index, "range_min": 600, "range_max": 3300}
+                         for index, name in enumerate(teleop.JOINT_NAMES)}
+
+        def dump(source):
+            return {name: {"Homing_Offset": values["homing_offset"], "Min_Position_Limit": values["range_min"],
+                           "Max_Position_Limit": values["range_max"]} for name, values in source.items()}
+
+        calibrations = {"leader": leader_file, "follower": follower_file}
+        straight = {"leader": dump(leader_file), "follower": dump(follower_file)}
+        crossed = {"leader": dump(follower_file), "follower": dump(leader_file)}
+        self.assertEqual(teleop.port_verdict(straight, calibrations)[0], "READY")
+        self.assertEqual(teleop.port_verdict(crossed, calibrations)[0], "WRONG PORTS")
+        # No file to compare against, one arm not read, and a mismatch that is not a swap:
+        # all undecided, never READY.
+        self.assertEqual(teleop.port_verdict(straight, {"leader": leader_file, "follower": {}})[0],
+                         "CANNOT TELL")
+        self.assertEqual(teleop.port_verdict({"leader": dump(leader_file)}, calibrations)[0],
+                         "CANNOT TELL")
+        one_off = {"leader": dump(leader_file), "follower": dump(follower_file)}
+        one_off["follower"]["elbow_flex"]["Homing_Offset"] = 7
+        verdict, detail = teleop.port_verdict(one_off, calibrations)
+        self.assertEqual(verdict, "CANNOT TELL")
+        self.assertIn("follower", detail)
+
+    def test_the_verdict_block_is_ruled_off_and_names_the_ports(self):
+        ports = {"leader": "/dev/ttyACM1", "follower": "/dev/ttyACM0"}
+        for verdict, detail, expected in (
+            ("READY", "everything matches", "command can use them"),
+            ("WRONG PORTS", "each arm matches the other", "--leader-port /dev/ttyACM0"),
+            ("CANNOT TELL", "no file", "Read the lines above"),
+        ):
+            printed = []
+            with patch.object(teleop, "say", printed.append):
+                teleop.say_result(verdict, detail, ports)
+            text = "\n".join(printed)
+            self.assertEqual(text.count(teleop.RESULT_RULE), 2, "the block must be ruled top and bottom")
+            self.assertIn(f"RESULT: {verdict}", text)
+            self.assertIn("/dev/ttyACM1", text)
+            self.assertIn(expected, text)
 
     def test_a_power_cycled_arm_is_reported_once_not_six_times(self):
         from unittest.mock import patch
