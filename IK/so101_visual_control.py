@@ -8,8 +8,11 @@ orange model along it; Execute follows it. Model mode (default) moves the model 
 only after the operator arms the arm by typing ENABLE, every command is a small joint
 step at a limited rate, the arm is watched for lag and load, and every stop, the
 emergency one included, holds position with torque on; only Release torque switches
-the motors off. There is no collision detection: the operator watches the
-arm and keeps the DC cutoff within reach. Keep so101_cartesian_demo.py in the same directory.
+the motors off. The command loop has the shape lerobot-teleoperate uses, down to the
+same max_relative_target cap, so that only the source of the action changes when the
+leader arm arrives: read the follower, compute one action, send it, wait out the
+period. There is no collision detection: the operator watches the arm and keeps the DC
+cutoff within reach. Keep so101_cartesian_demo.py in the same directory.
 """
 from __future__ import annotations
 
@@ -32,9 +35,21 @@ import so101_cartesian_demo as control
 
 VISER_VERSION = "1.1.0"
 LOOPBACK = "127.0.0.1"  # Hardware control must never bind a LAN/public interface.
-UPDATE_SECONDS = 0.05  # 20 Hz UI, readback and command loop; not a real-time guarantee.
-MOTION_RATE_DEG_S = 10.0  # Joint speed for hardware execution and the model-mode execute.
-GRIPPER_RATE_PCT_S = 20.0  # Gripper opening speed; its eased peak stays under LeRobot's 2 %-per-command clip.
+# Command loop rate, the same knob as lerobot-teleoperate --fps, which lesson 8 sets to 30. This
+# loop also drives the 3-D view on every tick, so it runs a little slower.
+CONTROL_FPS = 20
+UPDATE_SECONDS = 1 / CONTROL_FPS  # UI, readback and command period; not a real-time guarantee.
+# Joint speed for hardware execution and the model-mode execute. The eased peak is pi/2 times
+# this, and it has to stay under the speed max_relative_target still allows: the servo needs
+# about 0.13 s of lag per degree of error (fitted to the 2026-09-08 hardware log), so the cap
+# tops the arm out near 15 deg/s. At 8 the cap stays out of the way in normal motion, which is
+# what makes the clip figure in the execution log worth reading.
+MOTION_RATE_DEG_S = 8.0
+# Gripper opening speed, on its own 0-100 scale. Same rule as MOTION_RATE_DEG_S: the eased peak
+# (pi/2 times this) has to stay under what max_relative_target allows, and the cap applies its 2
+# units to the gripper as well. The gripper's own time constant has not been measured, so this uses
+# the arm's 0.13 s, which errs slow. Raise it once a hardware log shows the cap staying out of the way.
+GRIPPER_RATE_PCT_S = 10.0
 ANIMATION_MIN_SECONDS = 2.0  # Execution of even a tiny move takes at least this long.
 PREVIEW_RATE_DEG_S = 45.0  # The orange model only: fast enough to watch, nothing physical behind it.
 PREVIEW_MIN_SECONDS = 1.0
@@ -46,6 +61,7 @@ CONTACT_ERROR_DEG = 4.0
 CONTACT_LOAD_PCT = 60.0
 LOAD_READ_RETRIES = 2
 SETTLE_TOLERANCE_DEG = 0.8
+SETTLE_TOLERANCE_PCT = 1.0  # The gripper's counterpart, on its own 0-100 scale.
 SETTLE_TIMEOUT_SECONDS = 2.0
 REPLAN_TOLERANCE_DEG = 1.0  # The arm moved since planning: plan again. Holding sag stays well under this.
 READ_RETRIES = 3  # Bus reads retry before a failure counts; one bad packet must not drop the arm.
@@ -139,9 +155,15 @@ def blocked_joints(current, commanded, loads_pct, error_deg, load_pct):
             if abs(float(c) - float(g)) > error_deg and float(load) > load_pct]
 
 
-def settle_state(residual_deg, settle_ticks):
-    """After the last command: done when close enough, otherwise wait, then accept with a note."""
-    if residual_deg <= SETTLE_TOLERANCE_DEG:
+def settle_state(residual_deg, gripper_residual_pct, settle_ticks):
+    """After the last command: done when close enough, otherwise wait, then accept with a note.
+
+    Waiting means the loop keeps re-sending the final target, which is how the last of the motion
+    gets made when max_relative_target has been holding the goal back. The gripper is checked here
+    because that cap applies to it too: without it the loop can stop sending while the gripper is
+    still several percent short and report the goal as reached.
+    """
+    if residual_deg <= SETTLE_TOLERANCE_DEG and gripper_residual_pct <= SETTLE_TOLERANCE_PCT:
         return "done"
     return "timeout" if settle_ticks * UPDATE_SECONDS >= SETTLE_TIMEOUT_SECONDS else "wait"
 
@@ -265,7 +287,7 @@ def help_markdown(zh, args):
 
 #### 四种停
 - **停止并保持**：执行中随时可按，停在原地，电机继续出力。
-- **自动停止**：执行中某关节落后指令超过 {e}° 且负载超过 {l}%（判定为碰到东西）、落后超过 {TRACKING_ABORT_DEG:g}°、LeRobot 截短了目标、浏览器断开，程序都自动停止并保持，状态行写明原因。
+- **自动停止**：执行中某关节落后指令超过 {e}° 且负载超过 {l}%（判定为碰到东西）、落后超过 {TRACKING_ABORT_DEG:g}°、总线连续通信失败、浏览器断开，程序都自动停止并保持，状态行写明原因。
 - **紧急停止**：任何时候都能按，比如执行中看到手臂快撞到东西。立刻停在原地并保持力矩，绝不卸力；之后界面锁住，检查完点“解除紧急停止”继续，或托住手臂后断电。
 - **终端 Ctrl+C**：程序退出，退出前断电（释放力矩），手臂会掉。只作最后手段。
 
@@ -290,7 +312,7 @@ def help_markdown(zh, args):
 
 #### Four kinds of stop
 - **Stop and hold**: available at any moment during execution; the arm stops in place with the motors still driving.
-- **Automatic stop**: during execution a joint more than {e}° behind its command at over {l}% load (taken as contact), a lag over {TRACKING_ABORT_DEG:g}°, a target clipped by LeRobot, or a browser disconnect all stop and hold, and the status line states why.
+- **Automatic stop**: during execution a joint more than {e}° behind its command at over {l}% load (taken as contact), a lag over {TRACKING_ABORT_DEG:g}°, repeated bus communication failures, or a browser disconnect all stop and hold, and the status line states why.
 - **EMERGENCY STOP**: available at any moment, for example when you see the arm about to hit something during execution. It stops in place at once with torque kept on and never releases; the interface then locks until you press Clear emergency stop after checking, or power off with the arm supported.
 - **Ctrl+C in the terminal**: the program exits and powers off (releases torque) first, so the arm drops. Last resort only.
 
@@ -365,11 +387,11 @@ def run(args):
             pass  # Dropped input is safer than a replayed backlog.
 
     def read_pose():
-        # Same normalisation as get_observation, but retried: a single bad packet must not end the program.
-        positions = arm.bus.sync_read("Present_Position", num_retry=READ_RETRIES)
-        q = np.array([positions[name] for name in control.JOINTS], dtype=float)
+        # The call lerobot-teleoperate reads a follower with; num_read_retries covers a bad packet.
+        observation = arm.get_observation()
+        q = np.array([observation[f"{name}.pos"] for name in control.JOINTS], dtype=float)
         control.validate_joints(q, reading_limits)
-        opening = float(positions["gripper"])
+        opening = float(observation["gripper.pos"])
         if not math.isfinite(opening) or not 0 <= opening <= 100:
             raise ValueError("Gripper readback is outside its calibrated range")
         return q, opening
@@ -402,10 +424,16 @@ def run(args):
     try:
         if args.hardware:
             from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
+            # max_relative_target is the same 2 degrees lesson 8 passes to lerobot-teleoperate. It
+            # caps every goal against the *present* reading, so it limits speed, not travel: the loop
+            # keeps sending and the arm keeps closing the gap, the way the Follower chases the Leader.
+            # A clipped goal is therefore ordinary in a streamed trajectory and never a fault - a
+            # position servo in motion is always a few degrees behind its goal. What a real fault
+            # looks like is defined by TRACKING_ABORT_DEG and the contact thresholds instead.
             arm = SO101Follower(SO101FollowerConfig(
                 port=args.port, id=args.robot_id, calibration_dir=Path(args.calibration_dir),
                 use_degrees=True, max_relative_target=control.MAX_JOINT_STEP_DEG,
-                cameras={}, disable_torque_on_disconnect=False,
+                num_read_retries=READ_RETRIES, cameras={}, disable_torque_on_disconnect=False,
             ))
             # Do not use Robot.connect(): its generic configuration enables torque.
             arm.bus.connect()
@@ -879,6 +907,7 @@ def run(args):
                     action = {f"{name}.pos": float(v) for name, v in zip(control.JOINTS, waypoint)}
                     action["gripper.pos"] = float(plan.gripper_start + (plan.gripper_goal - plan.gripper_start) * fraction)
                     try:
+                        # As in lerobot-teleoperate, the reply is kept for the record, never as a fault.
                         sent = arm.send_action(action)
                         comm_failures = 0
                     except (ConnectionError, RuntimeError, OSError) as exc:
@@ -887,22 +916,25 @@ def run(args):
                         if comm_failures >= COMM_FAILURE_LIMIT:
                             abort_and_hold(copy("总线通信连续失败", "bus communication failed repeatedly"))
                         continue
-                    if any(abs(sent[key] - value) > control.SENT_TARGET_TOLERANCE_DEG for key, value in action.items()):
-                        abort_and_hold(copy("LeRobot 截短了关节目标", "LeRobot clipped the joint target"))
-                        continue
                     last_command = tuple(waypoint)
-                    LOG.debug("exec %d/%d f=%.3f cmd=%s cur=%s lag=%.2f loads=%s", step, steps, fraction, np.round(waypoint, 2).tolist(),
-                              np.round(current, 2).tolist(), lag(current, waypoint), [round(v) for v in loads])
+                    # Which motor the cap held back and by how much: the figure to read when checking
+                    # MOTION_RATE_DEG_S and GRIPPER_RATE_PCT_S against max_relative_target on real hardware.
+                    held, clipped = max(((key, abs(sent[key] - value)) for key, value in action.items()), key=lambda pair: pair[1])
+                    LOG.debug("exec %d/%d f=%.3f cmd=%s cur=%s lag=%.2f clip=%.2f@%s loads=%s", step, steps, fraction,
+                              np.round(waypoint, 2).tolist(), np.round(current, 2).tolist(), lag(current, waypoint),
+                              clipped, held.removesuffix(".pos"), [round(v) for v in loads])
                     if step >= steps:
                         residual = lag(current, plan.goal)
-                        state = settle_state(residual, settle_ticks)
+                        gripper_residual = abs(float(opening) - plan.gripper_goal)
+                        state = settle_state(residual, gripper_residual, settle_ticks)
                         settle_ticks += 1
                         if state != "wait":
                             phase, last_command, plan = "idle", None, None
                             clear_trail()
                             refresh_buttons()
                             say(copy("已到达目标并保持。", "Goal reached and holding.") if state == "done" else
-                                copy(f"已发出最终目标并保持，剩余误差 {residual:.1f}°。", f"Final target sent and holding; residual error {residual:.1f}°."))
+                                copy(f"已发出最终目标并保持，剩余误差 {residual:.1f}°、夹爪 {gripper_residual:.1f}%。",
+                                     f"Final target sent and holding; residual error {residual:.1f}° and {gripper_residual:.1f}% at the gripper."))
                 else:
                     current = np.array(waypoint)
                     if step >= steps:

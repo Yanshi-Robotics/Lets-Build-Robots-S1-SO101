@@ -202,9 +202,16 @@ def solve_position(kinematics, current, target_xyz, limits):
 
 
 def check_step(current, proposed, startup, xyz, startup_xyz, args):
-    """Pure checks used before every hardware action; no clamping of bad solutions."""
-    if max(abs(float(a) - float(b)) for a, b in zip(proposed, current)) > args.max_joint_step_deg:
-        raise ValueError("Joint step is too large; choose a smaller Cartesian step or another pose")
+    """Pure checks used before every hardware action; no clamping of bad solutions.
+
+    A step is measured from where the arm is now, but the loop accepts an arm that stopped
+    TRACKING_TOLERANCE_DEG short of the last target, and max_relative_target measures the next goal
+    against the real reading. Step plus that residual therefore has to stay inside the cap, or
+    LeRobot clips a target that passed every check here.
+    """
+    step_limit = args.max_joint_step_deg - TRACKING_TOLERANCE_DEG
+    if max(abs(float(a) - float(b)) for a, b in zip(proposed, current)) > step_limit:
+        raise ValueError(f"Joint step is too large (limit {step_limit:.2f} deg); choose a smaller Cartesian step or another pose")
     if max(abs(float(a) - float(b)) for a, b in zip(proposed, startup)) > args.session_joint_envelope_deg:
         raise ValueError("Joint session envelope reached; do not expand it to bypass a rejection")
     if max(abs(float(a) - float(b)) * 1000 for a, b in zip(xyz, startup_xyz)) > args.session_xyz_envelope_mm:
@@ -381,6 +388,8 @@ def main(argv=None):
         for key in ("step_mm", "max_joint_step_deg", "session_joint_envelope_deg", "session_xyz_envelope_mm"):
             if not math.isfinite(getattr(args, key)) or getattr(args, key) <= 0:
                 parser.error(f"{key} must be finite and positive")
+        if args.max_joint_step_deg <= TRACKING_TOLERANCE_DEG:
+            parser.error(f"max_joint_step_deg must exceed the {TRACKING_TOLERANCE_DEG:g} deg settling tolerance")
     try:
         if args.mode == "prepare":
             prepare_model(Path(args.model_dir))
