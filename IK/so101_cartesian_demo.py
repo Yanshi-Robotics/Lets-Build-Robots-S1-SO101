@@ -44,11 +44,15 @@ MAX_EE_STEP_M = 5 * EE_STEP_M
 # into +-100 before scaling. 0.01 gives one percent of opening per frame, 30 %/s at 30 fps.
 GRIPPER_SPEED_FACTOR = 0.01
 GRIPPER_MIN_PCT, GRIPPER_MAX_PCT = 0.0, 100.0
-# A teaching workspace, not a measured safety guarantee. Sampling the pinned model over its
-# URDF joint limits gives a reachable box of x [-0.34, 0.48], y [-0.44, 0.44], z [-0.22, 0.53]
-# metres; these bounds sit well inside it, in front of the base and above the mounting plane.
+# A teaching workspace, not a measured safety guarantee. Sampling the pinned model over its URDF
+# joint limits gives a reachable box of x [-0.34, 0.48], y [-0.44, 0.44], z [-0.22, 0.53] metres;
+# these bounds sit inside it and above the mounting plane.
+# ⚠️ The box must contain the pose the arm starts from. Rest folds the gripper back over the
+# base at about x=0.04, z=0.29 (2026-09-09, measured from the recorded Rest joint angles). An
+# earlier x minimum of 0.10 put Rest 58 mm outside, and EEBoundsAndSafety would then clip the
+# very first target to the edge and walk the arm there before anyone touched a key.
 # ⛔ Widening them does not make a rejected target safe. Override only with the arm watched.
-DEFAULT_BOUNDS_M = {"min": (0.10, -0.20, 0.02), "max": (0.35, 0.20, 0.35)}
+DEFAULT_BOUNDS_M = {"min": (0.00, -0.22, 0.02), "max": (0.38, 0.22, 0.42)}
 DOWNLOAD_TIMEOUT_SECONDS = 45
 DOWNLOAD_ATTEMPTS = 3
 
@@ -192,6 +196,32 @@ def build_robot_action_processor(kinematics, bounds, step_m=EE_STEP_M, max_step_
         to_transition=robot_action_observation_to_transition,
         to_output=transition_to_robot_action,
     )
+
+
+def check_start_pose(observation, kinematics, bounds):
+    """Where the gripper is now, refusing to start if the workspace does not contain it.
+
+    This runs once, before the loop, and reads nothing but the observation the caller already
+    has. It is not in the control chain. Without it an arm parked outside the box is not
+    rejected but *corrected*: EEBoundsAndSafety clips the first target to the nearest face and
+    the arm walks there on its own, which is the one motion nobody asked for.
+    """
+    import numpy as np
+    joints = np.array([float(observation[f"{name}.pos"]) for name in JOINTS])
+    here = kinematics.forward_kinematics(joints)[:3, 3]
+    low, high = np.asarray(bounds["min"], dtype=float), np.asarray(bounds["max"], dtype=float)
+    outside = [axis for index, axis in enumerate("xyz") if not low[index] <= here[index] <= high[index]]
+    if outside:
+        raise RuntimeError(
+            f"The gripper is at x={here[0]:.3f} y={here[1]:.3f} z={here[2]:.3f} m, outside the "
+            f"workspace on {', '.join(outside)}.\n"
+            f"    workspace  min {tuple(round(float(v), 3) for v in low)}  "
+            f"max {tuple(round(float(v), 3) for v in high)}\n"
+            "Move the arm into the workspace by hand with motor power off, or pass --bounds-min-m "
+            "and --bounds-max-m for a box that contains this pose. Starting here would have the "
+            "arm travel to the nearest edge before you touch anything."
+        )
+    return here
 
 
 def preview(args):

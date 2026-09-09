@@ -17,12 +17,44 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import so101_cartesian_demo as model  # noqa: E402  (same folder, as the lesson downloads it)
 
 DEFAULT_FPS = 30
+# How long to wait for the operator to prove the keyboard is being captured, before any motor
+# is powered. pynput needs an X11 session on Linux; on Wayland or over plain ssh it silently
+# captures nothing, and without this check that looks exactly like a dead program.
+KEY_CHECK_SECONDS = 30
+KEY_POLL_SECONDS = 0.05
+
+KEY_MAP = """  arrow keys           move the gripper in x and y
+  shift / right shift  move it down / up
+  left ctrl / right ctrl  close / open the gripper
+  Ctrl+C               stop (every motor releases, and an unfolded arm drops)"""
+
+
+def wait_for_a_key(teleop):
+    """Return once the keyboard is proven to reach this program. Raises if it never does.
+
+    Runs before the robot is connected, so nothing is powered while it waits.
+    """
+    print("Press any arrow key now, to prove the keyboard reaches this program.", flush=True)
+    deadline = time.monotonic() + KEY_CHECK_SECONDS
+    while time.monotonic() < deadline:
+        action = teleop.get_action()
+        if any(abs(float(action.get(f"delta_{axis}", 0.0))) > 0 for axis in "xyz"):
+            print("Keyboard confirmed.", flush=True)
+            return
+        time.sleep(KEY_POLL_SECONDS)
+    raise RuntimeError(
+        f"No key reached this program in {KEY_CHECK_SECONDS} s, so the arm was never powered.\n"
+        "    LeRobot captures keys through pynput, which on Linux only works on an X11 session:\n"
+        "    not on Wayland, and not over an ssh connection without a local display.\n"
+        "    Check `echo $XDG_SESSION_TYPE` prints x11, and run this from a terminal on that desktop."
+    )
 
 
 def run(args):
@@ -47,9 +79,23 @@ def run(args):
     ))
     teleop = KeyboardEndEffectorTeleop(KeyboardEndEffectorTeleopConfig(id=args.robot_id, use_gripper=True))
 
-    robot.connect()
+    # The input device first, and proven to work, before any motor is powered. Connecting the
+    # follower enables torque, so an arm that is live while the operator has no working control
+    # is the state to avoid.
     teleop.connect()
     try:
+        wait_for_a_key(teleop)
+        robot.connect()
+    except Exception:
+        teleop.disconnect()
+        raise
+
+    try:
+        here = model.check_start_pose(robot.get_observation(), kinematics, bounds)
+        print(f"\nFollower on {args.port} is live. Gripper at "
+              f"x={here[0]:.3f} y={here[1]:.3f} z={here[2]:.3f} m, inside the workspace.")
+        print(f"{KEY_MAP}\n\nA held key moves the gripper {args.step_mm:g} mm per frame, "
+              f"{args.step_mm * args.fps:g} mm/s at {args.fps} fps.\n", flush=True)
         teleop_loop(
             teleop=teleop,
             robot=robot,

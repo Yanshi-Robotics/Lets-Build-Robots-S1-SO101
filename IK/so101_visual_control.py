@@ -21,6 +21,7 @@ import math
 import socket
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from importlib.metadata import version
 from pathlib import Path
@@ -34,6 +35,10 @@ VISER_VERSION = "1.1.0"
 LOOPBACK = "127.0.0.1"  # Hardware control must never bind a LAN or public interface.
 DEFAULT_WEB_PORT = 4602
 DEFAULT_FPS = 30
+# How long to wait for someone to open the page before giving up, rather than powering an arm
+# nobody is watching.
+BROWSER_WAIT_SECONDS = 120
+BROWSER_POLL_SECONDS = 0.2
 # The handle is a rate control, not a position command: however far it is dragged, one frame
 # asks for at most one step. Releasing it puts it back on the gripper, so the two never diverge.
 MAX_UNITS_PER_FRAME = 1.0
@@ -165,8 +170,9 @@ class ViserEndEffectorTeleop:
                 for lo, hi in zip(self.config.bounds["min"], self.config.bounds["max"])
             ),
         )
-        self.handle.on_drag_start(self._drag_start)
-        self.handle.on_drag_end(self._drag_end)
+        # viser 1.1.0 folds the drag lifecycle into on_update; the separate start/end
+        # callbacks still work but warn.
+        self.handle.on_update(self._on_handle_event)
         with self.server.gui.add_folder("Gripper"):
             close_button = self.server.gui.add_button("Close")
             open_button = self.server.gui.add_button("Open")
@@ -185,6 +191,24 @@ class ViserEndEffectorTeleop:
         delta = drag_to_units(self.handle.position, gripper_xyz, self.step_m) if dragging else np.zeros(3)
         return {"delta_x": float(delta[0]), "delta_y": float(delta[1]), "delta_z": float(delta[2]),
                 "gripper": int(gripper)}
+
+    def wait_for_a_browser(self, seconds, poll_seconds) -> None:
+        """Return once someone has the page open. Raises if nobody does.
+
+        Runs before the robot is connected, so nothing is powered while it waits: an arm that
+        is live with no operator at the controls is the state to avoid.
+        """
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self.server.get_clients():
+                print("Browser connected.", flush=True)
+                return
+            time.sleep(poll_seconds)
+        raise RuntimeError(
+            f"No browser opened the page in {seconds:.0f} s, so the arm was never powered.\n"
+            f"    Open http://{LOOPBACK}:{self.config.web_port} on this machine and run it again.\n"
+            "    The page binds to the loopback interface only, so another machine cannot reach it."
+        )
 
     def disconnect(self) -> None:
         if self.server is not None:
@@ -210,13 +234,11 @@ class ViserEndEffectorTeleop:
             f" {'dragging' if dragging else 'handle parked on the arm'}"
         )
 
-    def _drag_start(self, _event) -> None:
-        with self._lock:
-            self._dragging = True
-
-    def _drag_end(self, _event) -> None:
-        with self._lock:
-            self._dragging = False
+    def _on_handle_event(self, event) -> None:
+        """"start" when the handle is grabbed, "end" at release; "update" is every pose change."""
+        if event.phase in ("start", "end"):
+            with self._lock:
+                self._dragging = event.phase == "start"
 
     def _set_gripper(self, command) -> None:
         with self._lock:
@@ -291,9 +313,21 @@ def run(args):
         bounds={"min": bounds["min"], "max": bounds["max"]},
     ), kinematics)
 
-    robot.connect()
+    # The input device first, and proven to have an operator, before any motor is powered.
     page.connect()
     try:
+        page.wait_for_a_browser(BROWSER_WAIT_SECONDS, BROWSER_POLL_SECONDS)
+        robot.connect()
+    except Exception:
+        page.disconnect()
+        raise
+
+    try:
+        here = model.check_start_pose(robot.get_observation(), kinematics, bounds)
+        print(f"\nFollower on {args.port} is live. Gripper at "
+              f"x={here[0]:.3f} y={here[1]:.3f} z={here[2]:.3f} m, inside the workspace.\n"
+              f"Drag the handle to move it, {args.step_mm:g} mm per frame while it is held away "
+              f"from the gripper. Ctrl+C stops; every motor then releases.\n", flush=True)
         teleop_loop(
             teleop=page,
             robot=robot,

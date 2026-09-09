@@ -36,6 +36,7 @@ demo = load("cartesian_demo", ROOT / "IK/so101_cartesian_demo.py")
 sys.modules["so101_cartesian_demo"] = demo
 visual = load("visual_control", ROOT / "IK/so101_visual_control.py")
 teleop = load("teleop_log", ROOT / "Teleop/so101_teleop_log.py")
+load("so101_ee_teleop", ROOT / "IK/so101_ee_teleop.py")
 
 
 class EndEffectorPipelineTests(unittest.TestCase):
@@ -195,10 +196,52 @@ class ViserPageTests(unittest.TestCase):
         self.assertTrue(all(module.startswith("lerobot.") for module in modules), modules)
         called = {node.func.id for node in ast.walk(run)
                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+        # The two names that are not LeRobot's both run before the loop and touch no action.
         self.assertEqual(called - {"SO101Follower", "SO101FollowerConfig", "teleop_loop", "Path",
                                    "KeyboardEndEffectorTeleop", "KeyboardEndEffectorTeleopConfig",
-                                   "make_default_processors"}, set())
+                                   "make_default_processors", "wait_for_a_key", "print"}, set())
         self.assertNotIn("class ", (ROOT / "IK/so101_ee_teleop.py").read_text(encoding="utf-8"))
+
+    def test_nothing_is_powered_until_the_operator_has_working_controls(self):
+        # 2026-09-09: the first version connected the follower -- which enables torque -- before
+        # the keyboard and before the browser. A silent input device then looked exactly like a
+        # dead program, with the arm live the whole time.
+        for name, device, gate in (("IK/so101_ee_teleop.py", "teleop.connect()", "wait_for_a_key"),
+                                   ("IK/so101_visual_control.py", "page.connect()", "wait_for_a_browser")):
+            source = (ROOT / name).read_text(encoding="utf-8")
+            self.assertLess(source.index(device), source.index("robot.connect()"), name)
+            self.assertLess(source.index(gate + "("), source.rindex("robot.connect()"), name)
+            self.assertLess(source.index("robot.connect()"), source.index("check_start_pose"), name)
+
+    def test_a_start_pose_outside_the_workspace_is_refused_not_corrected(self):
+        # 2026-09-09: Rest folds the gripper to about x=0.04, and the first workspace started at
+        # x=0.10. EEBoundsAndSafety does not reject an out-of-box pose, it clips the target to
+        # the nearest face -- so the arm would walk 58 mm to the edge before anyone touched a key.
+        kinematics, _limits = demo.load_kinematics(args.model_dir) if args.model_dir else (None, None)
+        if kinematics is None:
+            self.skipTest("needs the pinned model")
+        rest = (13.98, -103.69, 97.01, -102.29, 6.37)
+        observation = dict(zip((f"{name}.pos" for name in demo.MOTORS), (*rest, 50.0)))
+        inside = demo.check_start_pose(observation, kinematics,
+                                       demo.bounds_dict(demo.DEFAULT_BOUNDS_M["min"], demo.DEFAULT_BOUNDS_M["max"]))
+        self.assertEqual(len(inside), 3)
+        with self.assertRaises(RuntimeError) as refused:
+            demo.check_start_pose(observation, kinematics, demo.bounds_dict((0.10, -0.2, 0.02), (0.35, 0.2, 0.35)))
+        self.assertIn("outside the workspace on x", str(refused.exception))
+
+    def test_the_keyboard_gate_gives_up_instead_of_powering_the_arm(self):
+        import so101_ee_teleop as keyboard_program
+        silent = SimpleNamespace(get_action=lambda: {"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0})
+        original = keyboard_program.KEY_CHECK_SECONDS
+        keyboard_program.KEY_CHECK_SECONDS = 0.2
+        try:
+            with self.assertRaises(RuntimeError) as gave_up:
+                keyboard_program.wait_for_a_key(silent)
+        finally:
+            keyboard_program.KEY_CHECK_SECONDS = original
+        self.assertIn("the arm was never powered", str(gave_up.exception))
+        pressed = SimpleNamespace(get_action=lambda: {"delta_x": 0.0, "delta_y": -1.0, "delta_z": 0.0})
+        keyboard_program.wait_for_a_key(pressed)
 
 
 class BusReadTests(unittest.TestCase):
