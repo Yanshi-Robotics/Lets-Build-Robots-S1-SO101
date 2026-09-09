@@ -85,13 +85,18 @@ def run(args):
     teleop.connect()
     try:
         wait_for_a_key(teleop)
+        # Judged with nothing energised: connect() ends by enabling torque, which is exactly what
+        # a joint resting on its stop must not have (2026-09-08 logs).
+        observation, _already_powered = model.read_pose_before_power(robot)
+        here = model.check_start_pose(observation, kinematics, bounds, limits)
         robot.connect()
     except Exception:
+        # Nothing has been commanded yet, so the arm is still where the operator left it.
+        model.release_torque(robot, "startup stopped before any command was sent")
         teleop.disconnect()
         raise
 
     try:
-        here = model.check_start_pose(robot.get_observation(), kinematics, bounds, limits)
         print(f"\nFollower on {args.port} is live. Gripper at "
               f"x={here[0]:.3f} y={here[1]:.3f} z={here[2]:.3f} m, inside the workspace.")
         print(f"{KEY_MAP}\n\nA held key moves the gripper {args.step_mm:g} mm per frame, "

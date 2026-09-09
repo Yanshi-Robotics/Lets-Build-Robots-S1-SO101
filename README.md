@@ -22,7 +22,7 @@ Season 1 starts with printing and assembling two SO-101 arms and ends with a tra
 - **`Bringup/`**: `so101_bus_check.py` reads all six motors on one bus; `so101_calibrate.py` records each joint's mid position and range. Used in Lesson 6.
 - **`IK/`**: `so101_cartesian_demo.py` downloads the pinned model and solves one Cartesian step with LeRobot's own IK; `so101_visual_control.py` is a browser page with three ways to drive the arm (LeRobot's keyboard device, a leader arm, or a dragged target solved by IK); `so101_ee_teleop.py` is the same keyboard control with no page, as the smallest thing that runs. Used in Lesson 8. All three stay in the same folder: the two control programs import the model helpers from the first.
 - **`Teleop/`**: `so101_teleop_log.py` dumps both arms' protection and calibration registers, checks the two arms against each other, and grades a recording made by `lerobot-record`. Teleoperation itself stays with the official `lerobot-teleoperate`. Used in Lesson 7.
-- **`tests/`**: 60 tests that run the programs against fake hardware.
+- **`tests/`**: 64 tests that run the programs against fake hardware.
 - **`Teleop/logs/`** (git-ignored): one debug log per diagnostics run, the last 20 kept, plus anything `lerobot-record` writes there. Send the newest one when something goes wrong.
 - **`tools/`**: `build_control_poses.py` computes the poses drawn in the lesson illustrations.
 

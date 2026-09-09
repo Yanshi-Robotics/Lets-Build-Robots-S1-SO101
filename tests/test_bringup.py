@@ -249,7 +249,62 @@ class ProgramShapeTests(unittest.TestCase):
             source = (ROOT / name).read_text(encoding="utf-8")
             self.assertLess(source.index(device), source.index("robot.connect()"), name)
             self.assertLess(source.index(gate + "("), source.rindex("robot.connect()"), name)
-            self.assertLess(source.index("robot.connect()"), source.index("check_start_pose"), name)
+
+    def test_the_start_pose_is_judged_before_a_single_motor_is_powered(self):
+        # 2026-09-09 on hardware: the check ran on robot.get_observation(), which is after
+        # connect(), and connect() ends by enabling torque. The check exists to keep torque off a
+        # joint resting on its stop, so running it afterwards prevents nothing.
+        for name in ("IK/so101_ee_teleop.py", "IK/so101_visual_control.py"):
+            source = (ROOT / name).read_text(encoding="utf-8")
+            self.assertIn("read_pose_before_power", source, name)
+            self.assertLess(source.index("check_start_pose"), source.index("robot.connect()"), name)
+            self.assertNotIn("check_start_pose(robot.get_observation()", source, name)
+
+    def test_a_refused_startup_lets_go_of_the_arm(self):
+        # 2026-09-09 on hardware: the refusal message says to move the arm by hand, and the arm
+        # was still held, because the follower is configured not to release on disconnect.
+        for name in ("IK/so101_ee_teleop.py", "IK/so101_visual_control.py"):
+            source = (ROOT / name).read_text(encoding="utf-8")
+            self.assertIn("release_torque(robot", source, name)
+            self.assertLess(source.index("release_torque(robot"), source.index("teleop_loop("), name)
+
+    def test_the_pre_power_read_opens_and_hands_back_the_port_untouched(self):
+        # It must read over bus.connect(), which only opens the port, and never over
+        # Robot.connect(), which ends in configure() with torque on. It must also hand the port
+        # back closed, so the official connect() can open it straight afterwards.
+        events, reading = [], {name: 1.0 for name in demo.MOTORS}
+        torque = dict.fromkeys(demo.MOTORS, 0) | {"shoulder_pan": 1}
+
+        def sync_read(data_name, motors=None, *, normalize=True, num_retry=0):
+            events.append(f"read {data_name} normalize={normalize}")
+            return dict(reading) if data_name == "Present_Position" else dict(torque)
+
+        robot = SimpleNamespace(
+            config=SimpleNamespace(num_read_retries=3),
+            bus=SimpleNamespace(
+                connect=lambda: events.append("bus.connect"),
+                disconnect=lambda disable_torque=True: events.append(f"bus.disconnect({disable_torque})"),
+                sync_read=sync_read))
+        observation, powered = demo.read_pose_before_power(robot)
+        self.assertEqual(observation, {f"{name}.pos": 1.0 for name in demo.MOTORS})
+        self.assertEqual(powered, ["shoulder_pan"])
+        self.assertEqual(events[0], "bus.connect")
+        self.assertEqual(events[-1], "bus.disconnect(False)", "the port must be handed back closed")
+        self.assertIn("read Torque_Enable normalize=False", events)
+
+    def test_release_torque_is_quiet_when_there_is_nothing_to_release(self):
+        released = []
+        closed = SimpleNamespace(bus=SimpleNamespace(is_connected=False))
+        self.assertFalse(demo.release_torque(closed, "no bus"))
+        powered = SimpleNamespace(bus=SimpleNamespace(
+            is_connected=True, disable_torque=lambda: released.append("let go")))
+        self.assertTrue(demo.release_torque(powered, "startup refused"))
+        self.assertEqual(released, ["let go"])
+
+        def broken():
+            raise RuntimeError("bus gone")
+        self.assertFalse(demo.release_torque(
+            SimpleNamespace(bus=SimpleNamespace(is_connected=True, disable_torque=broken)), "x"))
 
     def test_a_start_pose_outside_the_workspace_is_refused_not_corrected(self):
         # 2026-09-09: Rest folds the gripper to about x=0.04, and the first workspace started at

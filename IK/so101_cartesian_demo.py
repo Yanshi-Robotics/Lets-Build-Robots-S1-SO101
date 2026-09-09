@@ -204,6 +204,45 @@ def build_robot_action_processor(kinematics, bounds, step_m=EE_STEP_M, max_step_
 STOP_MARGIN_DEG = 3.0
 
 
+def read_pose_before_power(robot):
+    """Where the arm is, read over its own bus without enabling a single motor.
+
+    `Robot.connect()` ends in `configure()`, which leaves torque ON -- so any check made after
+    connecting is made too late to prevent what it is checking for. `bus.connect()` only opens
+    the port and handshakes, so the arm can be read first and the port handed back untouched.
+    """
+    robot.bus.connect()
+    try:
+        reading = robot.bus.sync_read("Present_Position", num_retry=robot.config.num_read_retries)
+        powered = [name for name, value in
+                   robot.bus.sync_read("Torque_Enable", normalize=False).items() if value]
+        return {f"{motor}.pos": float(value) for motor, value in reading.items()}, powered
+    finally:
+        robot.bus.disconnect(disable_torque=False)
+
+
+def release_torque(robot, why):
+    """Let go of every motor, for a failure that happened before anything was commanded.
+
+    ⚠️ Only safe there: between connecting and the first command the arm has not been asked to
+    move, so it is still in the self-supporting pose the operator left it in. ⛔ Never call this
+    to recover from a fault mid-motion -- releasing a raised arm drops it.
+
+    2026-09-09: a startup refusal used to leave the arm held, because the follower is configured
+    not to release on disconnect. The message told the operator to move the arm by hand, and the
+    arm would not move.
+    """
+    if not robot.bus.is_connected:
+        return False
+    print(f"Releasing every motor: {why}", file=sys.stderr, flush=True)
+    try:
+        robot.bus.disable_torque()
+        return True
+    except Exception as exc:  # a bus that has already gone cannot be asked to let go
+        print(f"    could not release over the bus ({exc}). Cut DC power.", file=sys.stderr)
+        return False
+
+
 def check_start_pose(observation, kinematics, bounds, limits=None, margin=STOP_MARGIN_DEG):
     """Where the gripper is now, refusing to start from a pose the arm cannot leave.
 

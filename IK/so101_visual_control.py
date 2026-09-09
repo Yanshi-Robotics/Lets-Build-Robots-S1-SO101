@@ -503,18 +503,28 @@ def run(args):
     page.connect()
     try:
         page.wait_for_a_browser(BROWSER_WAIT_SECONDS, BROWSER_POLL_SECONDS)
+        # Read the arm and judge the pose over its own bus, with nothing energised. Doing this
+        # after connect() would be too late: connect() ends by enabling torque, which is the very
+        # thing a joint resting on its stop must not have (2026-09-08 logs).
+        observation, already_powered = model.read_pose_before_power(robot)
+        here = model.check_start_pose(observation, kinematics, bounds, limits)
+        if already_powered:
+            print(f"Note: torque was already enabled on {', '.join(already_powered)} before this "
+                  "run started.", file=sys.stderr)
         if leader is not None:
             leader.connect()
         robot.connect()
     except Exception:
+        # Nothing has been commanded yet, so the arm is still in the self-supporting pose the
+        # operator left it in: letting go is safe, and without it a refusal would hold the arm
+        # while telling the operator to move it by hand.
+        model.release_torque(robot, "startup stopped before any command was sent")
         if keyboard is not None:
             keyboard.disconnect()
         page.disconnect()
         raise
 
     try:
-        observation = robot.get_observation()
-        here = model.check_start_pose(observation, kinematics, bounds, limits)
         page.seed(observation)
         print(f"\nFollower on {args.port} is live. Gripper at "
               f"x={here[0]:.3f} y={here[1]:.3f} z={here[2]:.3f} m, inside the workspace.\n"
