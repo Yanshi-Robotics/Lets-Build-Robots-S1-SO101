@@ -260,15 +260,105 @@ class ProgramShapeTests(unittest.TestCase):
         self.assertLess(source.index("teleop.connect()"), source.index("robot.connect()"))
         self.assertLess(source.index("wait_for_a_key("), source.rindex("robot.connect()"))
 
-    def test_the_start_pose_is_judged_before_a_single_motor_is_powered(self):
-        # 2026-09-09 on hardware: the check ran on robot.get_observation(), which is after
-        # connect(), and connect() ends by enabling torque. The check exists to keep torque off a
-        # joint resting on its stop, so running it afterwards prevents nothing.
+    def test_the_goal_is_parked_before_a_single_motor_is_powered(self):
+        # 2026-09-09, third attempt on hardware. An unpowered SO-101 falls onto its shoulder stop
+        # and stays there, so refusing to start from a stop refused the only pose the arm has.
+        # The hazard was never the stop: it is torque arriving while Goal_Position is somewhere
+        # else. connect() never writes a goal, and a DC power cycle leaves every motor holding 0.
         for name in ("IK/so101_ee_teleop.py", "IK/so101_visual_control.py"):
             source = (ROOT / name).read_text(encoding="utf-8")
             self.assertIn("read_pose_before_power", source, name)
-            self.assertLess(source.index("check_start_pose"), source.index("robot.connect()"), name)
-            self.assertNotIn("check_start_pose(robot.get_observation()", source, name)
+            self.assertLess(source.index("park_the_goal"), source.index("robot.connect()"), name)
+            self.assertLess(source.index("robot.connect()"), source.index("goal_diverged"), name)
+        # placo does not clamp an out-of-limit joint, so a pose past the model needs no refusal.
+        self.assertNotIn("joints_outside_the_model",
+                         (ROOT / "IK/so101_cartesian_demo.py").read_text(encoding="utf-8"))
+
+    def test_the_encoder_resolution_is_lerobots_not_ours(self):
+        # Every stop distance depends on this. A copy of the number here is a second source of
+        # truth that can stop matching the library without anyone noticing.
+        from lerobot.motors.feetech.tables import MODEL_RESOLUTION
+        self.assertAlmostEqual(demo.degrees_per_step(),
+                               360 / (MODEL_RESOLUTION[demo.MOTOR_MODEL] - 1))
+        source = (ROOT / "IK/so101_cartesian_demo.py").read_text(encoding="utf-8")
+        for literal in ("4095", "4096"):
+            self.assertNotIn(literal, source, "the encoder resolution must not be written down")
+
+    def test_parking_the_goal_asks_every_motor_to_hold_where_it_is(self):
+        written = {}
+        robot = SimpleNamespace(bus=SimpleNamespace(
+            sync_write=lambda name, values, **kw: written.update({name: dict(values)}),
+            sync_read=lambda name, motors=None, **kw: (
+                dict(written.get("Goal_Position", {})) if name == "Goal_Position"
+                else {n: 1.0 for n in demo.MOTORS})))
+        observation = {f"{name}.pos": 1.0 for name in demo.MOTORS}
+        self.assertEqual(demo.park_the_goal(robot, observation), {name: 1.0 for name in demo.MOTORS})
+        self.assertEqual(set(written), {"Goal_Position"}, "nothing else is written before torque")
+        self.assertEqual(demo.goal_diverged(robot), [], "a parked goal is not a divergence")
+        # A DC power cycle leaves every goal at 0, which is one end of the travel: that is the
+        # shape this has to catch, not a degree of sag.
+        written["Goal_Position"]["shoulder_lift"] = 1.0 - demo.GOAL_MARGIN_DEG - 1.0
+        diverged = demo.goal_diverged(robot)
+        self.assertEqual(len(diverged), 1, diverged)
+        self.assertIn("shoulder_lift", diverged[0])
+        written["Goal_Position"]["shoulder_lift"] = 1.0 - demo.GOAL_MARGIN_DEG + 0.5
+        self.assertEqual(demo.goal_diverged(robot), [], "sag inside the margin is not a fault")
+
+    def test_a_stop_is_reported_but_never_refused(self):
+        source = (ROOT / "IK/so101_visual_control.py").read_text(encoding="utf-8")
+        body = source[source.index("def self_check("):source.index("def read_only_display(")]
+        after_stop = body[body.index("joints_on_a_stop"):]
+        self.assertNotIn("raise CheckFailed", after_stop[:after_stop.index('report("joint travel"')])
+
+    def test_the_stop_note_measures_this_arm_not_the_model(self):
+        # 2026-09-09 on hardware: the refusal quoted the URDF's -100..+100 while this arm's
+        # recorded travel is +-104.48, so "1.2 deg short of the stop" was printed as "3.3 deg over
+        # a limit", and it never said how far to move.
+        # ⛔ Not read from calibration/: that directory is git-ignored and belongs to one arm, so
+        # a test reading it cannot run anywhere else. These are the raw ranges recorded on the
+        # course follower on 2026-09-09, with the expectation derived from them rather than typed.
+        recorded = {"shoulder_lift": (929, 3306), "elbow_flex": (926, 3163),
+                    "shoulder_pan": (635, 3375), "wrist_flex": (835, 3218),
+                    "wrist_roll": (0, 4095), "gripper": (2000, 3539)}
+        calibration = {name: {"homing_offset": 0, "range_min": low, "range_max": high}
+                       for name, (low, high) in recorded.items()}
+        travel = demo.travel_degrees(calibration)
+        per_step = demo.degrees_per_step()
+        for name, (low, high) in recorded.items():
+            self.assertAlmostEqual(travel[name], (high - low) / 2 * per_step)
+        self.assertAlmostEqual(travel["shoulder_lift"], 104.48, places=1)
+        self.assertAlmostEqual(travel["elbow_flex"], 98.33, places=1)
+        folded = dict(zip((f"{name}.pos" for name in demo.MOTORS),
+                          (-30.95, -103.6, 97.0, 85.93, 6.20, 33.0)))
+        notes = demo.joints_on_a_stop(folded, calibration)
+        self.assertEqual(len(notes), 2, notes)
+        self.assertIn("shoulder_lift is 0.9 deg from the end of its travel", notes[0])
+        self.assertIn("Move it at least", notes[0], "it must say how far, not just that it is close")
+        clear = dict(zip((f"{name}.pos" for name in demo.MOTORS),
+                         (*demo.PREVIEW_JOINTS_DEG, 33.0)))
+        self.assertEqual(demo.joints_on_a_stop(clear, calibration), [])
+        if not args.model_dir:
+            return
+        # ⭐ Reaching past the model is safe to compute with: placo does not clamp, so forward
+        # kinematics for an out-of-limit joint is the pose the arm is really in.
+        kinematics, limits = demo.load_kinematics(args.model_dir)
+        for name, (low, high) in limits.items():
+            self.assertGreater(travel[name], high, f"{name}: this arm reaches past the model")
+            self.assertLess(-travel[name], low, name)
+        kinematics.forward_kinematics(__import__("numpy").array([0.0, -103.6, 97.0, 0.0, 0.0]))
+        self.assertAlmostEqual(math.degrees(kinematics.robot.get_joint("shoulder_lift")), -103.6,
+                               places=3, msg="placo silently clamping would falsify every pose")
+
+    def test_the_workspace_opens_far_enough_to_contain_the_parked_pose(self):
+        # An arm rests where gravity leaves it, which on this follower is 20 mm below the base
+        # plane. EEBoundsAndSafety clips rather than refuses, so a box that excluded the parked
+        # pose would walk the arm to its edge on the first frame.
+        asked = demo.bounds_dict((0.0, -0.22, 0.0), (0.38, 0.22, 0.42))
+        widened = demo.bounds_including(asked, (0.099, 0.035, -0.020))
+        self.assertAlmostEqual(float(widened["min"][2]), -0.020 - demo.WORKSPACE_MARGIN_M)
+        self.assertEqual(demo.outside_the_workspace((0.099, 0.035, -0.020), widened), [])
+        unchanged = demo.bounds_including(asked, (0.2, 0.0, 0.2))
+        self.assertEqual(list(unchanged["min"]), list(asked["min"]), "a contained pose widens nothing")
 
     def test_the_self_check_runs_before_any_server_or_any_motor(self):
         # Jeff, 2026-09-09: a page that opens looking healthy while none of its modes can work is

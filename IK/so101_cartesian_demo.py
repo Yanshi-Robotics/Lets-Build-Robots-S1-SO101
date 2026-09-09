@@ -43,6 +43,8 @@ MAX_EE_STEP_M = 5 * EE_STEP_M
 # The gripper command is discrete (close / hold / open), which GripperVelocityToJoint turns
 # into +-100 before scaling. 0.01 gives one percent of opening per frame, 30 %/s at 30 fps.
 GRIPPER_SPEED_FACTOR = 0.01
+# The gripper's scale is not a choice of ours: SOFollower gives that motor MotorNormMode
+# RANGE_0_100, so 0 and 100 are the two ends of whatever range Lesson 6 recorded.
 GRIPPER_MIN_PCT, GRIPPER_MAX_PCT = 0.0, 100.0
 # A teaching workspace, not a measured safety guarantee. Sampling the pinned model over its URDF
 # joint limits gives a reachable box of x [-0.34, 0.48], y [-0.44, 0.44], z [-0.22, 0.53] metres;
@@ -205,8 +207,15 @@ STOP_MARGIN_DEG = 3.0
 # How much further than the margin the operator is asked to move, so the arm does not come back
 # resting exactly on the boundary.
 STOP_CLEARANCE_DEG = 3.0
-# One turn minus one, matching LeRobot's model_resolution_table for the STS3215.
-ENCODER_STEPS = 4095
+# A goal further than this from where the motor actually is, once torque is on, is a fault: the
+# servo is being asked to travel rather than to hold. Well clear of the few degrees a
+# gravity-loaded joint sags on a proportional servo.
+GOAL_MARGIN_DEG = 5.0
+# How far outside the parked pose the workspace box is opened when it has to be widened.
+WORKSPACE_MARGIN_M = 0.02
+# The servo this course uses. LeRobot names it in SOFollower's own motor table; the encoder
+# resolution that goes with it is looked up rather than written down (see degrees_per_step).
+MOTOR_MODEL = "sts3215"
 
 
 def read_pose_before_power(robot):
@@ -241,7 +250,19 @@ def recorded_range(entry):
     return float(entry["range_min"]), float(entry["range_max"])
 
 
-def travel_degrees(calibration):
+def degrees_per_step(model_name=MOTOR_MODEL):
+    """How many degrees one encoder step is, taken from LeRobot rather than written down here.
+
+    `MotorsBus._normalize` converts a DEGREES joint with `(raw - mid) * 360 / (resolution - 1)`,
+    and the resolution comes from the model table. ⛔ Copying the figure into this file would
+    make a second source of truth that can stop matching the library without anyone noticing --
+    and every stop distance measured below depends on it.
+    """
+    from lerobot.motors.feetech.tables import MODEL_RESOLUTION
+    return 360 / (MODEL_RESOLUTION[model_name] - 1)
+
+
+def travel_degrees(calibration, per_step=None):
     """Half of each joint's own recorded travel, in degrees: the distance from zero to a stop.
 
     LeRobot reports a reading in degrees around the midpoint of the range recorded in Lesson 6,
@@ -252,10 +273,11 @@ def travel_degrees(calibration):
     ±104.75 against the model's ±95). The stop is a physical fact about this arm; the model
     limit is what the solver can represent. Both are checked, separately.
     """
+    per_step = degrees_per_step() if per_step is None else per_step
     travel = {}
     for name, entry in calibration.items():
         low, high = recorded_range(entry)
-        travel[name] = (high - low) / 2 * 360 / ENCODER_STEPS
+        travel[name] = (high - low) / 2 * per_step
     return travel
 
 
@@ -303,27 +325,6 @@ def joints_on_a_stop(observation, calibration, margin=STOP_MARGIN_DEG):
     return complaints
 
 
-def joints_outside_the_model(observation, limits):
-    """Joints the pinned URDF cannot represent, which is the space the solver works in.
-
-    Separate from a stop: the hardware reaches further than the model on every joint of this arm,
-    so a pose can be perfectly safe and still be one the IK has no way to express.
-    """
-    complaints = []
-    for name in JOINTS:
-        if name not in limits or f"{name}.pos" not in observation:
-            continue
-        value = float(observation[f"{name}.pos"])
-        low, high = limits[name]
-        if not low <= value <= high:
-            towards = high if value > high else low
-            complaints.append(
-                f"{name} at {value:+.1f} deg is outside the model's {low:+.1f}..{high:+.1f} range.\n"
-                f"        The solver cannot represent this pose; move it back inside "
-                f"{towards:+.1f} deg, with motor power off.")
-    return complaints
-
-
 def gripper_position(observation, kinematics):
     """Where the gripper is now, from the joints in the observation."""
     import numpy as np
@@ -349,21 +350,51 @@ def outside_the_workspace(here, bounds):
             "power off, or pass --bounds-min-m and --bounds-max-m for a box that contains it."]
 
 
-def check_start_pose(observation, kinematics, bounds, limits=None, calibration=None):
-    """Every reason this pose cannot be driven from, raised together. Returns the gripper position.
+def park_the_goal(robot, observation):
+    """Write where each motor is as where it is told to go, before torque is enabled.
 
-    Reads nothing but the observation the caller already has, and is not in the control chain.
+    This is the whole of the power-on protection. A servo drives towards Goal_Position the
+    instant torque comes on, and LeRobot's connect() never writes one: after a DC power cycle
+    every motor reads a goal of 0, which is one end of the travel. Measured 2026-09-08: torque
+    enabled with a stale goal drove two joints at 100 % load 2.5 deg into their stops, and the
+    servos' overload protection cut them to 20 % two seconds later.
+
+    ⚠️ The arm being folded onto a stop is not itself the hazard, and cannot be avoided: an
+    unpowered SO-101 falls onto its shoulder stop and stays there. Parked at its own position it
+    simply holds, wherever that is.
+
+    ⛔ Torque must still be off, and the bus open, when this is called.
     """
-    here = gripper_position(observation, kinematics)
-    complaints = []
-    if calibration:
-        complaints += joints_on_a_stop(observation, calibration)
-    if limits:
-        complaints += joints_outside_the_model(observation, limits)
-    complaints += outside_the_workspace(here, bounds)
-    if complaints:
-        raise RuntimeError("This pose cannot be driven from:\n    " + "\n    ".join(complaints))
-    return here
+    goal = {name: float(observation[f"{name}.pos"]) for name in MOTORS
+            if f"{name}.pos" in observation}
+    robot.bus.sync_write("Goal_Position", goal)
+    return goal
+
+
+def goal_diverged(robot, margin=GOAL_MARGIN_DEG):
+    """Motors whose goal is not where they are, read back once torque is on.
+
+    The 2026-09-08 incident happened with the goal believed equal to the present position, so
+    this reads the servos' own registers rather than trusting the write.
+    """
+    goal = robot.bus.sync_read("Goal_Position")
+    present = robot.bus.sync_read("Present_Position")
+    return [f"{name}: goal {float(goal[name]):+.1f} against present {float(present[name]):+.1f}"
+            for name in goal if abs(float(goal[name]) - float(present[name])) > margin]
+
+
+def bounds_including(bounds, point, margin=WORKSPACE_MARGIN_M):
+    """The workspace box, widened if it does not already contain the pose the arm starts in.
+
+    EEBoundsAndSafety does not reject a target outside its box, it clips it to the nearest face:
+    an arm parked outside would be walked to the edge before anyone touched a control. The arm
+    rests wherever gravity leaves it, so the box accommodates that rather than the other way
+    round. The box actually in use is printed, so a widened one is never a silent one.
+    """
+    import numpy as np
+    low = np.minimum(np.asarray(bounds["min"], dtype=float), np.asarray(point, dtype=float) - margin)
+    high = np.maximum(np.asarray(bounds["max"], dtype=float), np.asarray(point, dtype=float) + margin)
+    return {"min": low, "max": high}
 
 
 def preview(args):

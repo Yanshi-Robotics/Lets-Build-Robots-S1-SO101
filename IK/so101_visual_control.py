@@ -50,15 +50,17 @@ DEFAULT_FPS = 30
 
 KEYBOARD, LEADER, IK = "keyboard", "leader", "ik"
 MODE_LABELS = {KEYBOARD: "1 - Keyboard", LEADER: "2 - Leader arm", IK: "3 - Inverse kinematics"}
-# Whether starting this mode has to hold the arm. All three drive the follower, so all three do;
-# a mode that only watched would set this False and the rest of the flow would be unchanged.
-MODE_HOLDS_THE_ARM = {KEYBOARD: True, LEADER: True, IK: True}
+# ⭐ Every mode here drives the follower, so enabling any of them holds the arm. ⛔ There is no
+# per-mode switch for that: a branch nothing takes is a branch nothing tests. A watch-only mode
+# would earn one when it exists.
 
 # The handle and the planned target are rate controls, not position commands: however far away
 # they are, one frame asks for at most one step.
 MAX_UNITS_PER_FRAME = 1.0
-# Below this a request counts as noise, matching MapDeltaActionToRobotActionStep's own 1e-3
-# threshold on the same units.
+# Below this the page asks for nothing at all. ⚠️ Ours, not LeRobot's: MapDeltaActionToRobotAction
+# applies its own threshold downstream on the same units, so this only keeps a resting handle from
+# producing a stream of zero-sized requests. ⛔ Do not describe it as matching theirs -- two
+# numbers that are equal today and owned by different files do not stay equal.
 NOISE_UNITS = 1e-3
 # Execution stops when the gripper is this close to the planned target.
 ARRIVED_MM = 1.0
@@ -564,7 +566,8 @@ def self_check(args, robot, leader, kinematics, bounds, keyboard_available):
     ⛔ Nothing here energises anything and nothing here opens the page: a page that comes up
     looking healthy while none of its modes can work is worse than no page at all.
 
-    Returns the follower reading, so the page can be painted with the real pose from the start.
+    Returns the follower reading and the workspace box actually in use, so the page can be
+    painted with the real pose from the start.
     """
     print("Self-check:", flush=True)
     if version("lerobot") != model.LEROBOT_VERSION or version("viser") != VISER_VERSION:
@@ -602,24 +605,20 @@ def self_check(args, robot, leader, kinematics, bounds, keyboard_available):
             f"{', '.join(disagreeing)}.\n        " + LESSON_7_CHECK)
     report("follower calibration", "every motor matches its file")
 
+    # ⚠️ Not a failure. An unpowered SO-101 falls onto its shoulder stop and stays there, so
+    # requiring an arm off its stops would be requiring the impossible. Parking the goal at the
+    # present position before torque is what makes starting there safe; this is only a note.
     on_a_stop = model.joints_on_a_stop(observation, robot.calibration)
-    if on_a_stop:
-        raise CheckFailed("Joints are resting against the end of their travel:\n    "
-                          + "\n    ".join(on_a_stop))
-    report("joint travel", "no joint is against a stop")
+    report("joint travel", "no joint is against a stop" if not on_a_stop
+           else f"{len(on_a_stop)} joint(s) resting on a stop; they will be held where they are")
 
-    _kinematics, limits = kinematics
-    outside = model.joints_outside_the_model(observation, limits)
-    if outside:
-        raise CheckFailed("The pose is outside the model the solver works in:\n    "
-                          + "\n    ".join(outside))
-    report("model range", "every joint is inside the pinned model")
-
+    _kinematics, _limits = kinematics
     here = model.gripper_position(observation, _kinematics)
-    off_the_box = model.outside_the_workspace(here, bounds)
-    if off_the_box:
-        raise CheckFailed("\n    ".join(off_the_box))
-    report("workspace", f"gripper at x={here[0]:.3f} y={here[1]:.3f} z={here[2]:.3f} m")
+    widened = model.bounds_including(bounds, here)
+    changed = not (np.allclose(widened["min"], bounds["min"]) and np.allclose(widened["max"], bounds["max"]))
+    report("workspace", f"gripper at x={here[0]:.3f} y={here[1]:.3f} z={here[2]:.3f} m"
+           + (f"; box widened to {tuple(round(float(v), 3) for v in widened['min'])}.."
+              f"{tuple(round(float(v), 3) for v in widened['max'])} to contain it" if changed else ""))
 
     if leader is None:
         report("leader arm", "not requested; that mode is left out")
@@ -646,7 +645,7 @@ def self_check(args, robot, leader, kinematics, bounds, keyboard_available):
     report("keyboard capture", "pynput can read keys in this session")
 
     print("Self-check passed.\n", flush=True)
-    return observation
+    return observation, widened
 
 
 def read_only_display(page, robot, fps):
@@ -714,8 +713,7 @@ def run(args):
     from lerobot.utils.keyboard_input import pynput_can_capture
 
     kinematics, limits = model.load_kinematics(args.model_dir)
-    bounds = model.bounds_dict(args.bounds_min_m, args.bounds_max_m)
-    pipeline = model.build_robot_action_processor(kinematics, bounds, step_m=args.step_mm / 1000)
+    asked_for = model.bounds_dict(args.bounds_min_m, args.bounds_max_m)
     robot = make_follower(args)
     leader = None
     if args.leader_port:
@@ -725,7 +723,9 @@ def run(args):
 
     # ⛔ Before any server and before any motor: a page that opens looking healthy while none of
     # its modes can work is worse than no page.
-    observation = self_check(args, robot, leader, (kinematics, limits), bounds, pynput_can_capture())
+    observation, bounds = self_check(args, robot, leader, (kinematics, limits), asked_for,
+                                     pynput_can_capture())
+    pipeline = model.build_robot_action_processor(kinematics, bounds, step_m=args.step_mm / 1000)
 
     keyboard = KeyboardEndEffectorTeleop(
         KeyboardEndEffectorTeleopConfig(id=args.robot_id, use_gripper=True))
@@ -749,14 +749,16 @@ def run(args):
     try:
         while True:
             mode, observation = read_only_display(page, robot, args.fps)
-            try:
-                model.check_start_pose(observation, kinematics, bounds, limits, robot.calibration)
-            except RuntimeError as exc:
-                page.disarmed(f"**Cannot enable {MODE_LABELS[mode]}**\n\n```\n{exc}\n```")
-                continue
+            # ⛔ Before torque, not after: a servo drives at its Goal_Position the instant torque
+            # comes on, and connect() never writes one.
+            model.park_the_goal(robot, observation)
             robot.bus.disconnect(disable_torque=False)
             robot.connect()  # the one place torque comes on
             holding = True
+            drifted = model.goal_diverged(robot)
+            if drifted:
+                raise RuntimeError("Torque came on with motors being told to travel, not to hold:"
+                                   "\n    " + "\n    ".join(drifted))
             page.armed(mode)
             print(f"{MODE_LABELS[mode]} is live. Press End on the page to stop and release.",
                   flush=True)

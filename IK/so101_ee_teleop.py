@@ -65,9 +65,6 @@ def run(args):
 
     kinematics, limits = model.load_kinematics(args.model_dir)
     bounds = model.bounds_dict(args.bounds_min_m, args.bounds_max_m)
-    robot_action_processor = model.build_robot_action_processor(
-        kinematics, bounds, step_m=args.step_mm / 1000
-    )
     teleop_action_processor, _identity, robot_observation_processor = make_default_processors()
 
     # The official follower configuration, with nothing added. In particular no
@@ -88,8 +85,20 @@ def run(args):
         # Judged with nothing energised: connect() ends by enabling torque, which is exactly what
         # a joint resting on its stop must not have (2026-09-08 logs).
         observation, _powered, _stored = model.read_pose_before_power(robot)
-        here = model.check_start_pose(observation, kinematics, bounds, limits, robot.calibration)
+        here = model.gripper_position(observation, kinematics)
+        bounds = model.bounds_including(bounds, here)
+        # ⛔ Park the goal before torque: a servo drives at its Goal_Position the instant torque
+        # comes on, and connect() never writes one (2026-09-08 logs).
+        robot.bus.connect()
+        try:
+            model.park_the_goal(robot, observation)
+        finally:
+            robot.bus.disconnect(disable_torque=False)
         robot.connect()
+        drifted = model.goal_diverged(robot)
+        if drifted:
+            raise RuntimeError("Torque came on with motors being told to travel, not to hold:\n    "
+                               + "\n    ".join(drifted))
     except Exception:
         teleop.disconnect()
         raise
@@ -97,6 +106,8 @@ def run(args):
     try:
         print(f"\nFollower on {args.port} is live. Gripper at "
               f"x={here[0]:.3f} y={here[1]:.3f} z={here[2]:.3f} m, inside the workspace.")
+        robot_action_processor = model.build_robot_action_processor(
+            kinematics, bounds, step_m=args.step_mm / 1000)
         print(f"{KEY_MAP}\n\nA held key moves the gripper {args.step_mm:g} mm per frame, "
               f"{args.step_mm * args.fps:g} mm/s at {args.fps} fps.\n", flush=True)
         teleop_loop(
