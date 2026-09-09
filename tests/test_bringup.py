@@ -729,6 +729,49 @@ class TeleopLogTests(unittest.TestCase):
         self.assertIn("goal of 0", problems[0])
         self.assertIn("toward step 0", problems[0])
 
+    def test_the_stop_reference_finds_the_moment_both_arms_were_against_one_end(self):
+        # A joint's zero is the midpoint of its recorded travel, so the two arms are only comparable
+        # when both sit against the same physical end. Finding that moment by eye while both hands
+        # are on the arms does not work, so it is found in the recording instead.
+        ranges = {"leader": (800, 3200), "follower": (900, 3300)}
+        far = [{"leader": 2000.0, "follower": 2000.0, "difference": 0.0, "leader_raw": 2000, "follower_raw": 2000}]
+        samples = [
+            {"leader": 810, "follower": 1500, "difference": 40.0},   # only the leader is at its end
+            {"leader": 815, "follower": 915, "difference": 0.4},     # both against the low end
+            {"leader": 805, "follower": 905, "difference": 0.2},     # both closer still: this one wins
+            {"leader": 3195, "follower": 910, "difference": 90.0},   # opposite ends: not comparable
+        ]
+        best = teleop.stop_reference(samples, ranges)
+        self.assertIsNotNone(best)
+        self.assertEqual(best[1], "low")
+        self.assertAlmostEqual(best[2], 0.2)
+        # Nothing qualifies when neither arm ever reached an end.
+        self.assertIsNone(teleop.stop_reference([{"leader": 2000, "follower": 2000, "difference": 0.0}], ranges))
+        self.assertIsNone(teleop.stop_reference([], ranges))
+        self.assertIsNone(teleop.stop_reference(far, ranges))
+
+    def test_compare_summary_names_a_reversed_joint_and_an_untested_one(self):
+        from unittest.mock import patch
+        ranges = {name: {"leader": (800, 3200), "follower": (800, 3200)} for name in teleop.JOINT_NAMES}
+        history = {}
+        for name in teleop.JOINT_NAMES:
+            if name == "elbow_flex":  # turned the same way by hand, read the opposite way
+                history[name] = [{"leader": float(i), "follower": float(-i), "difference": float(2 * i)}
+                                 for i in range(30)]
+            elif name == "wrist_flex":  # never touched
+                history[name] = [{"leader": 5.0, "follower": 5.0, "difference": 0.0} for _ in range(30)]
+            else:
+                history[name] = [{"leader": float(i), "follower": float(i) - 1, "difference": 1.0}
+                                 for i in range(30)]
+        printed = []
+        with patch.object(teleop, "say", printed.append):
+            teleop.summarise_compare(history, ranges)
+        text = "\n".join(printed)
+        self.assertIn("elbow_flex", text)
+        self.assertIn("assembled backwards", text)
+        self.assertIn("Not moved during this run", text)
+        self.assertIn("wrist_flex", text)
+
     def write_recording(self, directory, leader, follower, fps=30):
         """A dataset shaped the way lerobot-record writes one."""
         import pandas as pd

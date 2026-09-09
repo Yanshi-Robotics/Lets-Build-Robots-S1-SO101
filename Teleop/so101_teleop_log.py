@@ -51,6 +51,8 @@ STATUS_BITS = ((0, "voltage"), (1, "sensor"), (2, "temperature"), (3, "current")
 CALIBRATED_REGISTERS = {"Homing_Offset": "homing_offset", "Min_Position_Limit": "range_min", "Max_Position_Limit": "range_max"}
 
 COMPARE_HZ = 5.0
+COMPARE_PRINT_SECONDS = 1.0  # Sample fast, print slowly: both hands are on the arms.
+STOP_MARGIN_STEPS = 40  # About 3.5 deg. Closer than this to a recorded end counts as against the stop.
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_KEEP = 20
 LOG = logging.getLogger("so101_teleop_log")
@@ -292,8 +294,76 @@ def compare_line(index, name, leader_degrees, leader_raw, follower_degrees, foll
             f"   F {follower_degrees:8.2f}{unit} ({follower_raw:4d})   diff {difference:+8.2f}{flag}")
 
 
+def stop_reference(samples, ranges):
+    """The sample where both arms sat closest to the same mechanical end, and the difference there.
+
+    A joint's zero is the midpoint of its recorded travel, so two arms only become comparable when
+    both are against the same physical end. Finding that moment by eye while both hands are on the
+    arms does not work; this finds it in the recording instead. wrist_roll has no ends: LeRobot
+    records its range as a full turn, so it is excluded and has to be aligned by sight.
+    """
+    best = None
+    for sample in samples:
+        distances, ends = {}, {}
+        for role in ("leader", "follower"):
+            low, high = ranges[role]
+            raw = sample[role]
+            distances[role] = min(raw - low, high - raw)
+            ends[role] = "low" if raw - low < high - raw else "high"
+        if ends["leader"] != ends["follower"]:
+            continue
+        worst = max(distances.values())
+        if worst > STOP_MARGIN_STEPS:
+            continue
+        if best is None or worst < best[0]:
+            best = (worst, ends["leader"], sample["difference"])
+    return best
+
+
+def summarise_compare(history, ranges):
+    """One line per joint: what the two arms did, and whether they did it together."""
+    say("")
+    say("=== summary ===")
+    say(f"  {'joint':<15}{'diff seen':>18}{'direction':>11}   reference")
+    verdicts = []
+    for name in JOINT_NAMES:
+        samples = history[name]
+        differences = [sample["difference"] for sample in samples]
+        score = agreement([sample["leader"] for sample in samples], [sample["follower"] for sample in samples])
+        best = None if name == "wrist_roll" else stop_reference(samples, ranges[name])
+        if name == "wrist_roll":
+            reference = "no stop: align both wrists by sight, then read the difference"
+        elif best is None:
+            reference = "never both against the same stop; push both there and run again"
+        else:
+            reference = f"both on the {best[1]} stop: difference {best[2]:+.2f}"
+            if abs(best[2]) > 3:
+                verdicts.append(f"{name}: {best[2]:+.1f} apart with both arms on the {best[1]} stop; that is a"
+                                " calibration difference, not a pose difference")
+        say(f"  {name:<15}{min(differences):+8.2f} .. {max(differences):+6.2f}"
+            + (f"{score:>11.2f}" if score is not None else f"{'-':>11}")
+            + f"   {reference}")
+        if score is not None and score < 0.5:
+            verdicts.append(f"{name}: the Follower read the opposite way from the Leader (agreement {score:.2f});"
+                            " this one is assembled backwards, not mis-calibrated")
+        elif score is not None and score < 0.9:
+            verdicts.append(f"{name}: only {score:.0%} of movements agreed; move it further and more slowly to be sure")
+    unmoved = [name for name in JOINT_NAMES
+               if agreement([sample["leader"] for sample in history[name]],
+                            [sample["follower"] for sample in history[name]]) is None]
+    if unmoved:
+        say("")
+        say(f"  Not moved during this run, so nothing was tested: {', '.join(unmoved)}")
+    say("")
+    for verdict in verdicts:
+        say(f"  {verdict}")
+    if not verdicts and not unmoved:
+        say("  Every joint moved the same way on both arms, and the stop references agree within 3 degrees.")
+
+
 def run_compare(args):
-    arms, buses = {}, {}
+    # Defined before connecting: Ctrl+C during the handshake must not fall over the summary.
+    arms, buses, history, ranges = {}, {}, {}, {}
     try:
         for role, port, arm_id, calibration_dir in (
             ("leader", args.leader_port, args.leader_id, args.leader_calibration_dir),
@@ -308,20 +378,36 @@ def run_compare(args):
                 raise RuntimeError(f"{role}: no calibration loaded from {calibration_dir}; run Lesson 6 first")
             if not arm.bus.is_calibrated:
                 raise RuntimeError(f"{role}: the calibration file does not match what the motors hold; recalibrate")
-        say("Both arms are released. Move them by hand; every joint should read the same on both sides.")
-        say("Direction test: turn one joint of each arm the same way and watch the two columns move together.")
-        say("Stop with Ctrl+C.")
+        say("Both arms are released. Use both hands, watch the arms rather than the screen, and do this:")
+        say("  1. push the same joint of both arms against the same end of its travel, one joint at a time;")
+        say("  2. then turn each joint of both arms the same way, slowly, through a wide angle;")
+        say("  3. turn both wrist rolls to the same orientation by sight.")
+        say("Press Ctrl+C when you are done. Everything is judged from the recording, not from the screen.")
+        ranges.update({name: {role: (arms[role].calibration[name].range_min, arms[role].calibration[name].range_max)
+                              for role in arms} for name in JOINT_NAMES})
+        history.update({name: [] for name in JOINT_NAMES})
+        last_print = 0.0
         while True:
             tick = time.monotonic()
             readings = {role: (arms[role].bus.sync_read("Present_Position"),
                                arms[role].bus.sync_read("Present_Position", normalize=False)) for role in arms}
-            say("")
-            for index, name in enumerate(JOINT_NAMES, 1):
-                say(compare_line(index, name,
-                                 readings["leader"][0][name], readings["leader"][1][name],
-                                 readings["follower"][0][name], readings["follower"][1][name]))
+            for name in JOINT_NAMES:
+                history[name].append({
+                    "leader": readings["leader"][0][name], "follower": readings["follower"][0][name],
+                    "difference": joint_difference(name, readings["leader"][0][name], readings["follower"][0][name]),
+                })
+            if tick - last_print >= COMPARE_PRINT_SECONDS:
+                last_print = tick
+                say("")
+                for index, name in enumerate(JOINT_NAMES, 1):
+                    say(compare_line(index, name,
+                                     readings["leader"][0][name], readings["leader"][1][name],
+                                     readings["follower"][0][name], readings["follower"][1][name]))
             time.sleep(max(0.0, 1.0 / COMPARE_HZ - (time.monotonic() - tick)))
     except KeyboardInterrupt:
+        if history:
+            summarise_compare(history, ranges)
+        say("")
         say("Stopped. No motor was written; the arms were never powered by this program.")
         return 0
     finally:
