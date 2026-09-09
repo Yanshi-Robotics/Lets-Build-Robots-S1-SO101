@@ -7,8 +7,10 @@
 import argparse
 import ast
 import importlib.util
+import json
 import math
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -33,6 +35,7 @@ calibrate = load("calibrate_entry", ROOT / "Bringup/so101_calibrate.py")
 demo = load("cartesian_demo", ROOT / "IK/so101_cartesian_demo.py")
 sys.modules["so101_cartesian_demo"] = demo
 visual = load("visual_control", ROOT / "IK/so101_visual_control.py")
+teleop = load("teleop_log", ROOT / "Teleop/so101_teleop_log.py")
 
 
 class VisualControlTests(unittest.TestCase):
@@ -605,6 +608,151 @@ class SoftStartTests(unittest.TestCase):
             self.run_hold(arm)
         self.assertIn("bus fault", str(raised.exception))
         self.assertTrue(all(regs[n]["Torque_Enable"] == 0 for n in self.NAMES))
+
+
+class TeleopLogTests(unittest.TestCase):
+    """The teleoperation diagnostics: three read-only checks beside the official tools."""
+
+    def test_only_wrist_roll_folds_across_the_seam(self):
+        # Both arms record wrist_roll as a full turn, so its zero sits opposite a seam and two arms
+        # 2 deg apart across it would otherwise read 358 deg apart.
+        self.assertAlmostEqual(teleop.wrapped_difference(358), -2)
+        self.assertAlmostEqual(teleop.wrapped_difference(-358), 2)
+        self.assertAlmostEqual(teleop.wrapped_difference(180), -180)  # half a turn: the sign is arbitrary
+        self.assertAlmostEqual(teleop.joint_difference("wrist_roll", 179, -179), -2)
+        # Every other joint travels well under a turn; folding one would hide a real disagreement.
+        self.assertAlmostEqual(teleop.joint_difference("shoulder_pan", 179, -179), 358)
+        with self.assertRaises(ValueError):
+            teleop.wrapped_difference(math.nan)
+
+    def test_status_bits_name_the_latched_errors(self):
+        self.assertEqual(teleop.decode_status(0), [])
+        self.assertEqual(teleop.decode_status(1 << 5), ["overload"])
+        self.assertEqual(teleop.decode_status((1 << 0) | (1 << 5)), ["voltage", "overload"])
+
+    def test_agreement_separates_following_reversal_and_stalling(self):
+        rising = [float(i) for i in range(20)]
+        self.assertEqual(teleop.agreement(rising, rising), 1.0)
+        self.assertEqual(teleop.agreement(rising, [-v for v in rising]), 0.0)
+        self.assertEqual(teleop.agreement(rising, [3.0] * 20), 0.0)  # stalled: never moves with it
+        self.assertIsNone(teleop.agreement([1.0] * 20, rising))  # the leader never moved: nothing to judge
+        self.assertEqual(teleop.longest_still_run([3.0] * 7 + [4.0, 5.0]), 7)
+
+    def test_diagnostics_never_write_a_motor_register(self):
+        # The whole point of registers/compare is that they cannot move an arm. Teleoperation and
+        # recording stay with the official tools, so no action is ever sent either.
+        tree = ast.parse(Path(teleop.__file__).read_text())
+        called = {node.func.attr for node in ast.walk(tree)
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+        self.assertFalse(called & {"write", "sync_write", "enable_torque", "disable_torque", "configure",
+                                   "configure_motors", "write_calibration", "send_action", "calibrate"})
+        self.assertIn("sync_read", called)
+        disconnects = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                       and isinstance(node.func, ast.Attribute) and node.func.attr == "disconnect"]
+        self.assertTrue(disconnects)
+        for node in disconnects:  # the default disconnect writes Torque_Enable
+            self.assertTrue(any(keyword.arg == "disable_torque" and keyword.value.value is False
+                                for keyword in node.keywords))
+
+    def fake_bus(self, powered=False):
+        from types import SimpleNamespace
+        events = []
+        registers = {name: dict.fromkeys(teleop.REGISTERS, 0) for name in teleop.JOINT_NAMES}
+        for name, values in registers.items():
+            values.update(Torque_Enable=1 if powered else 0, Torque_Limit=1000, Max_Torque_Limit=1000,
+                          Present_Voltage=50, Goal_Position=2048, Present_Position=2048,
+                          Homing_Offset=-1380, Min_Position_Limit=635, Max_Position_Limit=3375)
+        def read(register, name, normalize=True, num_retry=0):
+            events.append(("read", register, name))
+            return registers[name][register]
+        return SimpleNamespace(is_connected=True, connect=lambda: events.append(("connect",)),
+                               disconnect=lambda disable_torque=True: events.append(("disconnect", disable_torque)),
+                               read=read), registers, events
+
+    def test_registers_refuses_a_powered_arm_before_reading_anything_else(self):
+        bus, _, _ = self.fake_bus(powered=True)
+        with self.assertRaises(RuntimeError) as raised:
+            teleop.refuse_if_powered(bus, "follower")
+        self.assertIn("torque is enabled", str(raised.exception))
+        released, _, _ = self.fake_bus(powered=False)
+        teleop.refuse_if_powered(released, "follower")  # does not raise
+
+    def test_register_dump_reads_every_motor_and_flags_a_mismatched_file(self):
+        from unittest.mock import patch
+        bus, registers, events = self.fake_bus()
+        registers["elbow_flex"]["Homing_Offset"] = 999  # file and motor disagree
+        registers["shoulder_lift"]["Status"] = 1 << 5  # latched overload
+        registers["wrist_flex"]["Torque_Limit"] = 300  # left low by an interrupted soft start
+        calibration = {name: {"homing_offset": -1380, "range_min": 635, "range_max": 3375} for name in teleop.JOINT_NAMES}
+        printed = []
+        with patch.object(teleop, "say", printed.append):
+            rows = teleop.dump_registers(bus, "follower", calibration)
+            problems = teleop.summarise_registers(rows, "follower")
+        self.assertEqual(set(rows), set(teleop.JOINT_NAMES))
+        self.assertFalse([event for event in events if event[0] != "read"])  # reads only
+        self.assertTrue(any("MISMATCH" in line for line in printed))
+        self.assertTrue(any("overload" in problem for problem in problems))
+        self.assertTrue(any("torque limit 300" in problem for problem in problems))
+
+    def write_recording(self, directory, leader, follower, fps=30):
+        """A dataset shaped the way lerobot-record writes one."""
+        import pandas as pd
+        names = [f"{name}.pos" for name in teleop.JOINT_NAMES]
+        root = Path(directory)
+        (root / "meta").mkdir(parents=True)
+        (root / "data" / "chunk-000").mkdir(parents=True)
+        (root / "meta" / "info.json").write_text(json.dumps({
+            "fps": fps,
+            "features": {"action": {"names": names}, "observation.state": {"names": names}},
+        }), encoding="utf-8")
+        pd.DataFrame({
+            "action": [list(row) for row in leader],
+            "observation.state": [list(row) for row in follower],
+        }).to_parquet(root / "data" / "chunk-000" / "file-000.parquet")
+        return root
+
+    def report_lines(self, leader, follower):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.write_recording(directory, leader, follower)
+            printed = []
+            with patch.object(teleop, "say", printed.append):
+                teleop.run_report(SimpleNamespace(dataset=str(root)))
+            return printed
+
+    def test_report_grades_a_following_arm_as_healthy(self):
+        leader = [[i * 0.5] * 6 for i in range(60)]
+        follower = [[i * 0.5 - 1.0] * 6 for i in range(60)]  # one degree behind, same direction
+        lines = self.report_lines(leader, follower)
+        self.assertTrue(any("followed the Leader in the same direction" in line for line in lines))
+
+    def test_report_names_a_reversed_joint(self):
+        leader = [[i * 0.5] * 6 for i in range(60)]
+        follower = [[-i * 0.5 if index == 2 else i * 0.5 - 1.0 for index in range(6)] for i in range(60)]
+        lines = self.report_lines(leader, follower)
+        self.assertTrue(any("elbow_flex" in line and "opposite" in line for line in lines))
+
+    def test_report_names_a_joint_that_never_moved(self):
+        leader = [[i * 0.5] * 6 for i in range(90)]
+        follower = [[7.0 if index == 1 else i * 0.5 - 1.0 for index in range(6)] for i in range(90)]
+        lines = self.report_lines(leader, follower)
+        self.assertTrue(any("shoulder_lift" in line and "did not move at all" in line for line in lines))
+
+    def test_a_log_is_written_per_run_and_old_ones_are_pruned(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            with patch.object(teleop, "LOG_DIR", folder), patch.object(teleop, "LOG_KEEP", 3):
+                for _ in range(5):
+                    teleop.start_log("compare", SimpleNamespace(mode="compare"))
+                    time.sleep(0.01)
+            for handler in list(teleop.LOG.handlers):
+                teleop.LOG.removeHandler(handler)
+                handler.close()
+            self.assertLessEqual(len(sorted(folder.glob("so101_teleop_log_*.log"))), 3)
+
 
 
 parser = argparse.ArgumentParser()

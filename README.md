@@ -21,8 +21,9 @@ Season 1 starts with printing and assembling two SO-101 arms and ends with a tra
 
 - **`Bringup/`**: `so101_bus_check.py` reads all six motors on one bus; `so101_calibrate.py` records each joint's mid position and range. Used in Lesson 6.
 - **`IK/`**: `so101_cartesian_demo.py` solves inverse kinematics for a gripper target; `so101_visual_control.py` shows the arm in a browser, plans a path to a dragged target, and in hardware mode reads the arm and executes the path after you arm it with ENABLE. Used in Lesson 7. The two files import each other and stay in the same folder.
-- **`tests/`**: 51 tests that run the programs against fake hardware.
-- **`IK/logs/`** (git-ignored): one debug log per run of the 3D control program, the last 20 kept. Send the newest one when something goes wrong.
+- **`Teleop/`**: `so101_teleop_log.py` checks the two arms against each other and grades a recording made by `lerobot-record`. Teleoperation itself stays with the official `lerobot-teleoperate`. Used in Lesson 8.
+- **`tests/`**: 65 tests that run the programs against fake hardware.
+- **`IK/logs/`** and `Teleop/logs/` (git-ignored): one debug log per run, the last 20 kept, plus anything `lerobot-record` writes there. Send the newest one when something goes wrong.
 - **`tools/`**: `build_control_poses.py` computes the poses drawn in the lesson illustrations.
 
 The lessons print these paths, so files here are not moved or renamed. Later tasks get their own folders, such as `ACT-1-Pick`.
@@ -65,7 +66,7 @@ source .venv/bin/activate
 python IK/so101_cartesian_demo.py preview --model-dir models/so101 --delta-mm 0 0 2
 ```
 
-This computes the joint angles that move the gripper 2 mm up and prints them as JSON; `position_error_mm` should be below 0.1. It touches no hardware. The programs in `Bringup/`, and the `jog` and `--readback` modes in `IK/`, do open a serial port; Lessons 6 and 7 cover the power and safety steps for those, and this file does not repeat them.
+This computes the joint angles that move the gripper 2 mm up and prints them as JSON; `position_error_mm` should be below 0.1. It touches no hardware. The programs in `Bringup/`, and the `jog` and `--hardware` modes in `IK/`, do open a serial port; Lessons 6 and 7 cover the power and safety steps for those, and this file does not repeat them.
 
 Before committing a change to a program, run the tests:
 
