@@ -81,24 +81,28 @@ def decode_status(value):
     return [name for bit, name in STATUS_BITS if int(value) >> bit & 1]
 
 
-def agreement(leader_series, follower_series):
-    """How often the two arms moved the same way, over the ticks where the Leader actually moved.
+MOVED_DEGREES = 0.2  # A couple of encoder steps: enough to have a direction rather than noise.
+PAIRED_TICKS_NEEDED = 5  # Fewer than this and the two arms were not moved together enough to judge.
 
-    1.0 means every Leader movement produced a Follower movement in the same direction, 0.0 means
-    every one produced the opposite, and a value near 0.5 means the Follower was not following.
-    Returns None when the Leader never moved enough to judge.
+
+def agreement(leader_series, follower_series):
+    """How often the two arms moved the same way, over the ticks where BOTH of them moved.
+
+    1.0 is same direction every time, 0.0 is opposite every time. Returns None when the two were
+    not moved together often enough to say anything, which is the common case when a person moves
+    them by hand one at a time: an arm that simply stayed still must not be read as a reversed one.
     """
     if len(leader_series) != len(follower_series):
         raise ValueError("Series must be the same length")
-    same = total = 0
+    same = paired = 0
     for index in range(1, len(leader_series)):
         leader_step = leader_series[index] - leader_series[index - 1]
-        if abs(leader_step) < 0.05:  # below the encoder step: no direction to agree with
-            continue
-        total += 1
         follower_step = follower_series[index] - follower_series[index - 1]
-        same += (leader_step > 0) == (follower_step > 0) and abs(follower_step) >= 0.05
-    return same / total if total else None
+        if abs(leader_step) < MOVED_DEGREES or abs(follower_step) < MOVED_DEGREES:
+            continue
+        paired += 1
+        same += (leader_step > 0) == (follower_step > 0)
+    return same / paired if paired >= PAIRED_TICKS_NEEDED else None
 
 
 def longest_still_run(series, tolerance=0.05):
@@ -297,17 +301,21 @@ def compare_line(index, name, leader_degrees, leader_raw, follower_degrees, foll
 def stop_reference(samples, ranges):
     """The sample where both arms sat closest to the same mechanical end, and the difference there.
 
-    A joint's zero is the midpoint of its recorded travel, so two arms only become comparable when
-    both are against the same physical end. Finding that moment by eye while both hands are on the
-    arms does not work; this finds it in the recording instead. wrist_roll has no ends: LeRobot
-    records its range as a full turn, so it is excluded and has to be aligned by sight.
+    A joint's zero is the midpoint of its recorded travel, so the two arms only become comparable
+    when both are against the same physical end. Finding that instant by eye while both hands are on
+    the arms does not work; this finds it in the recording instead.
+
+    What it checks is that the recorded travel still matches the real stops: an arm reads minus half
+    its own recorded range at its own low stop, so a difference here means the two recordings differ,
+    not that a joint is reversed. Direction cannot be judged this way at all, and is judged during
+    teleoperation instead. wrist_roll has no ends to find, LeRobot recording its range as a full turn.
     """
     best = None
     for sample in samples:
         distances, ends = {}, {}
         for role in ("leader", "follower"):
             low, high = ranges[role]
-            raw = sample[role]
+            raw = sample[f"{role}_raw"]
             distances[role] = min(raw - low, high - raw)
             ends[role] = "low" if raw - low < high - raw else "high"
         if ends["leader"] != ends["follower"]:
@@ -344,16 +352,19 @@ def summarise_compare(history, ranges):
             + (f"{score:>11.2f}" if score is not None else f"{'-':>11}")
             + f"   {reference}")
         if score is not None and score < 0.5:
-            verdicts.append(f"{name}: the Follower read the opposite way from the Leader (agreement {score:.2f});"
-                            " this one is assembled backwards, not mis-calibrated")
+            verdicts.append(f"{name}: the two arms read opposite ways while both were moving (agreement"
+                            f" {score:.2f}). Move this one joint on both arms together and run again to confirm")
         elif score is not None and score < 0.9:
-            verdicts.append(f"{name}: only {score:.0%} of movements agreed; move it further and more slowly to be sure")
+            verdicts.append(f"{name}: only {score:.0%} of the paired movements agreed; move it further and more"
+                            " slowly to be sure")
     unmoved = [name for name in JOINT_NAMES
                if agreement([sample["leader"] for sample in history[name]],
                             [sample["follower"] for sample in history[name]]) is None]
     if unmoved:
         say("")
-        say(f"  Not moved during this run, so nothing was tested: {', '.join(unmoved)}")
+        say("  Direction not tested on these: the two arms were never moved together enough.")
+        say(f"  {', '.join(unmoved)}")
+        say("  Moving one arm at a time cannot show direction; that is judged during teleoperation.")
     say("")
     for verdict in verdicts:
         say(f"  {verdict}")
@@ -394,6 +405,8 @@ def run_compare(args):
             for name in JOINT_NAMES:
                 history[name].append({
                     "leader": readings["leader"][0][name], "follower": readings["follower"][0][name],
+                    # Raw steps as well: the recorded travel is in steps, so the stop test needs them.
+                    "leader_raw": readings["leader"][1][name], "follower_raw": readings["follower"][1][name],
                     "difference": joint_difference(name, readings["leader"][0][name], readings["follower"][0][name]),
                 })
             if tick - last_print >= COMPARE_PRINT_SECONDS:

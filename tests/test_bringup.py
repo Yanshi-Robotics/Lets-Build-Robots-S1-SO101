@@ -630,12 +630,17 @@ class TeleopLogTests(unittest.TestCase):
         self.assertEqual(teleop.decode_status(1 << 5), ["overload"])
         self.assertEqual(teleop.decode_status((1 << 0) | (1 << 5)), ["voltage", "overload"])
 
-    def test_agreement_separates_following_reversal_and_stalling(self):
+    def test_agreement_judges_only_ticks_where_both_arms_moved(self):
         rising = [float(i) for i in range(20)]
         self.assertEqual(teleop.agreement(rising, rising), 1.0)
         self.assertEqual(teleop.agreement(rising, [-v for v in rising]), 0.0)
-        self.assertEqual(teleop.agreement(rising, [3.0] * 20), 0.0)  # stalled: never moves with it
-        self.assertIsNone(teleop.agreement([1.0] * 20, rising))  # the leader never moved: nothing to judge
+        # 2026-09-09: a joint the operator never touched scored 0.00 and was reported as assembled
+        # backwards. An arm that stood still has no direction, so there is nothing to disagree with.
+        self.assertIsNone(teleop.agreement(rising, [3.0] * 20))
+        self.assertIsNone(teleop.agreement([1.0] * 20, rising))
+        # Moving them one at a time leaves too few ticks with both in motion to judge.
+        alternating = [0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0]
+        self.assertIsNone(teleop.agreement(alternating, [0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0]))
         self.assertEqual(teleop.longest_still_run([3.0] * 7 + [4.0, 5.0]), 7)
 
     def test_diagnostics_never_write_a_motor_register(self):
@@ -734,19 +739,21 @@ class TeleopLogTests(unittest.TestCase):
         # when both sit against the same physical end. Finding that moment by eye while both hands
         # are on the arms does not work, so it is found in the recording instead.
         ranges = {"leader": (800, 3200), "follower": (900, 3300)}
-        far = [{"leader": 2000.0, "follower": 2000.0, "difference": 0.0, "leader_raw": 2000, "follower_raw": 2000}]
+        # 2026-09-09: this compared degrees against a travel recorded in encoder steps, so every
+        # sample looked like it was against the low stop. The reading and the range must share units.
+        far = [{"leader_raw": 2000, "follower_raw": 2000, "difference": 0.0}]
         samples = [
-            {"leader": 810, "follower": 1500, "difference": 40.0},   # only the leader is at its end
-            {"leader": 815, "follower": 915, "difference": 0.4},     # both against the low end
-            {"leader": 805, "follower": 905, "difference": 0.2},     # both closer still: this one wins
-            {"leader": 3195, "follower": 910, "difference": 90.0},   # opposite ends: not comparable
+            {"leader_raw": 810, "follower_raw": 1500, "difference": 40.0},  # only the leader is at its end
+            {"leader_raw": 815, "follower_raw": 915, "difference": 0.4},    # both against the low end
+            {"leader_raw": 805, "follower_raw": 905, "difference": 0.2},    # both closer still: this one wins
+            {"leader_raw": 3195, "follower_raw": 910, "difference": 90.0},  # opposite ends: not comparable
         ]
         best = teleop.stop_reference(samples, ranges)
         self.assertIsNotNone(best)
         self.assertEqual(best[1], "low")
         self.assertAlmostEqual(best[2], 0.2)
         # Nothing qualifies when neither arm ever reached an end.
-        self.assertIsNone(teleop.stop_reference([{"leader": 2000, "follower": 2000, "difference": 0.0}], ranges))
+        self.assertIsNone(teleop.stop_reference([{"leader_raw": 2000, "follower_raw": 2000, "difference": 0.0}], ranges))
         self.assertIsNone(teleop.stop_reference([], ranges))
         self.assertIsNone(teleop.stop_reference(far, ranges))
 
@@ -755,22 +762,25 @@ class TeleopLogTests(unittest.TestCase):
         ranges = {name: {"leader": (800, 3200), "follower": (800, 3200)} for name in teleop.JOINT_NAMES}
         history = {}
         for name in teleop.JOINT_NAMES:
-            if name == "elbow_flex":  # turned the same way by hand, read the opposite way
-                history[name] = [{"leader": float(i), "follower": float(-i), "difference": float(2 * i)}
-                                 for i in range(30)]
-            elif name == "wrist_flex":  # never touched
-                history[name] = [{"leader": 5.0, "follower": 5.0, "difference": 0.0} for _ in range(30)]
+            if name == "elbow_flex":  # both moving, reading opposite ways
+                history[name] = [{"leader": float(i), "follower": float(-i), "difference": float(2 * i),
+                                  "leader_raw": 2000 + i, "follower_raw": 2000 - i} for i in range(30)]
+            elif name == "wrist_flex":  # only the leader was touched
+                history[name] = [{"leader": float(i), "follower": 5.0, "difference": float(i) - 5,
+                                  "leader_raw": 2000 + i, "follower_raw": 2000} for i in range(30)]
             else:
-                history[name] = [{"leader": float(i), "follower": float(i) - 1, "difference": 1.0}
-                                 for i in range(30)]
+                history[name] = [{"leader": float(i), "follower": float(i) - 1, "difference": 1.0,
+                                  "leader_raw": 2000 + i, "follower_raw": 2000 + i} for i in range(30)]
         printed = []
         with patch.object(teleop, "say", printed.append):
             teleop.summarise_compare(history, ranges)
         text = "\n".join(printed)
         self.assertIn("elbow_flex", text)
-        self.assertIn("assembled backwards", text)
-        self.assertIn("Not moved during this run", text)
+        self.assertIn("read opposite ways", text)
+        self.assertIn("Direction not tested", text)
         self.assertIn("wrist_flex", text)
+        # An arm that was never moved must not be called reversed.
+        self.assertNotIn("wrist_flex: the two arms read opposite ways", text)
 
     def write_recording(self, directory, leader, follower, fps=30):
         """A dataset shaped the way lerobot-record writes one."""
