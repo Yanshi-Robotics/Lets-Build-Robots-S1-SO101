@@ -193,7 +193,11 @@ class VisualControlTests(unittest.TestCase):
         self.assertLess(visual.preview_duration(start, goal), visual.motion_duration(start, goal, 0, visual.ANIMATION_MIN_SECONDS))
         self.assertAlmostEqual(visual.preview_duration(start, goal), 60 / visual.PREVIEW_RATE_DEG_S)
         self.assertEqual(visual.preview_duration(start, [1, 0, 0, 0, 0]), visual.PREVIEW_MIN_SECONDS)
-        self.assertEqual(visual.MOTION_RATE_DEG_S, 10.0)  # Hardware speed is untouched by the preview speed.
+        # Hardware speed is set by the servo, not by the preview: the eased peak (pi/2 times the rate)
+        # has to stay under the speed max_relative_target still lets the servo reach, or the arm runs
+        # against its own cap on every move. Lag fitted to the 2026-09-08 log: 2.04 deg behind at 15.7 deg/s.
+        SERVO_LAG_SECONDS_PER_DEG = 0.13
+        self.assertLess(visual.MOTION_RATE_DEG_S * math.pi / 2, demo.MAX_JOINT_STEP_DEG / SERVO_LAG_SECONDS_PER_DEG)
 
     def test_contact_stop_needs_both_position_error_and_load(self):
         self.assertEqual(visual.load_percent(-437), 43.7)  # sign-decoded tenths of a percent
@@ -221,17 +225,25 @@ class VisualControlTests(unittest.TestCase):
             self.assertIn(phrase, source)
 
     def test_settling_ends_by_tolerance_or_by_timeout_never_hangs(self):
-        self.assertEqual(visual.settle_state(0.5, 0), "done")
-        self.assertEqual(visual.settle_state(1.2, 0), "wait")
+        self.assertEqual(visual.settle_state(0.5, 0.0, 0), "done")
+        self.assertEqual(visual.settle_state(1.2, 0.0, 0), "wait")
+        # The gripper has to arrive too: max_relative_target caps it on its own 0-100 scale, and the
+        # loop stops sending the moment settling ends, so a gripper still short would stay short.
+        self.assertEqual(visual.settle_state(0.5, 20.0, 0), "wait")
+        self.assertEqual(visual.settle_state(0.5, visual.SETTLE_TOLERANCE_PCT, 0), "done")
         ticks_to_timeout = int(visual.SETTLE_TIMEOUT_SECONDS / visual.UPDATE_SECONDS)
-        self.assertEqual(visual.settle_state(1.2, ticks_to_timeout - 1), "wait")
-        self.assertEqual(visual.settle_state(1.2, ticks_to_timeout), "timeout")
+        self.assertEqual(visual.settle_state(1.2, 0.0, ticks_to_timeout - 1), "wait")
+        self.assertEqual(visual.settle_state(1.2, 0.0, ticks_to_timeout), "timeout")
+        self.assertEqual(visual.settle_state(0.5, 20.0, ticks_to_timeout), "timeout")
         self.assertGreaterEqual(visual.REPLAN_TOLERANCE_DEG, 1.0)  # holding sag must not force endless re-planning
 
     def test_pose_reads_are_retried(self):
+        # The follower is read through get_observation, the call lerobot-teleoperate uses; the retry
+        # budget goes in through the config, so a single bad packet still cannot end the program.
         source = Path(visual.__file__).read_text()
-        self.assertIn('sync_read("Present_Position", num_retry=READ_RETRIES)', source)
-        self.assertNotIn("get_observation()", source)
+        self.assertIn("num_read_retries=READ_RETRIES", source)
+        self.assertIn("arm.get_observation()", source)
+        self.assertNotIn('sync_read("Present_Position"', source)
         self.assertGreaterEqual(visual.READ_RETRIES, 2)
 
     def test_reading_margin_covers_a_motor_holding_against_a_stop(self):
@@ -258,7 +270,7 @@ class VisualControlTests(unittest.TestCase):
             for handler in list(visual.LOG.handlers):
                 visual.LOG.removeHandler(handler); handler.close()
 
-    def test_power_on_is_refused_on_a_stop_and_holds_clamp_inside_the_travel(self):
+    def test_joints_on_a_stop_are_named_and_holds_clamp_inside_the_travel(self):
         limits = {name: (-105.48, 105.48) for name in demo.JOINTS}  # recorded +-100.48 plus the 5 deg reading margin
         rest = [13.98, -103.69, 97.01, -102.29, 6.37]
         blockers = demo.joints_on_a_stop(rest, limits)
@@ -378,32 +390,47 @@ class HoldTests(unittest.TestCase):
             events.append(event)
             if event == fail_at:
                 raise RuntimeError("injected test failure")
-        def read_raw(*args, **kwargs):
-            record("read-final-position")
-            return {name: (4095 if bad_raw and name == "elbow_flex" else 2048) for name in scan.JOINT_NAMES}
+        def read_raw(register, *args, **kwargs):
+            if register == "Present_Position":
+                record("read-final-position")
+                return {name: (4095 if bad_raw and name == "elbow_flex" else 2048) for name in scan.JOINT_NAMES}
+            # A still, unloaded arm: no load, no current, each motor at its full torque ceiling.
+            return {name: {"Max_Torque_Limit": 1000}.get(register, 0) for name in scan.JOINT_NAMES}
         def read_goal(*args, **kwargs):
             record("confirm-hold")
             return 2048
+        def sync_write(register, *args, **kwargs):
+            record("hold-target" if register == "Goal_Position" else "sync-" + register)
         bus = SimpleNamespace(
             motors={name: SimpleNamespace(model="sts3215") for name in scan.JOINT_NAMES},
             model_resolution_table={"sts3215": 4096},
-            disable_torque=lambda: record("disable"), configure_motors=lambda: record("configure"),
-            write=lambda register, *args: record("write-" + register), sync_read=read_raw, read=read_goal,
-            sync_write=lambda *args, **kwargs: record("hold-target"), enable_torque=lambda: record("enable"))
+            disable_torque=lambda *args, **kwargs: record("disable"), configure_motors=lambda: record("configure"),
+            write=lambda register, *args, **kwargs: record("write-" + register), sync_read=read_raw, read=read_goal,
+            sync_write=sync_write, enable_torque=lambda *args, **kwargs: record("enable"))
         arm = SimpleNamespace(bus=bus,
             config=SimpleNamespace(position_p_coefficient=16, position_i_coefficient=0, position_d_coefficient=32),
             calibration={name: SimpleNamespace(range_min=1024, range_max=3072) for name in scan.JOINT_NAMES})
         return arm, {name: (-80, 80) for name in demo.JOINTS}, events
 
     def test_enable_only_after_final_read_and_hold(self):
+        from unittest.mock import patch
         arm, limits, events = self.fixture()
-        demo.configure_and_hold(arm, position_mode=0)
+        with patch.object(demo.time, "sleep"):
+            demo.configure_and_hold(arm, position_mode=0)
         self.assertEqual(events[0], "disable")
-        self.assertEqual(events[-1], "enable")
         self.assertEqual(events.count("confirm-hold"), 6)
+        self.assertLess(events.index("configure"), events.index("read-final-position"))
         self.assertLess(events.index("read-final-position"), events.index("hold-target"))
         self.assertLess(events.index("hold-target"), events.index("confirm-hold"))
-        self.assertLess(events.index("configure"), events.index("read-final-position"))
+        self.assertLess(events.index("confirm-hold"), events.index("enable"))
+        # Soft start: the torque limit is lowered before torque comes on, the goal is written once
+        # more with torque on, and each motor's own limit is restored last.
+        enable = events.index("enable")
+        limit_writes = [i for i, event in enumerate(events) if event == "sync-Torque_Limit"]
+        self.assertEqual(len(limit_writes), 2)
+        self.assertLess(limit_writes[0], enable)
+        self.assertIn("hold-target", events[enable + 1:])
+        self.assertEqual(events[-1], "sync-Torque_Limit")
 
     def test_each_configuration_failure_never_enables(self):
         for stage in ("disable", "configure", "write-Operating_Mode", "write-P_Coefficient", "write-Protection_Current", "read-final-position", "hold-target", "confirm-hold"):
@@ -469,6 +496,115 @@ class BoundaryTests(unittest.TestCase):
     def test_xyz_session_envelope_rejected(self):
         with self.assertRaises(ValueError):
             demo.check_step([0]*5, [1]*5, [0]*5, [0, 0, 0.021], [0]*3, self.args)
+
+
+class SoftStartTests(unittest.TestCase):
+    """configure_and_hold enables torque through a watched soft start, against a fake six-motor bus."""
+
+    NAMES = (*demo.JOINTS, "gripper")
+
+    def make_arm(self, push=(), cured_by_rewrite=True, fault_after_reads=None):
+        from types import SimpleNamespace
+        names = self.NAMES
+        regs = {n: {"Present_Position": 2048, "Goal_Position": 0, "Torque_Enable": 0, "Lock": 0, "Torque_Limit": 1000,
+                    "Max_Torque_Limit": 500 if n == "gripper" else 1000, "Present_Load": 0, "Present_Current": 0,
+                    "Goal_Position_2": 0} for n in names}
+        state = SimpleNamespace(pushing=set(push), log=[], position_reads=0)
+
+        class Bus:
+            motors = {n: SimpleNamespace(model="sts3215") for n in names}
+            model_resolution_table = {"sts3215": 4096}
+
+            def disable_torque(self, motors=None, num_retry=0):
+                for n in names:
+                    regs[n]["Torque_Enable"] = 0
+                state.log.append(("disable_torque",))
+
+            def enable_torque(self, motors=None, num_retry=0):
+                for n in names:
+                    regs[n]["Torque_Enable"] = 1
+                state.log.append(("enable_torque",))
+
+            def configure_motors(self):
+                pass
+
+            def write(self, reg, name, value, normalize=True, num_retry=0):
+                regs[name][reg] = value
+                state.log.append(("write", reg, name, value))
+
+            def read(self, reg, name, normalize=True, num_retry=0):
+                return regs[name][reg]
+
+            def sync_write(self, reg, values, normalize=True, num_retry=0):
+                for n, v in values.items():
+                    regs[n][reg] = v
+                state.log.append(("sync_write", reg, dict(values)))
+                if reg == "Goal_Position" and cured_by_rewrite and any(regs[n]["Torque_Enable"] for n in values):
+                    state.pushing -= set(values)  # a goal written with torque on is the one the servo follows
+
+            def sync_read(self, reg, normalize=True, num_retry=0):
+                if reg == "Present_Position":
+                    state.position_reads += 1
+                    if fault_after_reads is not None and state.position_reads > fault_after_reads and any(regs[n]["Torque_Enable"] for n in names):
+                        raise ConnectionError("bad packet")
+                    # A pushing motor with torque on drives 3 counts per read at the capped load.
+                    for n in names:
+                        if n in state.pushing and regs[n]["Torque_Enable"]:
+                            regs[n]["Present_Position"] -= 3
+                            regs[n]["Present_Load"] = -regs[n]["Torque_Limit"]  # tenths of a percent, signed
+                        else:
+                            regs[n]["Present_Load"] = 0
+                return {n: regs[n][reg] for n in names}
+
+        calibration = {n: SimpleNamespace(range_min=1024, range_max=3072) for n in names}
+        config = SimpleNamespace(position_p_coefficient=16, position_i_coefficient=0, position_d_coefficient=32)
+        return SimpleNamespace(bus=Bus(), calibration=calibration, config=config), regs, state
+
+    def run_hold(self, arm):
+        from unittest.mock import patch
+        with patch.object(demo.time, "sleep"):
+            demo.configure_and_hold(arm, 0)
+
+    def test_calm_arm_powers_on_at_low_torque_and_gets_its_own_limit_back(self):
+        arm, regs, state = self.make_arm()
+        self.run_hold(arm)
+        kinds = [(e[0], e[1]) if e[0] == "sync_write" else e for e in state.log]
+        lowered = kinds.index(("sync_write", "Torque_Limit"))
+        enabled = kinds.index(("enable_torque",))
+        goals = [i for i, k in enumerate(kinds) if k == ("sync_write", "Goal_Position")]
+        self.assertLess(lowered, enabled)  # the limit is lowered before torque comes on
+        self.assertTrue(any(i < enabled for i in goals) and any(i > enabled for i in goals))  # goal written before and again after
+        self.assertEqual(state.log[lowered][2]["shoulder_lift"], demo.SOFT_START_TORQUE_LIMIT)
+        self.assertTrue(all(regs[n]["Torque_Enable"] == 1 for n in self.NAMES))
+        self.assertEqual(regs["shoulder_lift"]["Torque_Limit"], 1000)  # restored to each motor's own ceiling
+        self.assertEqual(regs["gripper"]["Torque_Limit"], 500)
+
+    def test_a_joint_that_drives_after_torque_on_is_given_its_goal_again_and_settles(self):
+        arm, regs, state = self.make_arm(push={"shoulder_lift"})
+        self.run_hold(arm)
+        after_enable = state.log[state.log.index(("enable_torque",)) + 1:]
+        rewrites = [e for e in after_enable if e[0] == "sync_write" and e[1] == "Goal_Position"]
+        self.assertGreaterEqual(len(rewrites), 1)
+        self.assertTrue(all(regs[n]["Torque_Enable"] == 1 for n in self.NAMES))
+        self.assertEqual(regs["shoulder_lift"]["Goal_Position"], regs["shoulder_lift"]["Present_Position"])
+        self.assertEqual(regs["shoulder_lift"]["Torque_Limit"], 1000)
+
+    def test_a_joint_that_keeps_driving_has_torque_released_and_is_named(self):
+        arm, regs, state = self.make_arm(push={"shoulder_lift"}, cured_by_rewrite=False)
+        with self.assertRaises(demo.SoftStartFailed) as raised:
+            self.run_hold(arm)
+        self.assertIn("shoulder_lift", str(raised.exception))
+        self.assertEqual(raised.exception.unconfirmed, {})
+        self.assertTrue(all(regs[n]["Torque_Enable"] == 0 for n in self.NAMES))
+        # The limit stays lowered: restoring it while a motor is still driving would be a full-force push.
+        self.assertEqual(regs["shoulder_lift"]["Torque_Limit"], demo.SOFT_START_TORQUE_LIMIT)
+
+    def test_a_bus_fault_during_the_watch_releases_torque(self):
+        arm, regs, state = self.make_arm(fault_after_reads=2)
+        with self.assertRaises(demo.SoftStartFailed) as raised:
+            self.run_hold(arm)
+        self.assertIn("bus fault", str(raised.exception))
+        self.assertTrue(all(regs[n]["Torque_Enable"] == 0 for n in self.NAMES))
 
 
 parser = argparse.ArgumentParser()

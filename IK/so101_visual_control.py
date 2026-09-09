@@ -282,7 +282,7 @@ def help_markdown(zh, args):
 3. **执行运动**：沿计划的轨迹过去。模型模式动蓝色模型；实机模式动真机，速度上限每秒 {MOTION_RATE_DEG_S:g}°，每个周期只发一小步。
 
 #### 上电与断电（实机模式）
-- **1 · 上电**：先输入 {ARM_WORD}。每个关节都要离活动范围两端 5° 以上，靠在止点上的休息姿态不许上电，要先用手托到中间姿态。程序把六个电机的目标设成当前位置再开力矩，从此电机锁定，才能设目标、计划、执行。
+- **1 · 上电**：先输入 {ARM_WORD}。任何姿态都可以上电，折叠的休息姿态也行。程序把六个电机的目标设成当前位置，先以三成力矩开力矩，再把目标写一遍，监视一秒：哪个电机自己动或自己出力，就断力矩并报出是哪个；都安静，才把力矩放开到正常值。从此电机锁定，才能设目标、计划、执行。靠在止点上的关节会在状态行里点名。
 - **3 · 断电**：也要输入 {ARM_WORD}。六个电机同时停止出力，手臂会失去支撑，先托住再点。断电是唯一让电机松开的操作；断电没确认干净时界面会说明，这时切断直流电源。
 
 #### 四种停
@@ -307,7 +307,7 @@ def help_markdown(zh, args):
 3. **Execute**: follows the planned trajectory. Model mode moves the blue model; hardware mode moves the arm at no more than {MOTION_RATE_DEG_S:g}° per second, one small step per cycle.
 
 #### Power on and off (hardware mode)
-- **1 · Power on**: type {ARM_WORD} first. Every joint must be more than 5° from either end of its travel; the folded rest pose on the stops is refused, so support the arm in a mid pose first. The program sets all six motor targets to the present position and then switches torque on; from then on the motors are locked and goals, plans and execution become available.
+- **1 · Power on**: type {ARM_WORD} first. Any pose will do, the folded rest pose included. The program sets all six motor targets to the present position, switches torque on at a third of its limit, writes the targets once more and watches for a second: a motor that moves or loads on its own has torque released and is named; only when all are still is the limit restored. From then on the motors are locked and goals, plans and execution become available. Joints resting on a stop are named in the status line.
 - **3 · Power off**: also requires {ARM_WORD}. All six motors stop driving and the arm loses its support, so hold it before pressing. Power-off is the only action that lets the motors go; if it cannot be confirmed on every motor the interface says so, and you cut DC power.
 
 #### Four kinds of stop
@@ -512,7 +512,7 @@ def run(args):
             with server.gui.add_folder(copy("1 · 上电", "1 · Power on")):
                 on_word = server.gui.add_text(copy(f"输入 {ARM_WORD}", f"Type {ARM_WORD}"), "")
                 on_button = server.gui.add_button(copy("上电（锁定电机，保持当前姿态）", "Power on (lock the motors at this pose)"),
-                                                  hint=copy("每个关节都要离活动范围两端 5° 以上；靠在止点上不许上电", "Every joint must be more than 5° from either end of its travel; power-on is refused on a stop"))
+                                                  hint=copy("任何姿态都可以上电：程序先以低力矩上电并监视一秒，哪个电机自己出力就断力矩并报出来", "Power on in any pose: torque comes on at a low limit and is watched for a second; a motor that drives on its own has torque released and is named"))
         bounds = slider_bounds(target_limits)
         with server.gui.add_folder(copy("2 · 目标关节角 / °", "2 · Goal joints / °")):
             sliders = [server.gui.add_slider(label, bounds[name][0], bounds[name][1], SLIDER_STEP_DEG, slider_value(v, bounds[name]), disabled=not powered)
@@ -791,14 +791,17 @@ def run(args):
                         if not arming_requested(str(request.payload)):
                             raise ValueError(copy(f"先在“上电”栏输入 {ARM_WORD}", f"Type {ARM_WORD} in the Power on panel first"))
                         blockers = control.joints_on_a_stop(current, reading_limits)
+                        on_stops = [f"F{control.JOINTS.index(name) + 1}" for name, _, _ in blockers]
                         if blockers:
-                            name, value, (low_end, high_end) = blockers[0]
-                            joint = f"F{control.JOINTS.index(name) + 1}"
-                            raise ValueError(copy(f"{joint} 靠在止点上（{value:.1f}°，活动范围 {low_end:.1f}° 到 {high_end:.1f}°）。先用手把手臂托到中间姿态，每个关节都离两端 5° 以上，再上电",
-                                                  f"{joint} rests on a stop ({value:.1f}°, travel {low_end:.1f}° to {high_end:.1f}°). Support the arm in a mid pose, every joint more than 5° from either end, then power on"))
+                            LOG.info("power on with joints on a stop: %s", [(name, round(value, 2)) for name, value, _ in blockers])
                         from lerobot.motors.feetech import OperatingMode
                         LOG.info("power on: pose %s", np.round(current, 2).tolist())
-                        control.configure_and_hold(arm, OperatingMode.POSITION.value)
+                        try:
+                            control.configure_and_hold(arm, OperatingMode.POSITION.value, log=LOG.debug)
+                        except control.SoftStartFailed as exc:
+                            torque_uncertain = bool(exc.unconfirmed)  # Released, unless a motor did not answer.
+                            refresh_buttons()
+                            raise
                         powered = True
                         on_word.value = ""
                         LOG.info("powered; torque on")
@@ -808,7 +811,9 @@ def run(args):
                             slider.value = slider_value(value, bounds[name])
                         gripper_slider.value = float(round(opening))
                         refresh_buttons()
-                        say(copy("已上电，电机锁定在当前姿态。可以松手，断电开关放在手边。现在拖操纵柄或拨滑杆设目标。", "Powered on; the motors hold this pose. You may let go; keep the DC switch within reach. Now set a goal with the handle or the sliders."))
+                        watched = (copy(f"{'、'.join(on_stops)} 顶在止点上，已用低力矩上电并监视过，没有自己出力。", f"{', '.join(on_stops)} on a stop: powered at low torque and watched, no motor drove on its own. ")
+                                   if on_stops else "")
+                        say(watched + copy("已上电，电机锁定在当前姿态。可以松手，断电开关放在手边。现在拖操纵柄或拨滑杆设目标。", "Powered on; the motors hold this pose. You may let go; keep the DC switch within reach. Now set a goal with the handle or the sliders."))
                         continue
                     if not powered or torque_uncertain:
                         if request.kind in ("drag", "joints", "reset", "plan", "execute"):

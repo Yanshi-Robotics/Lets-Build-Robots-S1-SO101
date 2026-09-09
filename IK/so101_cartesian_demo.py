@@ -34,11 +34,23 @@ STEP_MM = 2.0
 # shoulder_lift minimum with torque on. The margin still catches a wrong calibration file,
 # which is tens of degrees off, without refusing an honest rest pose.
 LIMIT_MARGIN_DEG = 5.0
-# Power-on is refused while any joint rests this close to the end of its recorded travel.
-# 2026-09-08 incident: torque enabled with shoulder_lift and wrist_flex on their stops drove
-# both at 100 % load into the stops within a second and tripped the servos' overload
-# protection (output cut to 20 %, error bit set on every acknowledged write afterwards).
+# Joints resting this close to the end of their recorded travel are named at power-on, so the
+# operator knows which ones the soft start below is protecting. 2026-09-08 incident: torque
+# enabled with shoulder_lift and wrist_flex on their stops drove both at 100 % load into the
+# stops within 250 ms and tripped the servos' overload protection (output cut to 20 %, error
+# bit set on every acknowledged write afterwards) - with the goal verified equal to the present
+# position beforehand, so the servos drove at a target that was not the one in their register.
 POWER_ON_MARGIN_DEG = 5.0
+# Soft start: torque comes on with Torque_Limit lowered, the goal is written once more with torque
+# on, and the arm is watched before each motor's own Max_Torque_Limit is restored. Holding a mid
+# pose reads 0-5 % load on this arm; a push into a stop saturates at the lowered limit, which is
+# far below what compresses a stop or trips overload.
+SOFT_START_TORQUE_LIMIT = 300  # of 1000
+SOFT_START_SECONDS = 1.0
+SOFT_START_STABLE_SECONDS = 0.3
+SOFT_START_DRIFT_COUNTS = 4  # about 0.35 deg: a joint that moves this far on its own is being driven
+SOFT_START_LOAD_PCT = 15.0  # between the 0-5 % of holding and the 30 % a capped push reads
+SOFT_START_REWRITES = 3  # goal rewrites granted to a driven joint before torque is released
 # Hold and goal commands never point at the very end of the recorded travel.
 HOLD_MARGIN_DEG = 2.0
 WRIST_ROLL_LOCK_WEIGHT = 1.0  # Soft joints task: position-only IK must not drift the roll axis.
@@ -236,8 +248,60 @@ def calibrated_limits(arm):
     return limits
 
 
-def configure_and_hold(arm, position_mode):
-    """Configure without an auto-reenabling context; enable only after all checks."""
+class SoftStartFailed(RuntimeError):
+    """Torque was released again during the soft start. `unconfirmed` names motors whose release could not be confirmed."""
+
+    def __init__(self, message, unconfirmed=None):
+        super().__init__(message)
+        self.unconfirmed = dict(unconfirmed or {})
+
+
+def _watch_soft_start(arm, reference, log):
+    """Torque is on at the lowered limit. Rewrite the goal, then watch until the arm is still.
+
+    A joint that moves or loads on its own gets its goal rewritten to where it now is, up to
+    SOFT_START_REWRITES times; one that keeps driving has torque released and is named.
+    """
+    # A goal written with torque off is what the incident showed the servos not to follow.
+    arm.bus.sync_write("Goal_Position", reference, normalize=False)
+    rewrites = stable = 0
+    deadline = time.monotonic() + SOFT_START_SECONDS
+    while time.monotonic() < deadline:
+        time.sleep(READ_INTERVAL_SECONDS)
+        present = arm.bus.sync_read("Present_Position", normalize=False, num_retry=2)
+        load = arm.bus.sync_read("Present_Load", normalize=False, num_retry=2)
+        if log:
+            log("soft start present=%s goal2=%s load=%s current=%s",
+                present, arm.bus.sync_read("Goal_Position_2", normalize=False, num_retry=2),
+                load, arm.bus.sync_read("Present_Current", normalize=False, num_retry=2))
+        driven = {name: (present[name] - reference[name], abs(load[name]) / 10) for name in arm.bus.motors
+                  if abs(present[name] - reference[name]) > SOFT_START_DRIFT_COUNTS or abs(load[name]) / 10 > SOFT_START_LOAD_PCT}
+        if not driven:
+            stable += 1
+            if stable * READ_INTERVAL_SECONDS >= SOFT_START_STABLE_SECONDS:
+                return
+            continue
+        stable = 0
+        rewrites += 1
+        if rewrites > SOFT_START_REWRITES:
+            unconfirmed = release_torque(arm.bus)
+            detail = ", ".join(f"{name} moved {counts * 360 / 4095:+.2f} deg at {pct:.0f} % load" for name, (counts, pct) in driven.items())
+            raise SoftStartFailed(f"a motor kept driving after {SOFT_START_REWRITES} goal rewrites; torque released. {detail}", unconfirmed)
+        reference = present
+        arm.bus.sync_write("Goal_Position", present, normalize=False)
+    unconfirmed = release_torque(arm.bus)
+    raise SoftStartFailed(f"the arm did not settle within {SOFT_START_SECONDS:g} s of power-on; torque released", unconfirmed)
+
+
+def configure_and_hold(arm, position_mode, log=None):
+    """Configure, hold the present pose, and enable torque through a soft start.
+
+    Torque comes on with every motor's Torque_Limit lowered to SOFT_START_TORQUE_LIMIT; the goal
+    is written once more with torque on and the arm is watched (see _watch_soft_start); only then
+    is each motor's own Max_Torque_Limit restored. If anything goes wrong while torque is on at
+    the lowered limit, torque is released before the error is raised: the caller never inherits
+    an energised arm it does not know about.
+    """
     arm.bus.disable_torque()
     arm.bus.configure_motors()
     for name in arm.bus.motors:
@@ -260,6 +324,9 @@ def configure_and_hold(arm, position_mode):
     gripper = arm.calibration["gripper"]
     if not gripper.range_min <= raw["gripper"] <= gripper.range_max:
         raise ValueError("Gripper is outside its calibrated range")
+    # Each motor's own ceiling (the gripper's is lower); Torque_Limit returns to it after the watch.
+    normal_limit = arm.bus.sync_read("Max_Torque_Limit", normalize=False)
+    arm.bus.sync_write("Torque_Limit", {name: SOFT_START_TORQUE_LIMIT for name in arm.bus.motors}, normalize=False)
     arm.bus.sync_write("Goal_Position", raw, normalize=False)
     # Broadcast sync_write has no per-motor acknowledgement. Verify every hold
     # target before enabling, so an undelivered packet cannot leave an old goal.
@@ -267,6 +334,14 @@ def configure_and_hold(arm, position_mode):
         if arm.bus.read("Goal_Position", name, normalize=False) != target:
             raise RuntimeError(f"Hold target not confirmed for {name}; torque remains disabled")
     arm.bus.enable_torque()
+    try:
+        _watch_soft_start(arm, raw, log)
+        arm.bus.sync_write("Torque_Limit", normal_limit, normalize=False)
+    except SoftStartFailed:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a bus fault here would otherwise leave torque on unannounced
+        unconfirmed = release_torque(arm.bus)
+        raise SoftStartFailed(f"bus fault during the soft start ({exc}); torque released", unconfirmed) from exc
 
 
 def preview(args):
