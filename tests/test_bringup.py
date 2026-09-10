@@ -1299,6 +1299,26 @@ class CameraCheckTests(unittest.TestCase):
         self.assertEqual((reloaded["wrist"]["width"], reloaded["wrist"]["height"]),
                          (cameras.CAPTURE_WIDTH, cameras.CAPTURE_HEIGHT))
 
+    def test_only_the_live_views_hold_a_connection_each(self):
+        """The model-eye panels must not be a second stream per camera.
+
+        A browser allows only a handful of connections to one origin. With two endless
+        MJPEG responses per camera they were all consumed, and clicking a rotation button
+        had no connection left to travel on: the page looked frozen rather than broken.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.page_state([0, 0], save_path=Path(directory) / "cameras.json")
+            page = cameras.build_page(state, heading="h", hint="", rotatable=True, assignable=True).decode()
+        # Live views are streamed directly...
+        self.assertIn('src="/stream/1"', page)
+        self.assertIn('src="/stream/2"', page)
+        # ...while the 224 panels are fetched by the refresh script, one short request at a time.
+        # Note the leading space: `data-src="/model/1"` contains `src="/model/` as a substring,
+        # so the check has to look for a bare src attribute rather than any occurrence.
+        self.assertNotIn(' src="/model/', page)
+        self.assertIn('data-src="/model/1"', page)
+        self.assertIn("setInterval(refreshEyes", page)
+
     def test_switching_size_releases_the_camera_before_opening_it_again(self):
         """A camera cannot be held open twice.
 

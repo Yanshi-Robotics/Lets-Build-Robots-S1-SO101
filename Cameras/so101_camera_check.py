@@ -473,6 +473,17 @@ PAGE = """<!doctype html><meta charset=utf-8><title>SO-101 cameras</title>
 <div class=bars><span class=lbl>capture size</span>%(sizes)s<span class=lbl>%(fill)s</span></div>
 <p class=why>%(why)s</p>
 <div class=row>%(cameras)s</div>
+<script>
+ // Refresh the model-eye stills on a timer. They only need to show framing, and a
+ // stream each would exhaust the browser's connections to this origin.
+ function refreshEyes() {
+   document.querySelectorAll('img.eye-img').forEach(function (img) {
+     img.src = img.dataset.src + '?t=' + Date.now();
+   });
+ }
+ refreshEyes();
+ setInterval(refreshEyes, 700);
+</script>
 """
 
 PANEL_WIDTH = 320
@@ -591,7 +602,7 @@ def build_page(state, *, heading, hint, rotatable, assignable):
         cards.append(
             f'<div class=cam><img src="/stream/{number}" alt="camera {number}">'
             f'<div class=bar><span class=n>[{number}]</span><span>{title}</span>{turns}{picker}</div>'
-            f'<div class=eye><img src="/model/{number}" alt="what the policy sees">'
+            f'<div class=eye><img class=eye-img data-src="/model/{number}" alt="what the policy sees">'
             f'<p>What a pi0 policy receives: this frame padded into 224x224. '
             f'The black bars are pixels the model never gets.</p></div></div>')
     sizes = "".join(
@@ -626,9 +637,27 @@ def serve_preview(state, *, port, heading, hint, rotatable=True, assignable=Fals
         def log_message(self, *_args):
             pass  # One line per JPEG would bury the instructions printed above.
 
-        def _stream(self, number, *, model=False):
+        def _still(self, jpeg):
+            """One JPEG over a short-lived request.
+
+            The model-eye panels are served this way rather than as a second stream per
+            camera. A browser allows only a handful of connections to one origin, and two
+            endless MJPEG responses per camera used them all up: the click on a rotation
+            button then had no connection left and simply waited.
+            """
+            if jpeg is None:
+                self.send_error(503)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(jpeg)))
+            self.end_headers()
+            self.wfile.write(jpeg)
+
+        def _stream(self, number):
             stream = streams[number - 1]
-            source = stream.model_jpeg if model else stream.jpeg
+            source = stream.jpeg
             self.send_response(200)
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
             self.end_headers()
@@ -662,8 +691,11 @@ def serve_preview(state, *, port, heading, hint, rotatable=True, assignable=Fals
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if parts[0] in ("stream", "model") and parts[1].isdigit() and 1 <= int(parts[1]) <= len(streams):
-                self._stream(int(parts[1]), model=parts[0] == "model")
+            if parts[0] == "stream" and parts[1].isdigit() and 1 <= int(parts[1]) <= len(streams):
+                self._stream(int(parts[1]))
+                return
+            if parts[0] == "model" and parts[1].isdigit() and 1 <= int(parts[1]) <= len(streams):
+                self._still(streams[int(parts[1]) - 1].model_jpeg())
                 return
             if parts[0] == "size" and len(parts) == 3:
                 state.set_capture_size(int(parts[1]), int(parts[2]))
