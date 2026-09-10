@@ -1267,6 +1267,33 @@ class CameraCheckTests(unittest.TestCase):
         from lerobot.cameras.configs import Cv2Rotation
         self.assertEqual(set(cameras.ROTATIONS), {rotation.value for rotation in Cv2Rotation})
 
+    def test_a_quarter_turn_swaps_the_dimensions_that_get_written_down(self):
+        # LeRobot validates width and height against the frame after rotation, so the pair
+        # written into cameras.json has to follow the quarter turns.
+        upright = {"width": 1280, "height": 720, "rotation": 0}
+        self.assertEqual(cameras.rotated_size(upright, 0), (1280, 720))
+        self.assertEqual(cameras.rotated_size(upright, 180), (1280, 720))
+        self.assertEqual(cameras.rotated_size(upright, 90), (720, 1280))
+        self.assertEqual(cameras.rotated_size(upright, -90), (720, 1280))
+        # Going back from a quarter turn restores the original pair rather than swapping again.
+        turned = {"width": 720, "height": 1280, "rotation": 90}
+        self.assertEqual(cameras.rotated_size(turned, 90), (720, 1280))
+        self.assertEqual(cameras.rotated_size(turned, 0), (1280, 720))
+
+    def test_the_printed_configuration_is_valid_json_carrying_the_chosen_rotations(self):
+        configured = self.configured()
+        printed = json.loads(cameras.cameras_json(configured, [90, 180]))
+        self.assertEqual(printed["top"]["rotation"], 90)
+        self.assertEqual((printed["top"]["width"], printed["top"]["height"]), (720, 1280))
+        self.assertEqual(printed["wrist"]["rotation"], 180)
+        self.assertEqual((printed["wrist"]["width"], printed["wrist"]["height"]), (1280, 720))
+        # It has to be loadable by the same reader that validates cameras.json.
+        with tempfile.TemporaryDirectory() as directory:
+            file = Path(directory) / "cameras.json"
+            file.write_text(cameras.cameras_json(configured, [90, 180]), encoding="utf-8")
+            reloaded = cameras.load_cameras_file(file)
+        self.assertEqual(reloaded["top"]["rotation"], 90)
+
 
 if __name__ == "__main__":
     unittest.main(argv=[__file__], verbosity=2)

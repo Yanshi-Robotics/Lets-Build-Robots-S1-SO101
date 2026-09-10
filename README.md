@@ -20,10 +20,10 @@ Season 1 starts with printing and assembling two SO-101 arms and ends with a tra
 ## What's in the repository
 
 - **`Bringup/`**: `so101_bus_check.py` reads all six motors on one bus; `so101_calibrate.py` records each joint's mid position and range. Used in Lesson 6.
-- **`Cameras/`**: `so101_camera_check.py` groups the video nodes under the physical cameras behind them and names the stable path for each, then opens the two cameras from `cameras.json`, measures what they deliver alone and together, and shows both views so their orientation can be settled. Used in Lesson 9.
+- **`Cameras/`**: `so101_camera_check.py` lists the cameras that deliver frames and names the stable path for each, then serves them live on a local page so a view can be matched to a mount and its rotation settled. `check` first measures what the two configured cameras deliver alone and together. Used in Lesson 9.
 - **`IK/`**: `so101_cartesian_demo.py` downloads the pinned model and solves one Cartesian step with LeRobot's own IK; `so101_visual_control.py` self-checks, then opens a browser page showing the arm with nothing powered, and powers it only when a mode is enabled: LeRobot's keyboard device, a leader arm, or a dragged target solved by IK. `so101_ee_teleop.py` is the keyboard control with no page, as the smallest thing that runs. Used in Lesson 8. All three stay in the same folder: the two control programs import the model helpers from the first.
 - **`Teleop/`**: `so101_teleop_log.py` dumps both arms' protection and calibration registers, checks the two arms against each other, and grades a recording made by `lerobot-record`. Teleoperation itself stays with the official `lerobot-teleoperate`. Used in Lesson 7.
-- **`tests/`**: 86 tests that run the programs against fake hardware.
+- **`tests/`**: 88 tests that run the programs against fake hardware.
 - **`Teleop/logs/`** (git-ignored): one debug log per diagnostics run, the last 20 kept, plus anything `lerobot-record` writes there. Send the newest one when something goes wrong.
 - **`tools/`**: `build_control_poses.py` computes the poses drawn in the lesson illustrations.
 

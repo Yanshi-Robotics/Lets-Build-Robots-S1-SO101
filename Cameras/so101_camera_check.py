@@ -191,13 +191,41 @@ def grab_one_frame(path):
         capture.release()
 
 
-def show_frames(cameras, *, height=360, snapshot=None):
-    """One frame per camera, side by side, each labelled with the number printed above.
+PREVIEW_WIDTH, PREVIEW_HEIGHT = 640, 480  # Enough to recognise a view; recording resolution is settled later.
+DEFAULT_PORT = 4603  # Registered for this course tool; --port moves it.
+JPEG_QUALITY = 80
 
-    This is the step that answers which camera is which. No amount of device text can:
-    the overhead camera and the wrist camera are the same model on this bench, and only
-    the picture tells them apart.
-    """
+
+def open_for_preview(path):
+    """A camera opened at preview resolution, or None when something else holds it."""
+    import cv2
+
+    capture = cv2.VideoCapture(str(path), cv2.CAP_V4L2)
+    if not capture.isOpened():
+        capture.release()
+        return None
+    capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, PREVIEW_WIDTH)
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, PREVIEW_HEIGHT)
+    return capture
+
+
+def grab_one_frame(path):
+    """One frame from a camera, opened and closed again; None when it delivers nothing."""
+    capture = open_for_preview(path)
+    if capture is None:
+        return None
+    try:
+        # The first frames off a UVC camera are often stale or half exposed.
+        for _ in range(8):
+            received, frame = capture.read()
+        return frame if received else None
+    finally:
+        capture.release()
+
+
+def write_snapshot(cameras, target, *, height=360):
+    """One still per camera, side by side, for a machine that cannot open a browser."""
     import cv2
     import numpy
 
@@ -209,23 +237,199 @@ def show_frames(cameras, *, height=360, snapshot=None):
             continue
         scale = height / frame.shape[0]
         panel = cv2.resize(frame, (max(1, int(frame.shape[1] * scale)), height))
-        panels.append(label(panel, [f"[{number}]  {model_name(camera['card'])}"], cv2,
-                            up_arrow=False, scale=0.6))
+        panels.append(label(panel, [f"[{number}]  {model_name(camera['card'])}"], cv2))
     if not panels:
         return False
-    board = numpy.hstack(panels)
-    if snapshot:
-        target = Path(snapshot)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(target), board)
-        print(f"Wrote {target}.")
-        return True
-    window = "Which camera is which - press any key to close"
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    cv2.imshow(window, board)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    path = Path(target)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), numpy.hstack(panels))
+    print(f"Wrote {path}.")
     return True
+
+
+class CameraStream:
+    """One camera read on its own thread, keeping only the newest frame.
+
+    A browser page can hold several readers of one stream, and a camera cannot be read
+    twice. Reading once into a shared slot means the number of viewers never changes
+    the load on the USB bus.
+    """
+
+    def __init__(self, camera, *, rotation=0):
+        self.camera = camera
+        self.rotation = rotation
+        self.capture = None
+        self.frame = None
+        self.lock = __import__("threading").Lock()
+        self.stop = __import__("threading").Event()
+        self.thread = None
+
+    def start(self):
+        import threading
+
+        self.capture = open_for_preview(self.camera["path"])
+        if self.capture is None:
+            return False
+        self.thread = threading.Thread(target=self._read_loop, daemon=True)
+        self.thread.start()
+        return True
+
+    def _read_loop(self):
+        while not self.stop.is_set():
+            received, frame = self.capture.read()
+            if not received:
+                time.sleep(0.05)
+                continue
+            with self.lock:
+                self.frame = frame
+
+    def jpeg(self):
+        """The newest frame as JPEG bytes, with the configured rotation applied."""
+        import cv2
+
+        with self.lock:
+            frame = None if self.frame is None else self.frame.copy()
+        if frame is None:
+            return None
+        turned = get_cv2_rotation_code(self.rotation)
+        if turned is not None:
+            frame = cv2.rotate(frame, turned)
+        encoded, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+        return buffer.tobytes() if encoded else None
+
+    def close(self):
+        self.stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+        if self.capture is not None:
+            self.capture.release()
+
+
+def get_cv2_rotation_code(rotation):
+    """LeRobot's rotation value as the cv2 constant, or None for no rotation."""
+    import cv2
+
+    return {0: None, 90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180,
+            -90: cv2.ROTATE_90_COUNTERCLOCKWISE}[rotation]
+
+
+PAGE = """<!doctype html><meta charset=utf-8><title>SO-101 cameras</title>
+<style>
+ body{font:14px system-ui,sans-serif;margin:0;padding:20px;background:#111;color:#eee}
+ h1{font-size:16px;margin:0 0 4px}
+ p{margin:0 0 18px;color:#aaa}
+ .row{display:flex;flex-wrap:wrap;gap:16px}
+ .cam{background:#1c1c1c;border:1px solid #333;border-radius:10px;overflow:hidden;width:%(width)dpx}
+ .cam img{display:block;width:100%%;background:#000}
+ .bar{display:flex;align-items:center;gap:8px;padding:8px 10px;font-size:13px}
+ .n{font-weight:700;color:#7ab7ff}
+ .rot{margin-left:auto;display:flex;gap:4px}
+ .rot a{color:#ddd;text-decoration:none;border:1px solid #444;border-radius:5px;padding:2px 7px;font-size:12px}
+ .rot a.on{background:#7ab7ff;color:#111;border-color:#7ab7ff}
+ code{background:#000;padding:1px 5px;border-radius:4px;color:#9f9}
+</style>
+<h1>%(heading)s</h1>
+<p>%(hint)s</p>
+<div class=row>%(cameras)s</div>
+"""
+
+
+def build_page(streams, *, heading, hint, rotatable):
+    cards = []
+    for number, stream in enumerate(streams, 1):
+        buttons = ""
+        if rotatable:
+            links = "".join(
+                f'<a class="{"on" if stream.rotation == value else ""}" href="/rotate/{number}/{value}">{value}</a>'
+                for value in ROTATIONS)
+            buttons = f'<span class=rot>{links}</span>'
+        cards.append(
+            f'<div class=cam><img src="/stream/{number}" alt="camera {number}">'
+            f'<div class=bar><span class=n>[{number}]</span>'
+            f'<span>{model_name(stream.camera["card"])}</span>{buttons}</div></div>')
+    return (PAGE % {"width": PREVIEW_WIDTH // 2, "heading": heading, "hint": hint,
+                    "cameras": "".join(cards)}).encode("utf-8")
+
+
+def serve_preview(streams, *, port, heading, hint, rotatable=False):
+    """A local page showing every stream live, until Ctrl-C.
+
+    A page rather than a desktop window because LeRobot pins opencv-python-headless:
+    the cv2 in the course environment is built without any GUI backend, so
+    `cv2.imshow` raises rather than opening anything. The page also works unchanged
+    over an SSH port forward, which a window never could.
+    """
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass  # One line per JPEG would bury the instructions printed above.
+
+        def _stream(self, number):
+            stream = streams[number - 1]
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.end_headers()
+            try:
+                while True:
+                    jpeg = stream.jpeg()
+                    if jpeg is None:
+                        time.sleep(0.05)
+                        continue
+                    self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n")
+                    self.wfile.write(f"Content-Length: {len(jpeg)}\r\n\r\n".encode())
+                    self.wfile.write(jpeg + b"\r\n")
+                    time.sleep(1 / 30)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # The viewer closed the tab or reloaded.
+
+        def do_GET(self):
+            parts = [part for part in self.path.split("/") if part]
+            if not parts:
+                body = build_page(streams, heading=heading, hint=hint, rotatable=rotatable)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if parts[0] == "stream" and parts[1].isdigit() and 1 <= int(parts[1]) <= len(streams):
+                self._stream(int(parts[1]))
+                return
+            if rotatable and parts[0] == "rotate" and len(parts) == 3:
+                number, value = int(parts[1]), int(parts[2])
+                if 1 <= number <= len(streams) and value in ROTATIONS:
+                    streams[number - 1].rotation = value
+                    print(f"  [{number}] rotation {value}")
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.end_headers()
+                return
+            self.send_error(404)
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server.daemon_threads = True
+    print(f"\nOpen  http://127.0.0.1:{port}  in a browser.")
+    print("Press Ctrl-C here when you are done looking.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def start_streams(cameras):
+    """Every camera opened for the page; the ones that refuse are named, not fatal."""
+    streams = []
+    for number, camera in enumerate(cameras, 1):
+        stream = CameraStream(camera, rotation=camera.get("rotation", 0))
+        if stream.start():
+            streams.append(stream)
+        else:
+            print(f"  [{number}] could not be opened; close whatever is using it and run this again")
+    return streams
 
 
 def run_list(args):
@@ -253,12 +457,23 @@ def run_list(args):
     print("\nNow look at the pictures. The view looking down at the workbench is `top`;")
     print("the view from the gripper is `wrist`. Note their numbers, then copy those two")
     print("paths into cameras.json.")
-    if args.snapshot is None and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        print("\nNo display here, so nothing can be shown. Run this again with --snapshot out.jpg")
-        print("and open that file.")
+    if args.snapshot is not None:
+        print("")
+        write_snapshot(cameras, args.snapshot)
         return 0
-    print("")
-    show_frames(cameras, snapshot=args.snapshot)
+    streams = start_streams(cameras)
+    if not streams:
+        print("\nNo camera could be opened for viewing.")
+        return 1
+    try:
+        serve_preview(streams, port=args.port,
+                      heading="Which camera is which?",
+                      hint="Wave a hand in front of one lens: the panel that moves is that camera. "
+                           "The view of the whole workbench is <code>top</code>; the view from the "
+                           "gripper is <code>wrist</code>. Note their numbers.")
+    finally:
+        for stream in streams:
+            stream.close()
     return 0
 
 
@@ -390,13 +605,8 @@ def say_verdict(name, detail, cameras):
 
 # --- the viewer ---------------------------------------------------------------------
 
-def label(frame, lines, cv2, *, up_arrow=True, scale=0.8):
-    """Burn the caption into a copy of the frame, so what is shown carries its own identity.
-
-    The up arrow belongs to the orientation viewer, where the question is which edge of
-    the picture the model will see as up. While identifying cameras there is no such
-    question yet, and the arrow only competes with the number, so it is optional.
-    """
+def label(frame, lines, cv2, *, scale=0.6):
+    """Burn the caption into a copy of the frame, so a saved still carries its own identity."""
     import numpy
 
     canvas = numpy.ascontiguousarray(frame)
@@ -405,12 +615,6 @@ def label(frame, lines, cv2, *, up_arrow=True, scale=0.8):
         origin = (12, int(30 * scale / 0.8) + row * step)
         cv2.putText(canvas, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 5, cv2.LINE_AA)
         cv2.putText(canvas, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 2, cv2.LINE_AA)
-    if up_arrow:
-        # The only reliable way to say "this side is up in the data" is to point at it in
-        # the picture the model will receive.
-        top = (canvas.shape[1] // 2, 18)
-        cv2.arrowedLine(canvas, (top[0], top[1] + 46), top, (0, 0, 0), 8, tipLength=0.4)
-        cv2.arrowedLine(canvas, (top[0], top[1] + 46), top, (255, 255, 255), 3, tipLength=0.4)
     return canvas
 
 
@@ -424,99 +628,60 @@ def model_name(card):
     return parts[0] if parts and all(part == parts[0] for part in parts) else str(card)
 
 
-def compose(opened, cameras, rotations, chosen, *, height, cv2):
-    """One image holding both views, captioned with the identity each one carries into the data."""
-    import numpy
+def rotated_size(camera, rotation):
+    """width and height as they must be written for a given rotation.
 
-    panels = []
-    for name in opened:
-        frame = opened[name].read()
-        image = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        scale = height / image.shape[0]
-        image = cv2.resize(image, (max(1, int(image.shape[1] * scale)), height))
-        marker = ">" if name == chosen else " "
-        panels.append(label(image, [f"{marker}{name}", f"rotation {rotations[name]}",
-                                    f"{frame.shape[1]}x{frame.shape[0]}"], cv2))
-    return numpy.hstack(panels)
-
-
-def run_preview(cameras, *, height=480, snapshot=None):
-    """Both views side by side, with `r` to try the rotations and `s` to print the result.
-
-    The viewer is the acceptance step the numbers cannot cover. Wave a hand in front of one
-    camera: the view that moves is that camera, and the direction it moves in tells you
-    whether the image is mirrored end for end.
-
-    With `snapshot` it writes one captioned still instead of opening a window. That still is
-    what the lesson's camera record asks to keep: a picture of what each view actually saw,
-    dated, next to the mounting photograph.
+    LeRobot validates these against the frame after rotation, so 90 and -90 swap them.
     """
-    import cv2
+    width, height = camera["width"], camera["height"]
+    if (camera["rotation"] in (90, -90)) != (rotation in (90, -90)):
+        width, height = height, width
+    return width, height
 
-    if snapshot is None and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        print("No display is available, so the preview is skipped. Run with --no-preview to silence this.")
-        return 0
 
-    opened = {}
+def cameras_json(cameras, rotations):
+    """The cameras.json for the rotations settled on, ready to copy into the file."""
+    entries = {}
+    for name, rotation in zip(cameras, rotations):
+        camera = cameras[name]
+        width, height = rotated_size(camera, rotation)
+        entries[name] = {"type": "opencv", "index_or_path": camera["path"],
+                         "width": width, "height": height, "fps": camera["fps"],
+                         "fourcc": camera["fourcc"], "rotation": rotation}
+    return json.dumps(entries, indent=2)
+
+
+def run_preview(cameras, *, port=DEFAULT_PORT, snapshot=None):
+    """Both configured views live, with the four rotations one click apart.
+
+    This is the acceptance step the numbers cannot cover: a stream that opens is not yet
+    a stream that is the right way up, and rotation is part of the model's input.
+    """
+    entries = [{"card": name, "path": camera["path"], "rotation": camera["rotation"]}
+               for name, camera in cameras.items()]
+    if snapshot is not None:
+        return 0 if write_snapshot(entries, snapshot) else 1
+    streams = start_streams(entries)
+    if len(streams) != len(entries):
+        for stream in streams:
+            stream.close()
+        print("Not every configured camera could be opened, so orientation cannot be settled here.")
+        return 1
     try:
-        for name, camera in cameras.items():
-            opened[name] = open_camera(camera["path"], width=camera["width"], height=camera["height"],
-                                       fps=camera["fps"], fourcc=camera["fourcc"], rotation=camera["rotation"])
-        rotations = {name: camera["rotation"] for name, camera in cameras.items()}
-        chosen = list(cameras)[0]
-        if snapshot is not None:
-            image = compose(opened, cameras, rotations, chosen, height=height, cv2=cv2)
-            target = Path(snapshot)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if not cv2.imwrite(str(target), image):
-                raise RuntimeError(f"Could not write {target}")
-            print(f"Wrote {target} ({image.shape[1]}x{image.shape[0]}), both views as configured.")
-            return 0
-        window = "SO-101 cameras: r rotate selected, tab switch, s print, q quit"
-        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-        print("")
-        print("Viewer: `r` rotates the selected view, `tab` switches which view is selected,")
-        print("        `s` prints the cameras.json lines for what is on screen, `q` quits.")
-        print("Hold a hand in front of one camera and check that the view that moves is the one you expect.")
-        while True:
-            cv2.imshow(window, compose(opened, cameras, rotations, chosen, height=height, cv2=cv2))
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
-                break
-            if key == ord("\t"):
-                names = list(opened)
-                chosen = names[(names.index(chosen) + 1) % len(names)]
-            if key == ord("r"):
-                current = rotations[chosen]
-                new = ROTATIONS[(ROTATIONS.index(current) + 1) % len(ROTATIONS)]
-                # The camera is reopened rather than rotated in place: width and height swap
-                # at 90 and 270, and LeRobot validates them at connect time.
-                camera = cameras[chosen]
-                width, height_config = camera["width"], camera["height"]
-                if (current in (90, -90)) != (new in (90, -90)):
-                    width, height_config = height_config, width
-                opened[chosen].disconnect()
-                cameras[chosen] = {**camera, "width": width, "height": height_config, "rotation": new}
-                opened[chosen] = open_camera(camera["path"], width=width, height=height_config,
-                                             fps=camera["fps"], fourcc=camera["fourcc"], rotation=new)
-                rotations[chosen] = new
-                print(f"{chosen}: rotation {new}, now {width}x{height_config}")
-            if key == ord("s"):
-                print("")
-                print("cameras.json for what is on screen:")
-                print(json.dumps({name: {"type": "opencv", "index_or_path": camera["path"],
-                                         "width": camera["width"], "height": camera["height"],
-                                         "fps": camera["fps"], "fourcc": camera["fourcc"],
-                                         "rotation": camera["rotation"]}
-                                  for name, camera in cameras.items()}, indent=2))
+        serve_preview(streams, port=port,
+                      heading="Which way up is each image?",
+                      hint="Click a rotation until the picture looks right. The gripper should enter "
+                           "the wrist view from the bottom, and the workbench should sit square in the "
+                           "top view. Press Ctrl-C in the terminal when done.",
+                      rotatable=True)
     finally:
-        for camera in opened.values():
-            if camera.is_connected:
-                camera.disconnect()
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            pass
+        rotations = [stream.rotation for stream in streams]
+        for stream in streams:
+            stream.close()
+        for name, rotation in zip(cameras, rotations):
+            cameras[name] = {**cameras[name], "rotation": rotation}
+    print("cameras.json for what you settled on:")
+    print(cameras_json(cameras, rotations))
     return 0
 
 
@@ -569,7 +734,7 @@ def run_check(args):
         return 1
     if args.no_preview:
         return 0
-    return run_preview(cameras)
+    return run_preview(cameras, port=args.port)
 
 
 def main(argv=None):
@@ -577,14 +742,17 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="mode", required=True)
     listing = commands.add_parser("list", help="every camera that delivers frames, with one frame from each")
     listing.add_argument("--verbose", action="store_true", help="also print why each path was chosen")
-    listing.add_argument("--snapshot", help="write the frames to this file instead of opening a window")
+    listing.add_argument("--snapshot", help="write one still per camera to this file instead of serving a page")
+    listing.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"port for the viewing page (default {DEFAULT_PORT})")
     check = commands.add_parser("check", help="verify cameras.json, then show both views")
     check.add_argument("--cameras", default="cameras.json", help="the LeRobot camera configuration to verify")
     check.add_argument("--frames", type=int, default=90, help="frames per measurement (90 is about 3s at 30 FPS)")
     check.add_argument("--no-preview", action="store_true", help="stop after the verdict")
+    check.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"port for the viewing page (default {DEFAULT_PORT})")
     preview = commands.add_parser("preview", help="show both views without measuring")
     preview.add_argument("--cameras", default="cameras.json")
-    preview.add_argument("--snapshot", help="write one captioned still to this path instead of opening a window")
+    preview.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"port for the viewing page (default {DEFAULT_PORT})")
+    preview.add_argument("--snapshot", help="write one still per view to this path instead of serving a page")
     args = parser.parse_args(argv)
     try:
         if args.mode != "list" and version("lerobot") != LEROBOT_VERSION:
@@ -595,7 +763,7 @@ def main(argv=None):
             if args.frames < 2:
                 parser.error("at least two frames are needed to tell a moving stream from a frozen one")
             return run_check(args)
-        return run_preview(load_cameras_file(args.cameras), snapshot=args.snapshot)
+        return run_preview(load_cameras_file(args.cameras), port=args.port, snapshot=args.snapshot)
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         return 130
