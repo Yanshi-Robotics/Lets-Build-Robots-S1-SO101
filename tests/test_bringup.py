@@ -1299,6 +1299,49 @@ class CameraCheckTests(unittest.TestCase):
         self.assertEqual((reloaded["wrist"]["width"], reloaded["wrist"]["height"]),
                          (cameras.CAPTURE_WIDTH, cameras.CAPTURE_HEIGHT))
 
+    def test_switching_size_releases_the_camera_before_opening_it_again(self):
+        """A camera cannot be held open twice.
+
+        Opening the new capture before releasing the old one always fails, and the
+        failure reads as the camera refusing the size rather than as the bug it is.
+        """
+        events = []
+
+        class FakeCapture:
+            def __init__(self, tag):
+                self.tag = tag
+
+            def release(self):
+                events.append(f"release:{self.tag}")
+
+            def read(self):
+                return False, None
+
+        def fake_open(path, *, width=None, height=None):
+            events.append(f"open:{width}x{height}")
+            return FakeCapture(f"{width}x{height}")
+
+        stream = cameras.CameraStream({"path": "/dev/video0", "card": "cam"})
+        with patch.object(cameras, "open_for_preview", fake_open):
+            self.assertTrue(stream.start(640, 480))
+            events.clear()
+            self.assertTrue(stream.reopen(1280, 720))
+            self.assertEqual(events, ["release:640x480", "open:1280x720"])
+            self.assertEqual((stream.width, stream.height), (1280, 720))
+            stream.close()
+
+    def test_a_refused_size_leaves_the_camera_open_at_the_previous_one(self):
+        # Otherwise a size the hardware will not give turns that panel black for good.
+        def refusing_open(path, *, width=None, height=None):
+            return None if (width, height) == (9999, 9999) else object()
+
+        stream = cameras.CameraStream({"path": "/dev/video0", "card": "cam"})
+        stream.width, stream.height = 640, 480
+        with patch.object(cameras, "open_for_preview", refusing_open):
+            self.assertFalse(stream.reopen(9999, 9999))
+        self.assertIsNotNone(stream.capture)
+        self.assertEqual((stream.width, stream.height), (640, 480))
+
     def test_the_saved_file_matches_the_shape_the_lesson_prints(self):
         """The lesson shows this file so it can be typed by hand; the page writes the same shape.
 

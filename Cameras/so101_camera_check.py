@@ -336,6 +336,7 @@ class CameraStream:
     def __init__(self, camera, *, rotation=0):
         self.camera = camera
         self.rotation = rotation
+        self.width, self.height = CAPTURE_WIDTH, CAPTURE_HEIGHT
         self.capture = None
         self.frame = None
         self.lock = __import__("threading").Lock()
@@ -345,6 +346,7 @@ class CameraStream:
     def start(self, width=CAPTURE_WIDTH, height=CAPTURE_HEIGHT):
         import threading
 
+        self.width, self.height = width, height
         self.capture = open_for_preview(self.camera["path"], width=width, height=height)
         if self.capture is None:
             return False
@@ -356,6 +358,9 @@ class CameraStream:
         while not self.stop.is_set():
             with self.lock:
                 capture = self.capture
+            if capture is None:  # a reopen is in flight
+                time.sleep(0.02)
+                continue
             received, frame = capture.read()
             if not received:
                 time.sleep(0.05)
@@ -387,16 +392,25 @@ class CameraStream:
     def reopen(self, width, height):
         """Switch capture size without dropping the page's connections.
 
-        The reader thread keeps running against a replaced capture, so an open MJPEG
+        The old capture is released *before* the new one is opened: a camera cannot be
+        held open twice, so opening first would always fail and look like the camera
+        refusing the size. The reader thread tolerates the gap, so an open MJPEG
         response survives the change instead of every panel going blank.
+
+        A size the camera will not give leaves it reopened at the previous one, rather
+        than dark.
         """
-        capture = open_for_preview(self.camera["path"], width=width, height=height)
-        if capture is None:
-            return False
         with self.lock:
-            previous, self.capture, self.frame = self.capture, capture, None
+            previous, self.capture, self.frame = self.capture, None, None
         if previous is not None:
             previous.release()
+        capture = open_for_preview(self.camera["path"], width=width, height=height)
+        if capture is None:
+            with self.lock:
+                self.capture = open_for_preview(self.camera["path"], width=self.width, height=self.height)
+            return False
+        with self.lock:
+            self.capture, self.width, self.height = capture, width, height
         return True
 
     def close(self):
@@ -444,6 +458,9 @@ PAGE = """<!doctype html><meta charset=utf-8><title>SO-101 cameras</title>
  .rot{margin-left:auto}
  a.btn{color:#ddd;text-decoration:none;border:1px solid #444;border-radius:5px;padding:2px 7px;font-size:12px}
  a.btn.on{background:#7ab7ff;color:#111;border-color:#7ab7ff}
+ a.btn.rec{border-color:#5c8f5c}
+ a.btn.rec.on{border-color:#7ab7ff}
+ .why{color:#888;font-size:12px;max-width:60em;margin:-8px 0 18px}
  .lbl{color:#777;font-size:12px;align-self:center}
  .eye{border-top:1px solid #333;padding:10px;display:flex;gap:10px;align-items:center}
  .eye img{width:112px;height:112px;flex:none;border:1px solid #333;border-radius:4px}
@@ -454,6 +471,7 @@ PAGE = """<!doctype html><meta charset=utf-8><title>SO-101 cameras</title>
 <p class=hint>%(hint)s</p>
 <div class=bars><a class=go href="/save">Save %(file)s</a><span class=msg>%(message)s</span></div>
 <div class=bars><span class=lbl>capture size</span>%(sizes)s<span class=lbl>%(fill)s</span></div>
+<p class=why>%(why)s</p>
 <div class=row>%(cameras)s</div>
 """
 
@@ -488,11 +506,19 @@ class PreviewState:
                 self.roles[number] = stream.camera["role"]
 
     def set_capture_size(self, width, height):
-        """Every camera changes together: recording needs one size across all views."""
-        for stream in self.streams:
-            if not stream.reopen(width, height):
-                self.message = "A camera refused that size; nothing was changed."
-                return
+        """Every camera changes together, or none does.
+
+        Recording needs one size across views, so a half-applied change would leave the
+        two panels disagreeing about what is being recorded.
+        """
+        previous = self.sensor
+        for index, stream in enumerate(self.streams):
+            if stream.reopen(width, height):
+                continue
+            for done in self.streams[:index]:
+                done.reopen(*previous)
+            self.message = f"A camera would not give {width}x{height}; nothing was changed."
+            return
         self.sensor = (width, height)
         self.message = ""
 
@@ -569,12 +595,18 @@ def build_page(state, *, heading, hint, rotatable, assignable):
             f'<p>What a pi0 policy receives: this frame padded into 224x224. '
             f'The black bars are pixels the model never gets.</p></div></div>')
     sizes = "".join(
-        f'<a class="btn {"on" if (width, height) == tuple(state.sensor) else ""}" '
-        f'href="/size/{width}/{height}">{width}x{height}</a>'
+        f'<a class="btn {"rec " if (width, height) == (CAPTURE_WIDTH, CAPTURE_HEIGHT) else ""}'
+        f'{"on" if (width, height) == tuple(state.sensor) else ""}" '
+        f'href="/size/{width}/{height}">{width}x{height}'
+        f'{" &#9733;" if (width, height) == (CAPTURE_WIDTH, CAPTURE_HEIGHT) else ""}</a>'
         for width, height in state.sizes) or '<span class=lbl>(could not be read from the hardware)</span>'
+    why = (f"&#9733; {CAPTURE_WIDTH}x{CAPTURE_HEIGHT} is what this course records at: LeRobot's own recording "
+           f"examples and the main SO-101 guides use this size. A larger frame is not free — the dataset grows, "
+           f"training slows, and ACT's backbone does not need the extra detail. Being 4:3 it also loses less to "
+           f"padding in the 224 square than a 16:9 frame does.")
     return (PAGE % {"width": PANEL_WIDTH, "heading": heading, "hint": hint,
                     "file": state.save_path.name, "message": state.message,
-                    "sizes": sizes, "fill": fill_note(*state.sensor),
+                    "sizes": sizes, "fill": fill_note(*state.sensor), "why": why,
                     "cameras": "".join(cards)}).encode("utf-8")
 
 
