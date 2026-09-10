@@ -21,9 +21,9 @@
 
 - **`Bringup/`**：`so101_bus_check.py` 读一条总线上的六台电机；`so101_calibrate.py` 记录每个关节的中位和活动范围。第 6 课用。
 - **`Cameras/`**：`so101_camera_check.py` 列出能出图的摄像头、给出各自该用的稳定路径，再把它们实时显示在一个本地网页上，认出哪台装在哪、把画面转正、存进 `cameras.json`；`check` 会先测出两台相机单开与同开的速率。`so101_policy_view.py` 接着把同样的实时画面按 ACT、π₀、π₀.₅、SmolVLA 各自的预处理显示出来。第 9 课用。
-- **`IK/`**：`so101_cartesian_demo.py` 下载锁定模型，并用 LeRobot 自带的 IK 解一步笛卡尔位移；`so101_visual_control.py` 先自检，再打开网页显示机械臂当前姿态且不上电，点击启用某个模式才上电：LeRobot 的键盘设备、示教臂、或拖出目标交给 IK 求解。`so101_ee_teleop.py` 是键盘控制的无界面版本，能跑起来的最小形态。第 8 课用。三个文件必须放在同一个文件夹：两个控制程序从第一个里取模型相关的函数。
+- **`IK/`**：`so101_cartesian_demo.py` 装着锁定模型、本课自己的 placo 伺服求解器、机械臂本体，以及另外两个程序共用的那一条控制循环；单独运行时它下载模型，并在模型上走一次笛卡尔位移。`so101_visual_control.py` 先自检，再打开网页显示机械臂当前姿态且不上电，点击启用某个模式才上电：拖动手柄机械臂实时跟随、方向键挪的是同一个手柄、或者示教臂逐关节直通不经过求解器。加 `--model-only` 可以在不接机械臂的情况下打开同一个页面。`so101_ee_teleop.py` 是没有网页的方向键版本，能跑起来的最小形态。第 8 课用。三个文件必须放在同一个文件夹：两个控制程序的一切都从第一个里取。
 - **`Teleop/`**：`so101_teleop_log.py` 打印两只臂的保护与校准寄存器、把两只臂对着读，并给 `lerobot-record` 录下的数据打分。遥操作本身仍然用官方的 `lerobot-teleoperate`。第 7 课用。
-- **`tests/`**：101 条测试，用假硬件跑这些程序。
+- **`tests/`**：98 条测试，用假硬件跑这些程序。
 - **`Teleop/logs/`**（不进 git）：诊断程序每次运行一份调试日志，只留最近 20 份，`lerobot-record` 录下的数据也放这里。出问题时把最新那份发出来。
 - **`tools/`**：`build_control_poses.py` 计算课程原理图里画的姿态。
 
@@ -74,7 +74,7 @@ python IK/so101_cartesian_demo.py preview --model-dir models/so101 --delta-mm 0 
 改过程序，提交前先跑测试：
 
 ```bash
-python tests/test_bringup.py                            # 只用假硬件，末行是 OK (skipped=17)
+python tests/test_bringup.py                            # 只用假硬件，末行是 OK (skipped=18)
 python tests/test_bringup.py --model-dir models/so101   # 加上数值 IK 检查，末行是 OK
 ```
 

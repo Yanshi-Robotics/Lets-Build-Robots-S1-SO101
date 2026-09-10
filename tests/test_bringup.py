@@ -42,52 +42,95 @@ policy_view = load("policy_view", ROOT / "Cameras/so101_policy_view.py")
 load("so101_ee_teleop", ROOT / "IK/so101_ee_teleop.py")
 
 
-class EndEffectorPipelineTests(unittest.TestCase):
-    """The pipeline these programs assemble is LeRobot's; these tests pin how it is assembled."""
+class SolverTests(unittest.TestCase):
+    """The solver is this course's own placo servo. These pin why, and what it may do."""
 
-    def test_the_five_steps_are_lerobots_own_and_in_the_documented_order(self):
+    def test_the_solver_is_placos_and_not_lerobots(self):
+        # 2026-09-10. LeRobot 0.6.1's RobotKinematics.inverse_kinematics takes a single Newton
+        # step and never iterates -- a target 10 cm away came back as joints still 149.7 mm short
+        # -- and it omits update_kinematics() before solving, so the same inputs gave four
+        # different answers in four calls. Upstream fixed only the first, after 0.6.1 shipped,
+        # and 0.6.1 is still the newest release. ⛔ Do not route the control path back through it.
         source = (ROOT / "IK/so101_cartesian_demo.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
-        built = next(node for node in ast.walk(tree)
-                     if isinstance(node, ast.FunctionDef) and node.name == "build_robot_action_processor")
-        imported = {alias.name for node in ast.walk(built) if isinstance(node, ast.ImportFrom)
-                    for alias in node.names}
-        steps = [node.func.id for node in ast.walk(built)
-                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                 and node.func.id in imported and node.func.id != "RobotProcessorPipeline"]
-        self.assertEqual(steps, ["MapDeltaActionToRobotActionStep", "EEReferenceAndDelta",
-                                 "EEBoundsAndSafety", "GripperVelocityToJoint",
-                                 "InverseKinematicsEEToJoints"])
-        modules = {node.module for node in ast.walk(built) if isinstance(node, ast.ImportFrom)}
-        self.assertTrue(all(module.startswith("lerobot.") for module in modules), modules)
+        imported = {alias.name for node in ast.walk(tree)
+                    if isinstance(node, (ast.Import, ast.ImportFrom)) for alias in node.names}
+        self.assertIn("placo", imported)
+        self.assertNotIn("RobotKinematics", imported, "the control path is not routed back to it")
+        self.assertFalse([node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                          and node.name == "build_robot_action_processor"])
 
     def test_position_only_ik_because_the_arm_has_five_joints(self):
-        # InverseKinematicsEEToJoints' own docstring: 0.0 is position-only IK, for under-actuated
-        # arms like this one. Anything else asks a 5-DOF arm to match an orientation it cannot.
+        # ⚠️ Measured 2026-09-10, asking for (0.20, 0.10, 0.15) m while holding the start
+        # orientation: 119 mm short at weight 0.1, 36 mm short at 0.01, exactly on it at 0.0.
+        # The handle carries no rotation, so the task is switched off rather than weighted down.
+        self.assertEqual(demo.ORIENTATION_WEIGHT, 0.0)
         source = (ROOT / "IK/so101_cartesian_demo.py").read_text(encoding="utf-8")
-        self.assertIn("orientation_weight=0.0", source)
-        self.assertNotIn("orientation_weight=0.01", source)
+        self.assertIn('mask_dof("wrist_roll")', source,
+                      "position-only IK leaves the roll axis free to walk into a limit")
 
-    def test_no_solver_iteration_of_our_own(self):
-        # 2026-09-09: the previous version iterated the official step until its own residual
-        # criterion was met. One call per frame is the official design; the loop rate is the
-        # convergence. A hand-rolled loop is how a program stops being the official one.
+    def test_the_control_path_takes_one_solver_step_a_tick(self):
+        # ⭐ servo_step is a servo, not a solve: one step, then the next tick looks again. The
+        # iterating version exists (solve_pose) and is model-only, because a converged answer is
+        # a whole journey collapsed into one command -- the shape of the 2026-09-08 incident.
         source = (ROOT / "IK/so101_cartesian_demo.py").read_text(encoding="utf-8")
-        self.assertNotIn("IK_MAX_ITERATIONS", source)
         tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.For, ast.While)):
-                calls = [child.func.attr for child in ast.walk(node)
-                         if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)]
-                self.assertNotIn("inverse_kinematics", calls, "IK is called inside a loop")
+        step = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.FunctionDef) and node.name == "servo_step")
+        self.assertFalse([node for node in ast.walk(step) if isinstance(node, (ast.For, ast.While))],
+                         "servo_step must not loop")
+        loop = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.FunctionDef) and node.name == "control_loop")
+        called = {node.func.attr for node in ast.walk(loop)
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+        self.assertIn("servo_step", called)
+        self.assertNotIn("solve_pose", called, "the control loop never converges a whole journey")
 
-    def test_neither_program_adds_a_target_clamp(self):
-        # 2026-09-08: --robot.max_relative_target=2 was read as a speed limit. On a proportional
-        # servo it clamps the goal-to-present gap, which is what makes the force, so it capped
-        # output at about a tenth and the shoulder could not lift its own weight.
-        for name in ("IK/so101_ee_teleop.py", "IK/so101_visual_control.py"):
-            source = (ROOT / name).read_text(encoding="utf-8")
-            self.assertNotIn("max_relative_target=", source, name)
+    def test_the_command_can_never_lead_the_arm_by_more_than_its_budget(self):
+        # ⭐ This bound is the force budget. Because the command is re-seeded from the
+        # measurement every tick and the solver is velocity limited, the gap between what a
+        # motor is told and where it is cannot exceed one tick of travel, whatever the target.
+        if not args.model_dir:
+            self.skipTest("needs the pinned model")
+        import numpy
+        servo, _limits = demo.load_servo(str(args.model_dir))
+        budget = servo.max_joint_step_deg
+        start = {**dict(zip(demo.JOINTS, demo.PREVIEW_JOINTS_DEG)), "gripper": 0.0}
+        far = servo.fk(start).copy()
+        far[:3, 3] = numpy.array(demo.DEFAULT_BOUNDS_M["max"])
+        commanded = servo.servo_step(start, far)
+        worst = max(abs(commanded[name] - start[name]) for name in demo.JOINTS)
+        self.assertLessEqual(worst, budget + 1e-6, "one tick asked for more than its budget")
+
+    def test_the_speed_and_the_force_are_two_different_numbers(self):
+        # ⛔ The invariant this whole rewrite rests on. MAX_JOINT_SPEED_RAD_S decides how far a
+        # command may lead the arm, and on an STS3215 that lead is the only thing that makes
+        # force: upstream issue #3400 measures 2.3 deg of steady-state error at Feetech's P=32
+        # and 5.5 deg at LeRobot's default P=16. A budget below that cannot hold the arm up, let
+        # alone move it -- which is exactly the fault this replaced.
+        budget = math.degrees(demo.MAX_JOINT_SPEED_RAD_S * demo.CONTROL_DT)
+        self.assertGreater(budget, 2.3, "below the error measured at P=32 the arm cannot move")
+        self.assertEqual(demo.SERVO_P_COEFFICIENT, 32, "LeRobot's default of 16 doubles that error")
+        self.assertGreater(demo.REF_LINEAR_SPEED_MPS, 0)
+        self.assertLess(demo.REF_LINEAR_SPEED_MPS, 0.5, "a teaching arm travels slowly")
+
+    def test_a_joint_the_model_cannot_express_is_named_with_the_way_back(self):
+        # ⛔ Reproduced 2026-09-10 from the 2026-09-08 hardware log: this follower parks at
+        # shoulder_lift -103.8 and wrist_flex -100.2, outside the pinned model. placo clamps its
+        # answer into that range, so replaying the parked pose through a solve moves four joints
+        # by up to 5.8 deg before anyone has asked for anything.
+        limits = {"shoulder_pan": (-110.0, 110.0), "shoulder_lift": (-100.0, 100.0),
+                  "elbow_flex": (-96.83, 96.83), "wrist_flex": (-95.0, 95.0),
+                  "wrist_roll": (-157.0, 163.0)}
+        parked = dict(zip(demo.JOINTS, (-5.36, -103.78, 97.10, -100.18, 8.84)))
+        complaints = demo.joints_outside_the_model(parked, limits)
+        self.assertEqual(len(complaints), 3)
+        named = " ".join(complaints)
+        for joint in ("shoulder_lift", "elbow_flex", "wrist_flex"):
+            self.assertIn(joint, named)
+        self.assertIn("Move it at least", named)
+        self.assertEqual(demo.joints_outside_the_model(
+            dict(zip(demo.JOINTS, demo.PREVIEW_JOINTS_DEG)), limits), [])
 
     def test_bounds_must_be_three_finite_ordered_metres(self):
         good = demo.bounds_dict(demo.DEFAULT_BOUNDS_M["min"], demo.DEFAULT_BOUNDS_M["max"])
@@ -104,104 +147,90 @@ class EndEffectorPipelineTests(unittest.TestCase):
         for axis in range(3):
             self.assertGreater(demo.DEFAULT_BOUNDS_M["min"][axis], reach_min[axis])
             self.assertLess(demo.DEFAULT_BOUNDS_M["max"][axis], reach_max[axis])
-        self.assertGreaterEqual(demo.DEFAULT_BOUNDS_M["min"][2], 0.0, "the box must not reach below the base plane")
-
-    def test_one_frame_asks_for_one_step_at_most(self):
-        self.assertGreaterEqual(demo.MAX_EE_STEP_M, demo.EE_STEP_M)
-        self.assertEqual(demo.EE_STEP_M, demo.STEP_MM / 1000)
+        self.assertGreaterEqual(demo.DEFAULT_BOUNDS_M["min"][2], 0.0,
+                                "the box must not reach below the base plane")
 
 
-class ViserPageTests(unittest.TestCase):
-    """The page is one teleoperator with three modes; only the mode picks who fills in a frame."""
+class PageAndKeyboardTests(unittest.TestCase):
+    """The browser page holds what the operator asked for. ⛔ It never talks to the arm."""
 
-    def page(self, keyboard=None, leader=None, kinematics=None, pipeline=None):
-        """The page without a browser. `connect()` is exercised separately, on a real server."""
-        return visual.ViserControlPage(
-            visual.ViserTeleopConfig(id="t", model_dir="."), kinematics, pipeline,
-            keyboard=keyboard, leader=leader)
+    def test_the_page_does_not_touch_the_arm(self):
+        # ⛔ Viser callbacks run on the web server's own threads. Two threads sharing one serial
+        # bus corrupt each other's packets in ways that look like a hardware fault, so every
+        # callback writes down a wish and returns; the control loop is the only caller.
+        tree = ast.parse((ROOT / "IK/so101_visual_control.py").read_text(encoding="utf-8"))
+        page = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.ClassDef) and node.name == "ViserPage")
+        called = {node.func.attr for node in ast.walk(page)
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+        for forbidden in ("send_action", "sync_read", "sync_write", "disable_torque", "read"):
+            self.assertNotIn(forbidden, called, "the page reached for the arm")
 
-    def test_the_page_reports_what_a_leader_arm_reports(self):
-        # The identity processors carry the action through untouched, so its shape has to be the
-        # one SO101Follower.send_action consumes: one target per motor.
-        from lerobot.teleoperators.so_leader import SO101Leader
-        self.assertEqual(sorted(self.page().action_features),
-                         sorted(f"{name}.pos" for name in demo.MOTORS))
-        self.assertEqual(SO101Leader.action_features.fget.__annotations__["return"],
-                         dict[str, type])
-
-    def test_the_page_is_a_lerobot_teleoperator(self):
-        from lerobot.teleoperators import Teleoperator
-        self.assertTrue(issubclass(type(visual.build(
-            visual.ViserTeleopConfig(id="t", model_dir="."), None, None)), Teleoperator))
-
-    def test_a_distant_target_still_asks_for_one_step(self):
-        step = 0.002
-        far = visual.steps_towards([10.0, -10.0, 10.0], [0, 0, 0], step)
-        self.assertTrue((abs(far) <= visual.MAX_UNITS_PER_FRAME).all())
-        self.assertAlmostEqual(float(visual.steps_towards([step / 2, 0, 0], [0, 0, 0], step)[0]), 0.5)
-        for noisy in ([1e-12, 0, 0], [float("nan"), 0, 0], [float("inf"), 0, 0]):
-            self.assertEqual(list(visual.steps_towards(noisy, [0, 0, 0], step)), [0.0, 0.0, 0.0])
-        with self.assertRaises(ValueError):
-            visual.steps_towards([0, 0, 0], [0, 0, 0], 0.0)
-
-    def test_the_gripper_command_follows_lerobots_own_direction(self):
-        # 2026-09-09: this was inverted, and a slider set to 80 drove the gripper to 0.
-        # GripperVelocityToJoint maps command 0 (close) to a positive step, because "joint
-        # position increases on close" -- so reaching a larger figure means commanding CLOSE.
-        self.assertEqual(visual.gripper_command(20.0, 80.0), visual.GRIPPER_CLOSE)
-        self.assertEqual(visual.gripper_command(80.0, 20.0), visual.GRIPPER_OPEN)
-        self.assertEqual(visual.gripper_command(50.0, 50.0), visual.GRIPPER_HOLD)
-        self.assertEqual(visual.gripper_command(50.0, 50.0 + visual.GRIPPER_TOLERANCE_PCT),
-                         visual.GRIPPER_HOLD, "a tolerance under one frame would oscillate")
-        self.assertEqual(visual.gripper_command(None, 80.0), visual.GRIPPER_HOLD)
-        self.assertEqual(visual.gripper_command(50.0, float("nan")), visual.GRIPPER_HOLD)
+    def test_a_released_key_no_longer_cancels_one_still_held(self):
+        # ⚠️ Upstream, open as PR #3947: _drain_pressed_keys records a released key as False
+        # instead of dropping it, and get_action then walks that dictionary assigning one axis at
+        # a time -- so a key released a moment ago writes its zero over the key still held.
+        from pynput import keyboard as keys
+        from lerobot.teleoperators.keyboard import KeyboardEndEffectorTeleop
+        device = demo.keyboard_device("t")
+        device._on_press(keys.Key.up)
+        device._on_press(keys.Key.down)
+        device._on_release(keys.Key.down)
+        upstream = KeyboardEndEffectorTeleop(device.config)
+        upstream.event_queue, upstream.current_pressed = device.event_queue, {}
+        self.assertEqual(demo.keyboard_device("t").__class__.__mro__[1],
+                         KeyboardEndEffectorTeleop, "it is still LeRobot's device underneath")
+        held = KeyboardEndEffectorTeleop.get_action.__wrapped__(device)
+        self.assertEqual(float(held["delta_y"]), -1.0,
+                         "the still-held arrow key must survive the released one")
 
     def test_a_released_left_ctrl_is_not_a_gripper_command(self):
-        # ⚠️ Upstream, reproduced 2026-09-09: KeyboardEndEffectorTeleop computes `int(val) - 1`
-        # for ctrl_l, so releasing it reports -1 rather than 1, and the key stays in
-        # current_pressed as False for the rest of the session. GripperVelocityToJoint maps -1 to
-        # twice the close command, so the gripper would run one way at 2 % of travel per frame.
+        # ⚠️ Upstream, reproduced 2026-09-09: ctrl_l computes `int(val) - 1`, so releasing it
+        # reports -1 rather than 1 -- a fourth value where the protocol has three.
         from pynput import keyboard as keys
         from lerobot.teleoperators.keyboard import KeyboardEndEffectorTeleop, KeyboardEndEffectorTeleopConfig
         device = KeyboardEndEffectorTeleop(KeyboardEndEffectorTeleopConfig(id="t", use_gripper=True))
         device._on_press(keys.Key.ctrl_l)
         device._drain_pressed_keys()
         held = KeyboardEndEffectorTeleop.get_action.__wrapped__(device)
-        self.assertEqual(visual.gripper_from_keyboard(held), visual.GRIPPER_CLOSE)
+        self.assertEqual(demo.gripper_from_keyboard(held), demo.GRIPPER_CLOSE)
         device._on_release(keys.Key.ctrl_l)
         device._drain_pressed_keys()
         released = KeyboardEndEffectorTeleop.get_action.__wrapped__(device)
         self.assertEqual(released["gripper"], -1, "the upstream behaviour this guards against")
-        self.assertEqual(visual.gripper_from_keyboard(released), visual.GRIPPER_HOLD)
-        for command in (visual.GRIPPER_CLOSE, visual.GRIPPER_HOLD, visual.GRIPPER_OPEN):
-            self.assertEqual(visual.gripper_from_keyboard({"gripper": command}), command)
-        self.assertEqual(visual.gripper_from_keyboard({}), visual.GRIPPER_HOLD)
+        self.assertEqual(demo.gripper_from_keyboard(released), demo.GRIPPER_HOLD)
+        self.assertEqual(demo.gripper_from_keyboard({}), demo.GRIPPER_HOLD)
 
     def test_the_page_says_which_keys_it_believes_are_down(self):
         # A keyboard that reaches nothing looks exactly like a program that does nothing.
-        self.assertEqual(visual.held_keys_text({}), "no key held")
-        self.assertEqual(visual.held_keys_text({"Key.up": True, "Key.down": False}), "held: `up`")
+        self.assertEqual(demo.keys_held({}), "")
+        self.assertEqual(demo.keys_held({"delta_y": -1.0}), "y")
+        self.assertIn("close", demo.keys_held({"gripper": demo.GRIPPER_CLOSE}))
 
-    def test_the_leader_panel_shows_the_gap_joint_by_joint(self):
-        leader = {f"{name}.pos": 10.0 for name in demo.MOTORS}
-        follower = {f"{name}.pos": 7.5 for name in demo.MOTORS}
-        text = visual.following_text(leader, follower)
-        self.assertEqual(text.count("diff"), len(demo.MOTORS))
-        self.assertIn("+2.5", text)
-        self.assertEqual(visual.following_text({}, follower), "No leader reading.")
+    def test_the_arrow_keys_move_the_target_inside_the_workspace(self):
+        # ⭐ The keys move the target, not the arm: an absolute pose this program owns, which is
+        # why nothing here has to integrate anything from a measurement.
+        bounds = demo.bounds_dict((0.0, -0.2, 0.0), (0.4, 0.2, 0.4))
+        moved = demo.handle_after_keys((0.2, 0.0, 0.2), {"delta_x": 1.0}, bounds, 0.001)
+        self.assertAlmostEqual(float(moved[0]), 0.201)
+        clamped = demo.handle_after_keys((0.4, 0.0, 0.2), {"delta_x": 1.0}, bounds, 0.001)
+        self.assertAlmostEqual(float(clamped[0]), 0.4, msg="the box is a hard edge for the target")
 
-    def test_the_visual_joint_mapping_uses_names_radians_and_the_reported_figure(self):
+    def test_the_visual_joint_mapping_uses_names_and_radians(self):
+        # ⛔ get_actuated_joint_names() is ordered by the URDF's topology, which is the reverse
+        # of the bus order. A vector assembled by position draws a plausible arm in a wrong pose.
         names = ("gripper", "wrist_roll", "wrist_flex", "elbow_flex", "shoulder_lift", "shoulder_pan")
         travel = (-0.2, 1.7)
-        values = visual.viewer_configuration(names, (10, -20, 30, -40, 50), 0, travel)
+        degrees = dict(zip(demo.JOINTS, (10, -20, 30, -40, 50)))
+        values = visual.viewer_configuration(names, {**degrees, "gripper": 0}, travel)
         self.assertAlmostEqual(values[names.index("shoulder_pan")], math.radians(10))
         self.assertAlmostEqual(values[names.index("wrist_roll")], math.radians(50))
         self.assertAlmostEqual(values[names.index("gripper")], travel[0])
         self.assertAlmostEqual(
-            visual.viewer_configuration(names, (0, 0, 0, 0, 0), 100, travel)[names.index("gripper")],
+            visual.viewer_configuration(names, {**degrees, "gripper": 100}, travel)[names.index("gripper")],
             travel[1])
         with self.assertRaises(ValueError):
-            visual.viewer_configuration(("shoulder_pan",), (10, -20, 30, -40, 50), 0, travel)
+            visual.viewer_configuration(("shoulder_pan",), {**degrees, "gripper": 0}, travel)
 
     def test_the_gripper_travel_is_read_from_the_model_not_written_down(self):
         # ⚠️ Which end is open has not been watched on hardware, so nothing claims it. This only
@@ -212,19 +241,6 @@ class ViserPageTests(unittest.TestCase):
         self.assertLess(low, high)
         self.assertNotIn("GRIPPER_URDF_RANGE_RAD",
                          (ROOT / "IK/so101_visual_control.py").read_text(encoding="utf-8"))
-
-    def test_the_display_tap_returns_the_action_untouched(self):
-        seen = []
-        action = {"shoulder_pan.pos": 1.0}
-        observation = {f"{name}.pos": 0.0 for name in demo.MOTORS}
-        tap = visual.display_tap(SimpleNamespace(observe=seen.append))
-        self.assertEqual(tap((dict(action), observation)), action)
-        self.assertEqual(seen, [observation])
-
-    def test_a_page_with_no_arm_reading_yet_commands_nothing(self):
-        # Frame one runs before the display tap, so the page is seeded from the observation the
-        # caller already read. Until then it must ask for nothing at all.
-        self.assertEqual(self.page().get_action(), {})
 
     def test_the_page_binds_loopback_only_and_needs_an_explicit_port(self):
         self.assertEqual(visual.LOOPBACK, "127.0.0.1")
@@ -258,18 +274,28 @@ class ProgramShapeTests(unittest.TestCase):
     def test_the_page_keeps_holding_when_the_program_stops(self):
         # 2026-09-09, Jeff: an arm under IK has to stay held, or it drops at the end of a move.
         # disable_torque_on_disconnect defaults to True, which releases every motor on exit.
-        source = (ROOT / "IK/so101_visual_control.py").read_text(encoding="utf-8")
-        self.assertIn("disable_torque_on_disconnect=False", source)
+        # ⭐ 2026-09-10: the arm itself moved into the shared module, so that is where the
+        # setting lives now. The notice stayed with the program that prints it.
+        self.assertIn("disable_torque_on_disconnect=False",
+                      (ROOT / "IK/so101_cartesian_demo.py").read_text(encoding="utf-8"))
         self.assertIn("Cutting DC power", visual.SAFETY_NOTICE)
         self.assertIn("--release-torque", visual.SAFETY_NOTICE)
 
-    def test_no_control_loop_of_our_own(self):
-        # Every frame comes from LeRobot's teleop_loop. A while loop around send_action here
-        # would be a second control path with none of its timing or its stop behaviour.
+    def test_there_is_exactly_one_control_loop_and_both_programs_share_it(self):
+        # ⚠️ Reversed on 2026-09-10, deliberately. This used to require that every frame came
+        # from LeRobot's teleop_loop. It cannot any more: teleop_loop exists to carry a
+        # teleoperator's action through identity processors, and the thing that made the arm
+        # unable to move was the target those processors were handed. Owning the loop is what
+        # lets the target be an absolute pose walked towards at a set speed.
+        # ⛔ What replaces the old rule: the loop lives in the shared module and is imported by
+        # both programs. A loop copied into either of them is a loop that is right in one place.
+        shared = (ROOT / "IK/so101_cartesian_demo.py").read_text(encoding="utf-8")
+        self.assertIn("def control_loop(", shared)
         for name in ("IK/so101_ee_teleop.py", "IK/so101_visual_control.py"):
-            tree = ast.parse((ROOT / name).read_text(encoding="utf-8"))
-            self.assertIn("teleop_loop", {node.func.id for node in ast.walk(tree)
-                                          if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)})
+            source = (ROOT / name).read_text(encoding="utf-8")
+            self.assertNotIn("def control_loop(", source, f"{name} has a loop of its own")
+            self.assertIn("control_loop(", source, f"{name} does not use the shared loop")
+            tree = ast.parse(source)
             for node in ast.walk(tree):
                 if isinstance(node, (ast.For, ast.While)):
                     calls = {child.func.attr for child in ast.walk(node)
@@ -281,22 +307,27 @@ class ProgramShapeTests(unittest.TestCase):
         # keyboard existed. A silent input device then looked exactly like a dead program, with
         # the arm live the whole time.
         source = (ROOT / "IK/so101_ee_teleop.py").read_text(encoding="utf-8")
-        self.assertLess(source.index("teleop.connect()"), source.index("robot.connect()"))
-        self.assertLess(source.index("wait_for_a_key("), source.rindex("robot.connect()"))
+        # ⭐ Torque now arrives inside the shared loop, the first time a mode is enabled, so the
+        # thing to be before is the loop rather than a connect() this file no longer calls.
+        self.assertLess(source.index("teleop.connect()"), source.index("control_loop("))
+        self.assertLess(source.index("wait_for_a_key("), source.index("control_loop("))
 
     def test_the_goal_is_parked_before_a_single_motor_is_powered(self):
         # 2026-09-09, third attempt on hardware. An unpowered SO-101 falls onto its shoulder stop
         # and stays there, so refusing to start from a stop refused the only pose the arm has.
         # The hazard was never the stop: it is torque arriving while Goal_Position is somewhere
         # else. connect() never writes a goal, and a DC power cycle leaves every motor holding 0.
+        shared = (ROOT / "IK/so101_cartesian_demo.py").read_text(encoding="utf-8")
+        hold = shared[shared.index("    def hold(self, degrees):", shared.index("class LiveArm")):]
+        self.assertLess(hold.index("park_the_goal"), hold.index("robot.connect()"))
+        self.assertLess(hold.index("robot.connect()"), hold.index("goal_diverged"))
         for name in ("IK/so101_ee_teleop.py", "IK/so101_visual_control.py"):
-            source = (ROOT / name).read_text(encoding="utf-8")
-            self.assertIn("read_pose_before_power", source, name)
-            self.assertLess(source.index("park_the_goal"), source.index("robot.connect()"), name)
-            self.assertLess(source.index("robot.connect()"), source.index("goal_diverged"), name)
-        # placo does not clamp an out-of-limit joint, so a pose past the model needs no refusal.
-        self.assertNotIn("joints_outside_the_model",
-                         (ROOT / "IK/so101_cartesian_demo.py").read_text(encoding="utf-8"))
+            self.assertIn("read_before_power", (ROOT / name).read_text(encoding="utf-8"), name)
+        # ⚠️ Reversed 2026-09-10. This used to assert the opposite, on the belief that placo does
+        # not clamp an out-of-limit joint. It does: replaying the 2026-09-08 parked pose through
+        # a solve moves four joints by up to 5.8 deg with nothing commanded, because the solver
+        # clamps its answer into the model's range. The solving modes refuse that pose instead.
+        self.assertIn("joints_outside_the_model", shared)
 
     def test_the_encoder_resolution_is_lerobots_not_ours(self):
         # Every stop distance depends on this. A copy of the number here is a second source of
@@ -330,7 +361,7 @@ class ProgramShapeTests(unittest.TestCase):
 
     def test_a_stop_is_reported_but_never_refused(self):
         source = (ROOT / "IK/so101_visual_control.py").read_text(encoding="utf-8")
-        body = source[source.index("def self_check("):source.index("def read_only_display(")]
+        body = source[source.index("def self_check("):source.index("def run(args):")]
         after_stop = body[body.index("joints_on_a_stop"):]
         self.assertNotIn("raise CheckFailed", after_stop[:after_stop.index('report("joint travel"')])
 
@@ -365,13 +396,19 @@ class ProgramShapeTests(unittest.TestCase):
             return
         # ⭐ Reaching past the model is safe to compute with: placo does not clamp, so forward
         # kinematics for an out-of-limit joint is the pose the arm is really in.
-        kinematics, limits = demo.load_kinematics(args.model_dir)
+        servo, limits = demo.load_servo(args.model_dir)
         for name, (low, high) in limits.items():
             self.assertGreater(travel[name], high, f"{name}: this arm reaches past the model")
             self.assertLess(-travel[name], low, name)
-        kinematics.forward_kinematics(__import__("numpy").array([0.0, -103.6, 97.0, 0.0, 0.0]))
-        self.assertAlmostEqual(math.degrees(kinematics.robot.get_joint("shoulder_lift")), -103.6,
-                               places=3, msg="placo silently clamping would falsify every pose")
+        # ⭐ Forward kinematics never clamps, because saying where the arm really is is its job.
+        # ⚠️ The solver is the opposite: its joint limits are hard constraints, so `servo_step`
+        # pulls its seed inside them rather than raise QPError on the pose the arm parks in.
+        past = {**dict(zip(demo.JOINTS, (0.0, -103.6, 97.0, 0.0, 0.0))), "gripper": 0.0}
+        servo.fk(past)
+        self.assertAlmostEqual(math.degrees(servo.robot.get_joint("shoulder_lift")), -103.6,
+                               places=3, msg="clamping in fk would falsify every pose")
+        self.assertAlmostEqual(servo.inside_the_model(past)["shoulder_lift"], -100.0, places=3)
+        servo.servo_step(past, servo.fk(past))      # ⛔ must not raise
 
     def test_the_workspace_opens_far_enough_to_contain_the_parked_pose(self):
         # An arm rests where gravity leaves it, which on this follower is 20 mm below the base
@@ -389,19 +426,23 @@ class ProgramShapeTests(unittest.TestCase):
         # worse than no page. The check has to precede both the server and the power.
         source = (ROOT / "IK/so101_visual_control.py").read_text(encoding="utf-8")
         body = source[source.index("def run(args):"):]
-        self.assertLess(body.index("self_check("), body.index("page.connect()"))
-        self.assertLess(body.index("self_check("), body.index("robot.connect()"))
-        self.assertLess(body.index("page.connect()"), body.index("robot.connect()"))
+        self.assertLess(body.index("self_check("), body.index("page.start("))
+        self.assertLess(body.index("self_check("), body.index("arm.open_bus()"))
+        self.assertLess(body.index("page.start("), body.index("arm.open_bus()"))
 
     def test_only_ending_a_mode_releases_the_arm(self):
         # Jeff, 2026-09-09: a crash must not let go, because releasing a raised arm drops it.
         # Only the End path releases, and the program says so on any other way out.
+        shared = (ROOT / "IK/so101_cartesian_demo.py").read_text(encoding="utf-8")
+        loop = shared[shared.index("def control_loop("):shared.index("def step_towards(")]
+        self.assertEqual(loop.count("arm.release()"), 1, "exactly one release, on the End path")
+        self.assertLess(loop.index("take_end_request()"), loop.index("arm.release()"))
+        self.assertNotIn("disable_torque", loop, "the loop never reaches past the arm to let go")
+        # ⛔ And a stall stops the arm pushing without letting go of it.
+        self.assertIn("stop_pushing", loop)
         source = (ROOT / "IK/so101_visual_control.py").read_text(encoding="utf-8")
-        body = source[source.index("def run(args):"):source.index("def main(")]
-        self.assertEqual(body.count("disable_torque()"), 1, "exactly one release, on the End path")
-        self.assertLess(body.index("except ModeEnded"), body.index("disable_torque()"))
-        self.assertIn("except BaseException", body, "Ctrl+C counts as an unsafe stop too")
-        self.assertIn("SAFETY_NOTICE", body)
+        self.assertIn("except BaseException", source, "Ctrl+C counts as an unsafe stop too")
+        self.assertIn("SAFETY_NOTICE", source)
         self.assertIn("--release-torque", source)
 
     def test_the_pre_power_read_opens_and_hands_back_the_port_untouched(self):
@@ -451,18 +492,25 @@ class ProgramShapeTests(unittest.TestCase):
             connect=lambda: events.append("connect"), sync_read=sync_read,
             disable_torque=disable, is_connected=True,
             disconnect=lambda disable_torque=True: events.append(f"disconnect({disable_torque})")))
+        fake_arm = SimpleNamespace(
+            robot=robot, holding=False,
+            open_bus=lambda: robot.bus.connect(),
+            close_bus=lambda: robot.bus.disconnect(False),
+            read=lambda: {name: float(value) for name, value in deg.items()})
         import contextlib, io as _io
-        with patch.object(visual, "make_follower", lambda _args: robot), \
+        with patch.object(demo, "LiveArm", lambda *a, **k: fake_arm), \
                 contextlib.redirect_stdout(_io.StringIO()):
-            self.assertEqual(visual.release_only(SimpleNamespace()), 0)
+            self.assertEqual(visual.release_only(
+                SimpleNamespace(port="p", robot_id="r", calibration_dir="c")), 0)
         self.assertIn("disable_torque", events)
         self.assertEqual(events[-1], "disconnect(False)")
         self.assertLess(events.index("read Torque_Enable"), events.index("disable_torque"),
                         "it must look before it lets go")
         events.clear()
-        with patch.object(visual, "make_follower", lambda _args: robot), \
+        with patch.object(demo, "LiveArm", lambda *a, **k: fake_arm), \
                 contextlib.redirect_stdout(_io.StringIO()):
-            self.assertEqual(visual.release_only(SimpleNamespace()), 0)
+            self.assertEqual(visual.release_only(
+                SimpleNamespace(port="p", robot_id="r", calibration_dir="c")), 0)
         self.assertNotIn("disable_torque", events, "already released means nothing to do")
 
     def test_the_keyboard_gate_gives_up_instead_of_powering_the_arm(self):
@@ -478,6 +526,158 @@ class ProgramShapeTests(unittest.TestCase):
         self.assertIn("the arm was never powered", str(gave_up.exception))
         keyboard_program.wait_for_a_key(
             SimpleNamespace(get_action=lambda: {"delta_x": 0.0, "delta_y": -1.0, "delta_z": 0.0}))
+
+
+class ControlLoopTests(unittest.TestCase):
+    """What the one loop actually does, driven with a page that is not a browser.
+
+    ⭐ These are the tests the 2026-09-10 rewrite exists for. Every one of them fails against
+    the version that could not move the arm, because that version's fault was not a crash: it
+    asked, politely and for ever, for about one degree.
+    """
+
+    class Page:
+        """The page interface, with nothing behind it but the wishes the test wants recorded."""
+
+        def __init__(self, target, ticks, mode=None):
+            import numpy
+            self.target = numpy.asarray(target, dtype=float)
+            self.handle = self.target.copy()
+            self.ticks, self.seen = ticks, []
+            self.mode = demo.HANDLE if mode is None else mode
+            self.armed_as, self.asked, self.gripper = None, False, 0.0
+
+        def take_arm_request(self):
+            if self.asked:
+                return None
+            self.asked = True
+            return self.mode
+
+        def take_end_request(self):
+            return False
+
+        def handle_xyz(self):
+            return self.handle
+
+        def gripper_target(self):
+            return self.gripper
+
+        def set_gripper_target(self, percent):
+            self.gripper = float(percent)
+
+        def nudge_gripper(self, percent):
+            self.gripper += float(percent)
+
+        def move_handle(self, xyz):
+            import numpy
+            # ⛔ Only while nothing is live: once armed, the handle is the operator's, and the
+            # loop snapping it back to the gripper is what the real page must never do either.
+            if self.armed_as is None:
+                self.handle = numpy.asarray(xyz, dtype=float)
+
+        def armed(self, mode):
+            self.armed_as = mode
+            self.handle = self.target.copy()
+
+        def disarmed(self, message=""):
+            self.armed_as = None
+
+        def show(self, measured, commanded, status, note="", keys=""):
+            self.seen.append((dict(measured), dict(commanded)))
+            if len(self.seen) >= self.ticks:
+                raise StopIteration
+
+    def drive(self, target, ticks, arm=None, mode=None, leader=None):
+        if not args.model_dir:
+            self.skipTest("needs the pinned model")
+        servo, limits = demo.load_servo(str(args.model_dir))
+        start = {**dict(zip(demo.JOINTS, demo.PREVIEW_JOINTS_DEG)), "gripper": 0.0}
+        arm = demo.ModelArm(start) if arm is None else arm
+        bounds = demo.bounds_dict(demo.DEFAULT_BOUNDS_M["min"], demo.DEFAULT_BOUNDS_M["max"])
+        page = self.Page(target, ticks, mode)
+        stalled = None
+        # ⚠️ The loop paces itself to real time; the tests do not have that long.
+        with patch.object(demo.time, "sleep", lambda _seconds: None):
+            try:
+                demo.control_loop(page, arm, servo, bounds, limits, leader=leader)
+            except StopIteration:
+                pass
+            except demo.FollowingLost as lost:
+                stalled = str(lost)
+        return servo, arm, page, stalled
+
+    def test_a_stalled_arm_is_commanded_up_to_its_budget_and_no_further(self):
+        # ⭐ The judge. Against the version this replaced, the command stayed about 1.09 deg
+        # ahead of the arm for ever, whatever the target -- far below the 2.3 deg of position
+        # error a Feetech STS3215 needs at P=32 before it makes any useful force, so the arm
+        # never moved. The command must be free to lead by the whole budget, and by no more.
+        class Stuck(demo.ModelArm):
+            def send(self, degrees):
+                pass                      # the commands go out; the arm does not follow
+
+        servo, _arm, page, _stalled = self.drive((0.30, 0.0, 0.25), 120, arm=Stuck(
+            {**dict(zip(demo.JOINTS, demo.PREVIEW_JOINTS_DEG)), "gripper": 0.0}))
+        leads = [max(abs(commanded[name] - measured[name]) for name in demo.JOINTS)
+                 for measured, commanded in page.seen if page.armed_as]
+        budget = servo.max_joint_step_deg
+        self.assertGreater(max(leads), budget * 0.9,
+                           "a held-back arm must be commanded with the whole budget")
+        self.assertLessEqual(max(leads), budget + 1e-6, "and never with more than the budget")
+
+    def test_the_arm_travels_at_the_set_speed_and_stops_when_it_arrives(self):
+        servo, arm, page, stalled = self.drive((0.30, 0.0, 0.25), 400)
+        import numpy
+        reached = servo.gripper_xyz(arm.read())
+        self.assertIsNone(stalled, "a reachable target is not a stall")
+        self.assertLess(float(numpy.linalg.norm(reached - page.target)) * 1000, demo.ARRIVED_MM)
+        moved = [numpy.linalg.norm(servo.gripper_xyz(b) - servo.gripper_xyz(a))
+                 for (_m, a), (_n, b) in zip(page.seen, page.seen[1:])]
+        a_tick = demo.REF_LINEAR_SPEED_MPS * demo.CONTROL_DT
+        self.assertLessEqual(max(moved), a_tick * 1.05, "the gripper outran the set speed")
+        # ⭐ And once it is there, it stops pushing: the command settles onto the measurement.
+        settled = page.seen[-1]
+        self.assertLess(max(abs(settled[1][name] - settled[0][name]) for name in demo.JOINTS), 0.05)
+
+    def test_a_target_it_cannot_reach_is_stopped_without_being_let_go(self):
+        # ⛔ Stopping is not releasing. The force comes out of the motors -- the goal is parked
+        # where they stand -- but letting go of a raised arm drops it, so nothing lets go.
+        released, parked = [], []
+
+        class Watched(demo.ModelArm):
+            def release(self):
+                released.append(True)
+
+            def stop_pushing(self, degrees):
+                parked.append(dict(degrees))
+
+        _servo, _arm, _page, stalled = self.drive(
+            (0.38, 0.22, 0.42), 900, arm=Watched(
+                {**dict(zip(demo.JOINTS, demo.PREVIEW_JOINTS_DEG)), "gripper": 0.0}))
+        self.assertIsNotNone(stalled, "an unreachable target must be reported, not chased for ever")
+        self.assertIn("stopped closing", stalled)
+        self.assertEqual(released, [], "a stall must never release the arm")
+        self.assertEqual(len(parked), 1, "it must stop pushing, exactly once")
+
+    def test_the_jaw_does_not_jump_when_a_mode_starts(self):
+        # 2026-09-09 on hardware: the slider sat at its default while the jaw read 1.8, so
+        # enabling any mode drove the gripper across its travel before anyone touched a control.
+        start = {**dict(zip(demo.JOINTS, demo.PREVIEW_JOINTS_DEG)), "gripper": 1.8}
+        _servo, arm, page, _stalled = self.drive((0.30, 0.0, 0.25), 6, arm=demo.ModelArm(start))
+        self.assertAlmostEqual(page.gripper, 1.8, places=6,
+                               msg="the slider moves to the jaw, not the jaw to the slider")
+        self.assertLess(abs(arm.read()["gripper"] - 1.8), demo.GRIPPER_STEP_PCT + 1e-6)
+
+    def test_the_leader_mode_never_reaches_the_solver(self):
+        # ⛔ Lesson 7's chain, and the only mode that worked before this rewrite. It passes joint
+        # angles straight through: no solver, no speed limit, no stall check -- the hand on the
+        # leader is all three.
+        reading = {f"{name}.pos": 12.5 for name in demo.MOTORS}
+        leader = SimpleNamespace(get_action=lambda: dict(reading))
+        servo, arm, _page, stalled = self.drive((0.38, 0.22, 0.42), 40, mode=demo.LEADER,
+                                                leader=leader)
+        self.assertIsNone(stalled, "the leader mode is not watched for stalling")
+        self.assertEqual({name: round(value, 3) for name, value in arm.read().items()},
+                         {name: 12.5 for name in demo.MOTORS})
 
 
 class BusReadTests(unittest.TestCase):
@@ -847,331 +1047,155 @@ args = parser.parse_args()
 
 @unittest.skipUnless(args.model_dir, "optional numerical check requires a pinned model directory and kinematics dependencies")
 class NumericalTests(unittest.TestCase):
-    """Against the real pinned model and LeRobot's real solver. No hardware, no listener."""
+    """Against the real pinned model and the real solver. No hardware, no listener."""
 
     @classmethod
     def setUpClass(cls):
-        import numpy as np
-        cls.np = np
-        cls.kinematics, cls.limits = demo.load_kinematics(args.model_dir)
+        import numpy
+        cls.np = numpy
+        cls.servo, cls.limits = demo.load_servo(args.model_dir)
         cls.bounds = demo.bounds_dict(demo.DEFAULT_BOUNDS_M["min"], demo.DEFAULT_BOUNDS_M["max"])
+        cls.start = {**dict(zip(demo.JOINTS, demo.PREVIEW_JOINTS_DEG)), "gripper": 0.0}
 
-    def solve_one_step(self, seed, delta):
-        pose = self.kinematics.forward_kinematics(seed).copy()
-        target = pose[:3, 3] + self.np.asarray(delta, dtype=float)
-        pose[:3, 3] = target
-        solved = self.kinematics.inverse_kinematics(seed, pose, position_weight=1.0, orientation_weight=0.0)
-        actual = self.kinematics.forward_kinematics(solved)[:3, 3]
-        return solved, float(self.np.linalg.norm(actual - target) * 1000)
-
-    def test_one_official_call_reaches_a_one_step_target(self):
-        # Measured 2026-09-09: a single call leaves 0.008 mm at the 2 mm step this course uses.
-        # That is why nothing iterates: the control loop rate is the convergence.
-        seed = self.np.array(demo.PREVIEW_JOINTS_DEG)
+    def test_a_small_move_is_walked_off_in_a_few_ticks(self):
+        # ⭐ A tick is a step, not a solve. The velocity limit is nowhere near reached for a
+        # millimetre, but the regularisation that keeps the spare joint from drifting also damps
+        # the step, so it takes a handful of ticks -- 20 ms of them -- rather than one.
         for axis in range(3):
             for sign in (-1, 1):
+                pose = self.servo.fk(self.start).copy()
                 delta = self.np.zeros(3)
-                delta[axis] = sign * demo.STEP_MM / 1000
-                solved, residual = self.solve_one_step(seed, delta)
-                self.assertEqual(len(solved), 5)
-                self.assertLess(residual, 0.1)
+                delta[axis] = sign * 0.001
+                pose[:3, 3] = pose[:3, 3] + delta
+                walking = dict(self.start)
+                for _tick in range(10):
+                    walking = self.servo.servo_step(walking, pose)
+                reached = self.servo.gripper_xyz(walking)
+                self.assertLess(float(self.np.linalg.norm(reached - pose[:3, 3])) * 1000, 0.1)
+
+    def test_a_converged_solve_is_exact_where_lerobots_single_step_was_not(self):
+        # ⛔ Why the solver was replaced. LeRobot 0.6.1 takes one Newton step and stops: measured
+        # 2026-09-10, a target 10 cm away came back 149.7 mm short. Iterating reaches it.
+        pose = self.servo.fk(self.start).copy()
+        pose[:3, 3] = pose[:3, 3] + self.np.array([0.0, 0.0, 0.10])
+        solved = self.servo.solve_pose(self.start, pose)
+        reached = self.servo.gripper_xyz(solved)
+        self.assertLess(float(self.np.linalg.norm(reached - pose[:3, 3])) * 1000, 0.5)
+
+    def test_a_target_one_step_ahead_of_the_measurement_cannot_move_this_arm(self):
+        # ⛔ The fault this rewrite removed, kept as a test so it cannot come back. LeRobot's
+        # end-effector steps take their reference from the observation they are handed, so
+        # handing them the measurement makes the target `FK(measured) + one step` -- and the
+        # solver then travels one step and no further, whatever is held down.
+        # ⚠️ The number is the whole story: a Feetech STS3215 needs about 2.3 deg of position
+        # error at P=32 before it makes useful force (upstream issue #3400), and this asks for
+        # less than half of that. On hardware the arm simply did not move.
+        pose = self.servo.fk(self.start).copy()
+        pose[:3, 3] = pose[:3, 3] + self.np.array([0.0, 0.0, 0.002])
+        commanded = self.servo.servo_step(self.start, pose)
+        lead = max(abs(commanded[name] - self.start[name]) for name in demo.JOINTS)
+        self.assertLess(lead, 2.3, "if this ever exceeds the servo's error band, say why")
+        # ⭐ And the fix, measured the same way: a target that is where the operator actually
+        # wants the gripper gets the whole budget instead.
+        far = self.servo.fk(self.start).copy()
+        far[:3, 3] = self.np.array(demo.DEFAULT_BOUNDS_M["max"])
+        wanted = self.servo.servo_step(self.start, far)
+        self.assertGreater(max(abs(wanted[name] - self.start[name]) for name in demo.JOINTS), 2.3)
 
     def test_wrist_roll_is_masked_out_of_the_problem(self):
         # 2026-09-08: position-only IK left the roll axis free, and a drag once planned 155 deg
-        # of it. placo's mask_dof removes the joint from the solve; LeRobot exposes the solver.
-        seed = self.np.array([13.98, -103.69, 97.01, -102.29, 6.37])
-        goal = seed.copy()
+        # of it. placo's mask_dof removes the joint from the solve.
+        walking = {**dict(zip(demo.JOINTS, (13.98, -103.69, 97.01, -102.29, 6.37))), "gripper": 0.0}
         for delta in ((0.002, 0, 0.002), (0.002, 0.001, 0.002), (0.002, 0.002, 0.002)):
-            pose = self.kinematics.forward_kinematics(goal).copy()
+            pose = self.servo.fk(walking).copy()
             pose[:3, 3] = pose[:3, 3] + self.np.asarray(delta)
-            goal = self.kinematics.inverse_kinematics(goal, pose, position_weight=1.0, orientation_weight=0.0)
-            self.assertAlmostEqual(float(goal[4]), float(seed[4]), places=6)
-        unmasked, _ = demo.load_kinematics(args.model_dir, lock_wrist_roll=False)
-        self.assertNotEqual(id(unmasked), id(self.kinematics))
+            walking = self.servo.servo_step(walking, pose)
+            self.assertAlmostEqual(walking["wrist_roll"], 6.37, places=4)
 
-    def test_the_assembled_pipeline_returns_one_target_per_motor(self):
-        pipeline = demo.build_robot_action_processor(self.kinematics, self.bounds)
-        observation = dict(zip((f"{name}.pos" for name in demo.MOTORS),
-                               (0.0, -30.0, 60.0, -30.0, 0.0, 50.0)))
-        action = pipeline(({"delta_x": 0.0, "delta_y": 0.0, "delta_z": 1.0, "gripper": 1}, observation))
-        self.assertEqual(sorted(action), sorted(f"{name}.pos" for name in demo.MOTORS))
-        moved = self.kinematics.forward_kinematics(
-            self.np.array([action[f"{name}.pos"] for name in demo.JOINTS]))[:3, 3]
-        start = self.kinematics.forward_kinematics(
-            self.np.array([observation[f"{name}.pos"] for name in demo.JOINTS]))[:3, 3]
-        self.assertAlmostEqual(float((moved - start)[2]) * 1000, demo.STEP_MM, places=1)
+    def test_a_commanded_pose_carries_one_target_per_motor(self):
+        pose = self.servo.fk(self.start)
+        commanded = self.servo.servo_step(self.start, pose)
+        self.assertEqual(set(commanded), set(demo.MOTORS))
+        self.assertTrue(all(math.isfinite(value) for value in commanded.values()))
 
-    def test_a_held_command_stops_at_the_workspace_edge(self):
-        pipeline = demo.build_robot_action_processor(self.kinematics, self.bounds)
-        observation = dict(zip((f"{name}.pos" for name in demo.MOTORS),
-                               (0.0, -30.0, 60.0, -30.0, 0.0, 50.0)))
-        for _ in range(300):  # far more frames than it takes to reach the edge
-            observation = {key: float(value) for key, value in
-                           pipeline(({"delta_x": 1.0, "delta_y": 0.0, "delta_z": 1.0, "gripper": 1}, observation)).items()}
-        reached = self.kinematics.forward_kinematics(
-            self.np.array([observation[f"{name}.pos"] for name in demo.JOINTS]))[:3, 3]
-        self.assertTrue((reached <= self.np.asarray(self.bounds["max"]) + 1e-6).all(), reached)
-        self.assertTrue((reached >= self.np.asarray(self.bounds["min"]) - 1e-6).all(), reached)
-        self.assertAlmostEqual(float(observation["wrist_roll.pos"]), 0.0, places=6)
+    def test_the_chased_pose_never_leaves_the_workspace(self):
+        # The box is a hard edge for the target, so a handle outside it cannot walk the arm out.
+        outside = self.servo.fk(self.start).copy()
+        outside[:3, 3] = self.np.array([2.0, 2.0, 2.0])
+        clamped = demo.clamp_into_bounds(outside, self.bounds)
+        self.assertTrue((clamped[:3, 3] <= demo.bounds_high(self.bounds) + 1e-9).all())
+        self.assertTrue((clamped[:3, 3] >= demo.bounds_low(self.bounds) - 1e-9).all())
 
-    def test_the_gripper_opens_and_closes_within_its_own_scale(self):
-        pipeline = demo.build_robot_action_processor(self.kinematics, self.bounds)
-        observation = dict(zip((f"{name}.pos" for name in demo.MOTORS),
-                               (0.0, -30.0, 60.0, -30.0, 0.0, 50.0)))
-        still = {"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0}
-        closed = pipeline(({**still, "gripper": visual.GRIPPER_CLOSE}, observation))["gripper.pos"]
-        opened = pipeline(({**still, "gripper": visual.GRIPPER_OPEN}, observation))["gripper.pos"]
-        self.assertGreater(closed, observation["gripper.pos"])
-        self.assertLess(opened, observation["gripper.pos"])
-        for _ in range(500):
-            observation = {key: float(value) for key, value in
-                           pipeline(({**still, "gripper": visual.GRIPPER_OPEN}, observation)).items()}
-        self.assertGreaterEqual(observation["gripper.pos"], demo.GRIPPER_MIN_PCT)
+    def test_the_chased_pose_stops_ahead_of_the_gripper(self):
+        # ⭐ The second limit on force, and the one that binds first. Measured 2026-09-10: at
+        # 20 mm a reaching-out arm is only commanded 1.72 deg, below what this servo needs.
+        here = self.servo.gripper_xyz(self.start)
+        far = self.servo.fk(self.start).copy()
+        far[:3, 3] = self.np.array(demo.DEFAULT_BOUNDS_M["max"])
+        reference = self.servo.fk(self.start)
+        for _tick in range(500):
+            reference = demo.advance_reference(reference, far, here)
+        lead = float(self.np.linalg.norm(reference[:3, 3] - here)) * 1000
+        self.assertLessEqual(lead, demo.MAX_REF_LEAD_MM + 1e-6)
+        self.assertGreater(lead, demo.MAX_REF_LEAD_MM - 1.0, "it must actually reach its limit")
 
-    def test_preview_prints_the_solver_it_used_and_its_own_residual(self):
+    def test_the_gripper_moves_one_step_at_a_time_and_stops_on_its_target(self):
+        self.assertAlmostEqual(demo.step_towards(50.0, 80.0, 1.0), 51.0)
+        self.assertAlmostEqual(demo.step_towards(50.0, 20.0, 1.0), 49.0)
+        self.assertAlmostEqual(demo.step_towards(50.0, 50.4, 1.0), 50.4, msg="never overshoot")
+        self.assertAlmostEqual(demo.step_towards(50.0, 50.0, 1.0), 50.0)
+
+    def test_preview_reports_the_solver_it_used_and_its_own_residual(self):
         import contextlib, io as _io
-        buffer = _io.StringIO()
-        with contextlib.redirect_stdout(buffer):
+        printed = _io.StringIO()
+        with contextlib.redirect_stdout(printed):
             demo.preview(SimpleNamespace(model_dir=args.model_dir,
-                                         joints_deg=list(demo.PREVIEW_JOINTS_DEG),
-                                         delta_mm=[0.0, 0.0, demo.STEP_MM]))
-        report = json.loads(buffer.getvalue())
-        self.assertIn("orientation_weight=0.0", report["solver"])
-        self.assertIn("no hardware", report["mode"])
+                                         joints_deg=demo.PREVIEW_JOINTS_DEG,
+                                         delta_mm=(0.0, 0.0, 20.0), max_ticks=500))
+        report = json.loads(printed.getvalue())
+        self.assertIn("placo", report["solver"])
+        self.assertEqual(report["mode"], "model-only; no hardware")
         self.assertLess(report["position_error_mm"], 0.1)
-        self.assertEqual(report["solved_degrees"][4], 0.0)
+        # ⭐ Both halves: the answer, and the number of ticks the arm would really take to walk
+        # there. 20 mm at the set speed is 0.4 s, and saying so is the point of the lesson.
+        self.assertAlmostEqual(report["seconds_to_arrive"],
+                               0.020 / demo.REF_LINEAR_SPEED_MPS, places=1)
 
-    def fake_leader(self, values=(5.0, -25.0, 55.0, -25.0, 1.0, 40.0)):
-        """Only get_action() is needed to stand in for SO101Leader; no serial port is opened."""
-        reading = dict(zip((f"{name}.pos" for name in demo.MOTORS), values))
-        return SimpleNamespace(get_action=lambda: dict(reading)), reading
+    def test_viser_meshes_load_and_agree_with_the_solver(self):
+        import yourdfpy
+        from viser.extras import ViserUrdf
+        urdf = yourdfpy.URDF.load(str(Path(args.model_dir) / demo.URDF_NAME))
+        names = [joint.name for joint in urdf.actuated_joints]
+        self.assertEqual(set(names), set(demo.MOTORS))
+        # The viewer is fed by name, because this order is not the bus order.
+        values = visual.viewer_configuration(names, self.start, (-0.2, 1.7))
+        self.assertEqual(len(values), len(names))
+        self.assertAlmostEqual(values[names.index("shoulder_lift")],
+                               math.radians(self.start["shoulder_lift"]))
+        self.assertTrue(hasattr(ViserUrdf, "update_cfg"))
 
-    def live_page(self, keyboard=None, leader=None, armed=None, joints=None):
-        """A real Viser server on a free loopback port. No browser, no serial port, no robot."""
+    def test_the_page_builds_on_a_real_server_and_never_reaches_for_an_arm(self):
         import socket
         with socket.socket() as probe:
             probe.bind((visual.LOOPBACK, 0))
             port = probe.getsockname()[1]
-        pipeline = demo.build_robot_action_processor(self.kinematics, self.bounds)
-        page = visual.build(visual.ViserTeleopConfig(
-            id="test", model_dir=str(args.model_dir), web_port=port), self.kinematics, pipeline,
-            keyboard=keyboard, leader=leader)
-        page.seed(dict(zip((f"{name}.pos" for name in demo.MOTORS),
-                           (*(joints or demo.PREVIEW_JOINTS_DEG), 50.0))))
-        page.connect()
-        if armed:
-            page.armed(armed)
-        return page
-
-    def assert_joints_close(self, action, expected, places=6, message=""):
-        for name in demo.MOTORS:
-            self.assertAlmostEqual(float(action[f"{name}.pos"]), float(expected[f"{name}.pos"]),
-                                   places=places, msg=f"{name}: {message}")
-
-    def gripper_of(self, action):
-        return self.kinematics.forward_kinematics(
-            self.np.array([action[f"{name}.pos"] for name in demo.JOINTS]))[:3, 3]
-
-    def test_every_panel_is_actually_built(self):
-        # 2026-09-09: every other page test stubs the widgets, so a NameError inside connect()
-        # survived the whole suite and only appeared on hardware.
-        leader, _reading = self.fake_leader()
-        page = self.live_page(keyboard=SimpleNamespace(get_action=dict, current_pressed={}),
-                              leader=leader)
+        page = visual.ViserPage(args.model_dir, port, self.servo, self.bounds,
+                                (demo.HANDLE, demo.KEYBOARD), live=False)
         try:
-            self.assertEqual(len(page.mode_dropdown.options), 3)
-            self.assertTrue(page.panels[visual.KEYBOARD].visible)
-            self.assertFalse(page.panels[visual.IK].visible)
-            self.assertFalse(page.handle.visible)
-            page.mode_dropdown.value = visual.MODE_LABELS[visual.IK]
-            page._show_panel(visual.IK)
-            self.assertTrue(page.panels[visual.IK].visible)
-            self.assertTrue(page.handle.visible)
-            self.assertFalse(page.panels[visual.KEYBOARD].visible)
-            self.assertEqual(page.gripper_slider.value, visual.GRIPPER_INITIAL_PCT)
-        finally:
-            page.disconnect()
-
-    def test_the_page_opens_showing_the_arm_and_not_the_models_zero_pose(self):
-        # 2026-09-09 on hardware: observe() only ran inside the control loop, so the page sat at
-        # the URDF's zero configuration -- 384 mm from where the arm actually was -- for as long
-        # as it took to start. The seeded reading has to be painted by connect() itself.
-        folded = (-30.95, -95.0, 90.0, 60.0, 6.20)
-        page = self.live_page(joints=folded)
-        try:
-            expected = self.kinematics.forward_kinematics(self.np.array(folded))[:3, 3]
-            zero = self.kinematics.forward_kinematics(self.np.zeros(5))[:3, 3]
-            self.np.testing.assert_allclose(page.handle.position, expected, atol=1e-6)
-            self.assertGreater(float(self.np.linalg.norm(expected - zero)), 0.1,
-                               "the fixture must differ from the zero pose for this to mean anything")
-        finally:
-            page.disconnect()
-
-    def test_only_one_mode_can_be_live_and_end_stops_it(self):
-        leader, _reading = self.fake_leader()
-        page = self.live_page(keyboard=SimpleNamespace(get_action=dict, current_pressed={}),
-                              leader=leader)
-        try:
-            self.assertTrue(all(not b.disabled for b in page.enable_buttons.values()))
-            self.assertTrue(all(b.disabled for b in page.end_buttons.values()))
-            page._request_arm(visual.LEADER)
-            self.assertEqual(page.take_arm_request(), visual.LEADER)
-            self.assertIsNone(page.take_arm_request(), "the request is taken once")
-            page.armed(visual.LEADER)
-            self.assertTrue(all(b.disabled for b in page.enable_buttons.values()))
-            self.assertFalse(page.end_buttons[visual.LEADER].disabled)
-            self.assertTrue(page.end_buttons[visual.KEYBOARD].disabled)
-            self.assertTrue(page.mode_dropdown.disabled)
-            page._request_arm(visual.IK)
-            self.assertIsNone(page.take_arm_request(), "no second mode while one is live")
+            page.start(self.start)
+            self.assertIsNone(page.take_arm_request(), "nothing is asked for until a click")
+            page._request_arm()
+            self.assertEqual(page.take_arm_request(), demo.HANDLE)
+            self.assertIsNone(page.take_arm_request(), "a wish is taken once")
+            page.armed(demo.HANDLE)
             page._request_end()
-            with self.assertRaises(visual.ModeEnded) as ended:
-                page.get_action()
-            self.assertEqual(ended.exception.mode, visual.LEADER)
-            page.disarmed("done")
-            self.assertTrue(all(not b.disabled for b in page.enable_buttons.values()))
+            self.assertTrue(page.take_end_request())
+            page.set_gripper_target(12.0)
+            self.assertAlmostEqual(page.gripper_target(), 12.0)
+            page.move_handle((0.25, 0.0, 0.2))
+            self.assertAlmostEqual(float(page.handle_xyz()[0]), 0.25, places=3)
         finally:
-            page.disconnect()
-
-    def test_the_read_only_loop_reads_and_sends_nothing(self):
-        page = self.live_page()
-        sent = []
-        bus = SimpleNamespace(
-            sync_read=lambda name, motors=None, **kw: dict(zip(demo.MOTORS, (0.0, -30.0, 60.0, -30.0, 0.0, 50.0))),
-            send_action=lambda action: sent.append(action))
-        robot = SimpleNamespace(bus=bus, config=SimpleNamespace(num_read_retries=3))
-        try:
-            import threading
-            threading.Timer(0.1, lambda: page._request_arm(visual.IK)).start()
-            mode, observation = visual.read_only_display(page, robot, fps=60)
-            self.assertEqual(mode, visual.IK)
-            self.assertEqual(observation["shoulder_lift.pos"], -30.0)
-            self.assertEqual(sent, [], "the read-only loop must command nothing")
-        finally:
-            page.disconnect()
-
-    def test_the_leader_mode_passes_joints_through_without_touching_ik(self):
-        leader, reading = self.fake_leader()
-        page = self.live_page(leader=leader)
-        try:
-            page.armed(visual.LEADER)
-            self.assertEqual(page.get_action(), reading)
-        finally:
-            page.disconnect()
-
-    def test_holding_the_gripper_resists_instead_of_following_the_jaw(self):
-        # 2026-09-09 on hardware: the gripper opened by itself the moment a mode was enabled.
-        # GripperVelocityToJoint adds its step to the gripper's *measured* position, so a hold
-        # command asks the motor to go exactly where the jaw already is: zero error, zero force,
-        # and anything pushing the jaw open is followed rather than resisted.
-        page = self.live_page(keyboard=SimpleNamespace(
-            get_action=lambda: {"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": 1},
-            current_pressed={}), armed=visual.KEYBOARD)
-        try:
-            observation = dict(zip((f"{name}.pos" for name in demo.MOTORS),
-                                   (0.0, -30.0, 60.0, -30.0, 0.0, 50.0)))
-            commanded = None
-            for _ in range(8):
-                action = page.get_action()
-                commanded = float(action["gripper.pos"])
-                observation = {key: float(value) for key, value in action.items()}
-                observation["gripper.pos"] -= 0.4  # the jaw drifting open under its own weight
-                page.seed(observation)
-            self.assertAlmostEqual(commanded, 50.0, places=6,
-                                   msg="the command followed the jaw instead of holding it")
-        finally:
-            page.disconnect()
-
-    def test_the_keyboard_mode_moves_the_gripper_one_step_per_frame(self):
-        from pynput import keyboard as keys
-        from lerobot.teleoperators.keyboard import KeyboardEndEffectorTeleop, KeyboardEndEffectorTeleopConfig
-        device = KeyboardEndEffectorTeleop(KeyboardEndEffectorTeleopConfig(id="t", use_gripper=True))
-        device.connect()
-        if not device.is_connected:
-            self.skipTest("pynput cannot capture keys in this session")
-        page = self.live_page(keyboard=device, armed=visual.KEYBOARD)
-        try:
-            before = self.gripper_of(page.get_action())
-            device._on_press(keys.Key.left)  # left is +x in LeRobot's own mapping
-            after = self.gripper_of(page.get_action())
-            self.assertAlmostEqual(float((after - before)[0]) * 1000, demo.STEP_MM, places=1)
-        finally:
-            device.disconnect()
-            page.disconnect()
-
-    def test_ik_mode_holds_until_execute_then_arrives_and_stops(self):
-        page = self.live_page(armed=visual.IK)
-        try:
-            page._show_panel(visual.IK)
-            observation = dict(zip((f"{name}.pos" for name in demo.MOTORS),
-                                   (*demo.PREVIEW_JOINTS_DEG, 50.0)))
-            target = (0.34, 0.06, 0.22)
-            page.handle.position = target
-            page._make_plan()
-            self.assertIn("solver residual", page.plan_state.content)
-            self.assert_joints_close(page.get_action(), observation,
-                                     message="a plan alone must move nothing")
-
-            page._start_executing()
-            for frame in range(400):
-                observation = {key: float(value) for key, value in page.get_action().items()}
-                page.seed(observation)
-                if not page._executing:
-                    break
-            reached = self.gripper_of(observation)
-            self.assertLess(float(self.np.linalg.norm(reached - self.np.array(target))) * 1000,
-                            visual.ARRIVED_MM + demo.STEP_MM)
-            self.assertIn("Arrived", page.plan_state.content)
-            self.assertAlmostEqual(observation["wrist_roll.pos"], 0.0, places=6)
-            # Having arrived, it must stay put rather than creep.
-            self.assert_joints_close(page.get_action(), observation, message="it crept after arriving")
-        finally:
-            page.disconnect()
-
-    def test_stop_halts_an_execution_in_progress(self):
-        page = self.live_page(armed=visual.IK)
-        try:
-            page._show_panel(visual.IK)
-            page.handle.position = (0.34, 0.06, 0.22)
-            page._make_plan()
-            page._start_executing()
-            observation = {key: float(value) for key, value in page.get_action().items()}
-            page.seed(observation)
-            page._stop_executing("Stopped by the operator.")
-            # EEReferenceAndDelta holds the last command it was given while disabled, so the arm
-            # finishes the step already in flight and then stands still. Twenty frames of doing
-            # nothing must not add up to more than that one step.
-            here = self.gripper_of(observation)
-            for _ in range(20):
-                observation = {key: float(value) for key, value in page.get_action().items()}
-                page.seed(observation)
-            travelled_mm = float(self.np.linalg.norm(self.gripper_of(observation) - here)) * 1000
-            self.assertLess(travelled_mm, demo.STEP_MM, f"kept moving after Stop: {travelled_mm:.2f} mm")
-        finally:
-            page.disconnect()
-
-    def test_viser_urdf_meshes_and_fk_match_the_solver(self):
-        # Real Viser/yourdfpy loading; only scene transport is a test fixture.
-        # No listener, browser, serial port, or hardware is opened by this test.
-        import numpy as np
-        import yourdfpy
-        from functools import partial
-        from viser.extras import ViserUrdf
-        model_path = args.model_dir / demo.URDF_NAME
-        loaded = yourdfpy.URDF.load(model_path, filename_handler=partial(yourdfpy.filename_handler_magic, dir=model_path.parent))
-        scene = SimpleNamespace(add_frame=Mock(side_effect=lambda *a, **kw: SimpleNamespace(**kw)), add_mesh_simple=Mock())
-        viewer = ViserUrdf(SimpleNamespace(scene=scene), loaded, root_node_name="/test", mesh_color_override=visual.ARM_COLOR)
-        travel = visual.gripper_urdf_range(str(args.model_dir))
-        self.assertGreater(scene.add_mesh_simple.call_count, 0)
-        for call in scene.add_mesh_simple.call_args_list:
-            self.assertGreater(len(call.args[1]), 0)
-            self.assertGreater(len(call.args[2]), 0)
-            self.assertTrue(np.isfinite(call.args[1]).all())
-        for seed in (demo.PREVIEW_JOINTS_DEG, [10, -25, 55, -25, 10]):
-            viewer.update_cfg(np.array(visual.viewer_configuration(
-                viewer.get_actuated_joint_names(), seed, 0, travel)))
-            np.testing.assert_allclose(loaded.get_transform("gripper_frame_link"),
-                                       self.kinematics.forward_kinematics(seed), atol=1e-8)
+            page.stop()
 
 
 class PolicyViewTests(unittest.TestCase):
