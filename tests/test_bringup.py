@@ -1293,7 +1293,33 @@ class CameraCheckTests(unittest.TestCase):
             reloaded = cameras.load_cameras_file(target)
         self.assertEqual(reloaded["top"]["rotation"], 90)
         self.assertEqual(reloaded["wrist"]["rotation"], 180)
-        self.assertEqual((reloaded["top"]["width"], reloaded["top"]["height"]), (720, 1280))
+        # Derived from the default capture size, so changing that default does not fail this.
+        turned = cameras.size_for(cameras.CAPTURE_WIDTH, cameras.CAPTURE_HEIGHT, 90)
+        self.assertEqual((reloaded["top"]["width"], reloaded["top"]["height"]), turned)
+        self.assertEqual((reloaded["wrist"]["width"], reloaded["wrist"]["height"]),
+                         (cameras.CAPTURE_WIDTH, cameras.CAPTURE_HEIGHT))
+
+    def test_the_saved_file_matches_the_shape_the_lesson_prints(self):
+        """The lesson shows this file so it can be typed by hand; the page writes the same shape.
+
+        A reader comparing the two should not have to decide whether a formatting
+        difference means a content difference, so the layout is pinned here: one camera
+        per line, and the field order the lesson uses.
+        """
+        entries = {
+            name: {"type": "opencv", "index_or_path": f"<{name.upper()}_CAMERA_PATH>",
+                   "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG", "rotation": 0}
+            for name in ("top", "wrist")
+        }
+        rendered = cameras.rendered_configuration(entries)
+        self.assertEqual(rendered, (
+            '{\n'
+            '  "top": {"type": "opencv", "index_or_path": "<TOP_CAMERA_PATH>", "width": 640, '
+            '"height": 480, "fps": 30, "fourcc": "MJPG", "rotation": 0},\n'
+            '  "wrist": {"type": "opencv", "index_or_path": "<WRIST_CAMERA_PATH>", "width": 640, '
+            '"height": 480, "fps": 30, "fourcc": "MJPG", "rotation": 0}\n'
+            '}\n'))
+        self.assertEqual(json.loads(rendered).keys(), entries.keys())
 
     def test_saving_before_both_views_are_chosen_writes_nothing(self):
         # A half-filled cameras.json would fail later, at recording time, where it is

@@ -27,6 +27,7 @@ import array
 import fcntl
 import json
 import os
+import struct
 import sys
 import time
 from importlib.metadata import version
@@ -37,6 +38,9 @@ COURSE_CAMERA_NAMES = ("top", "wrist")
 # The four rotations LeRobot's Cv2Rotation accepts. Anything else cannot be expressed in
 # cameras.json, so the viewer refuses to offer it.
 ROTATIONS = (0, 90, 180, -90)
+
+CAPTURE_WIDTH, CAPTURE_HEIGHT = 640, 480  # The size LeRobot's SO-101 guides record at.
+CAPTURE_FPS, CAPTURE_FOURCC = 30, "MJPG"
 
 # --- V4L2 device query -------------------------------------------------------------
 # VIDIOC_QUERYCAP is the only ioctl used here. It answers the two questions the numbers
@@ -77,6 +81,46 @@ def query_capability(node):
         "bus_info": text(48, 32),
         "captures": bool(effective & V4L2_CAP_VIDEO_CAPTURE),
     }
+
+
+# VIDIOC_ENUM_FRAMESIZES = _IOWR('V', 74, struct v4l2_frmsizeenum)  (44 bytes)
+VIDIOC_ENUM_FRAMESIZES = 0xC02C564A
+MJPG_FOURCC = 0x47504A4D
+
+
+def supported_sizes(node):
+    """Discrete MJPG sizes this camera offers, largest first; empty when it cannot be asked.
+
+    Asked over ioctl rather than by trying `VideoCapture.set`, because set() silently
+    settles for the nearest mode it likes and reports that back as if it were granted.
+    """
+    try:
+        file = os.open(str(node), os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return []
+    sizes = []
+    try:
+        for index in range(64):
+            buffer = array.array("B", struct.pack("<III", index, MJPG_FOURCC, 0) + bytes(32))
+            try:
+                fcntl.ioctl(file, VIDIOC_ENUM_FRAMESIZES, buffer, True)
+            except OSError:
+                break
+            if struct.unpack_from("<I", buffer, 8)[0] != 1:  # discrete sizes only
+                break
+            sizes.append(struct.unpack_from("<II", buffer, 12))
+    finally:
+        os.close(file)
+    return sorted(set(sizes), key=lambda size: -size[0] * size[1])
+
+
+def shared_sizes(cameras):
+    """Sizes every one of these cameras offers. Recording needs one size for all of them."""
+    common = None
+    for camera in cameras:
+        offered = set(supported_sizes(Path(camera["path"]).resolve()))
+        common = offered if common is None else common & offered
+    return sorted(common or [], key=lambda size: -size[0] * size[1])
 
 
 def stable_links():
@@ -191,13 +235,47 @@ def grab_one_frame(path):
         capture.release()
 
 
-PREVIEW_WIDTH, PREVIEW_HEIGHT = 640, 480  # Enough to recognise a view; recording resolution is settled later.
 DEFAULT_PORT = 4603  # Registered for this course tool; --port moves it.
 JPEG_QUALITY = 80
 
 
-def open_for_preview(path):
-    """A camera opened at preview resolution, or None when something else holds it."""
+MODEL_IMAGE_SIZE = 224  # PaliGemma's square input, shared by pi0, pi05 and pi0-fast.
+
+
+def encode_jpeg(frame):
+    import cv2
+
+    if frame is None:
+        return None
+    encoded, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+    return buffer.tobytes() if encoded else None
+
+
+def pad_to_square(frame, side):
+    """Scale the long edge to `side` and centre the result on black, losing nothing.
+
+    This is what `resize_with_pad` does inside the pi0 family before the vision encoder,
+    reproduced here so the page can show what the policy actually receives. The bars are
+    the cost of a non-square frame: a 16:9 picture fills 56 percent of the square, 4:3
+    fills 75 percent.
+    """
+    import cv2
+    import numpy
+
+    if frame is None:
+        return None
+    height, width = frame.shape[:2]
+    scale = side / max(width, height)
+    resized = cv2.resize(frame, (max(1, round(width * scale)), max(1, round(height * scale))),
+                         interpolation=cv2.INTER_AREA)
+    canvas = numpy.zeros((side, side, frame.shape[2]), dtype=frame.dtype)
+    top, left = (side - resized.shape[0]) // 2, (side - resized.shape[1]) // 2
+    canvas[top:top + resized.shape[0], left:left + resized.shape[1]] = resized
+    return canvas
+
+
+def open_for_preview(path, *, width=None, height=None):
+    """A camera opened at the given capture size, or None when something else holds it."""
     import cv2
 
     capture = cv2.VideoCapture(str(path), cv2.CAP_V4L2)
@@ -205,8 +283,8 @@ def open_for_preview(path):
         capture.release()
         return None
     capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    capture.set(cv2.CAP_PROP_FRAME_WIDTH, PREVIEW_WIDTH)
-    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, PREVIEW_HEIGHT)
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, width or CAPTURE_WIDTH)
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height or CAPTURE_HEIGHT)
     return capture
 
 
@@ -264,10 +342,10 @@ class CameraStream:
         self.stop = __import__("threading").Event()
         self.thread = None
 
-    def start(self):
+    def start(self, width=CAPTURE_WIDTH, height=CAPTURE_HEIGHT):
         import threading
 
-        self.capture = open_for_preview(self.camera["path"])
+        self.capture = open_for_preview(self.camera["path"], width=width, height=height)
         if self.capture is None:
             return False
         self.thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -276,15 +354,19 @@ class CameraStream:
 
     def _read_loop(self):
         while not self.stop.is_set():
-            received, frame = self.capture.read()
+            with self.lock:
+                capture = self.capture
+            received, frame = capture.read()
             if not received:
                 time.sleep(0.05)
                 continue
             with self.lock:
-                self.frame = frame
+                # Discard a frame that arrived from a capture reopen() has replaced.
+                if capture is self.capture:
+                    self.frame = frame
 
-    def jpeg(self):
-        """The newest frame as JPEG bytes, with the configured rotation applied."""
+    def current(self):
+        """The newest frame with the configured rotation applied, or None."""
         import cv2
 
         with self.lock:
@@ -292,10 +374,30 @@ class CameraStream:
         if frame is None:
             return None
         turned = get_cv2_rotation_code(self.rotation)
-        if turned is not None:
-            frame = cv2.rotate(frame, turned)
-        encoded, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-        return buffer.tobytes() if encoded else None
+        return frame if turned is None else cv2.rotate(frame, turned)
+
+    def jpeg(self):
+        """The newest frame as JPEG bytes."""
+        return encode_jpeg(self.current())
+
+    def model_jpeg(self):
+        """What a pi0-family policy receives: the frame padded into a 224 square."""
+        return encode_jpeg(pad_to_square(self.current(), MODEL_IMAGE_SIZE))
+
+    def reopen(self, width, height):
+        """Switch capture size without dropping the page's connections.
+
+        The reader thread keeps running against a replaced capture, so an open MJPEG
+        response survives the change instead of every panel going blank.
+        """
+        capture = open_for_preview(self.camera["path"], width=width, height=height)
+        if capture is None:
+            return False
+        with self.lock:
+            previous, self.capture, self.frame = self.capture, capture, None
+        if previous is not None:
+            previous.release()
+        return True
 
     def close(self):
         self.stop.set()
@@ -313,8 +415,6 @@ def get_cv2_rotation_code(rotation):
             -90: cv2.ROTATE_90_COUNTERCLOCKWISE}[rotation]
 
 
-CAPTURE_WIDTH, CAPTURE_HEIGHT = 1280, 720  # What recording asks for; the page previews smaller.
-CAPTURE_FPS, CAPTURE_FOURCC = 30, "MJPG"
 
 
 def size_for(width, height, rotation):
@@ -330,10 +430,10 @@ PAGE = """<!doctype html><meta charset=utf-8><title>SO-101 cameras</title>
 <style>
  body{font:14px system-ui,sans-serif;margin:0;padding:20px;background:#111;color:#eee}
  h1{font-size:16px;margin:0 0 4px}
- .hint{margin:0 0 14px;color:#aaa}
- .save{display:flex;align-items:center;gap:12px;margin:0 0 18px}
- .save a{background:#7ab7ff;color:#111;font-weight:700;text-decoration:none;border-radius:6px;padding:7px 14px}
- .save .msg{color:#9f9}
+ .hint{margin:0 0 14px;color:#aaa;max-width:70em}
+ .bars{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin:0 0 18px}
+ .bars a.go{background:#7ab7ff;color:#111;font-weight:700;text-decoration:none;border-radius:6px;padding:7px 14px}
+ .msg{color:#9f9}
  .row{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start}
  .cam{background:#1c1c1c;border:1px solid #333;border-radius:10px;overflow:hidden;width:%(width)dpx}
  .cam img{display:block;width:100%%;background:#000}
@@ -342,16 +442,28 @@ PAGE = """<!doctype html><meta charset=utf-8><title>SO-101 cameras</title>
  .pick,.rot{display:flex;gap:4px}
  .pick{width:100%%}
  .rot{margin-left:auto}
- .bar a{color:#ddd;text-decoration:none;border:1px solid #444;border-radius:5px;padding:2px 7px;font-size:12px}
- .bar a.on{background:#7ab7ff;color:#111;border-color:#7ab7ff}
+ a.btn{color:#ddd;text-decoration:none;border:1px solid #444;border-radius:5px;padding:2px 7px;font-size:12px}
+ a.btn.on{background:#7ab7ff;color:#111;border-color:#7ab7ff}
  .lbl{color:#777;font-size:12px;align-self:center}
+ .eye{border-top:1px solid #333;padding:10px;display:flex;gap:10px;align-items:center}
+ .eye img{width:112px;height:112px;flex:none;border:1px solid #333;border-radius:4px}
+ .eye p{margin:0;color:#888;font-size:12px;line-height:1.5}
  code{background:#000;padding:1px 5px;border-radius:4px;color:#9f9}
 </style>
 <h1>%(heading)s</h1>
 <p class=hint>%(hint)s</p>
-%(save)s
+<div class=bars><a class=go href="/save">Save %(file)s</a><span class=msg>%(message)s</span></div>
+<div class=bars><span class=lbl>capture size</span>%(sizes)s<span class=lbl>%(fill)s</span></div>
 <div class=row>%(cameras)s</div>
 """
+
+PANEL_WIDTH = 320
+
+
+def fill_note(width, height):
+    """How much of the policy's 224 square this capture size actually fills."""
+    short = round(MODEL_IMAGE_SIZE * min(width, height) / max(width, height))
+    return f"{width}x{height} fills {short * MODEL_IMAGE_SIZE / (MODEL_IMAGE_SIZE ** 2) * 100:.0f}% of the 224 square"
 
 
 class PreviewState:
@@ -363,16 +475,26 @@ class PreviewState:
     """
 
     def __init__(self, streams, *, save_path, fps=CAPTURE_FPS, fourcc=CAPTURE_FOURCC,
-                 sensor=(CAPTURE_WIDTH, CAPTURE_HEIGHT)):
+                 sensor=(CAPTURE_WIDTH, CAPTURE_HEIGHT), sizes=()):
         self.streams = streams
         self.save_path = Path(save_path)
         self.fps, self.fourcc = fps, fourcc
         self.sensor = sensor  # unrotated, so a rotation change never compounds
+        self.sizes = list(sizes)
         self.roles = {}
         self.message = ""
         for number, stream in enumerate(streams, 1):
             if stream.camera.get("role") in COURSE_CAMERA_NAMES:
                 self.roles[number] = stream.camera["role"]
+
+    def set_capture_size(self, width, height):
+        """Every camera changes together: recording needs one size across all views."""
+        for stream in self.streams:
+            if not stream.reopen(width, height):
+                self.message = "A camera refused that size; nothing was changed."
+                return
+        self.sensor = (width, height)
+        self.message = ""
 
     def assign(self, number, role):
         """One role belongs to one camera, so assigning it takes it off any other."""
@@ -405,9 +527,21 @@ class PreviewState:
             self.message = f"Choose which camera is {' and which is '.join(unset)} first."
             return
         self.save_path.parent.mkdir(parents=True, exist_ok=True)
-        self.save_path.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+        self.save_path.write_text(rendered_configuration(entries), encoding="utf-8")
         self.message = f"Saved {self.save_path}."
         print(f"  saved {self.save_path}")
+
+
+def rendered_configuration(entries):
+    """cameras.json with one camera per line, matching the lesson's printed example.
+
+    The lesson shows the file so a reader can write it by hand, and the page writes the
+    same file from the buttons. Keeping the two byte-for-byte comparable means a reader
+    can check one against the other without wondering whether a formatting difference
+    means a content difference.
+    """
+    lines = [f'  "{name}": {json.dumps(entry, separators=(", ", ": "))}' for name, entry in entries.items()]
+    return "{\n" + ",\n".join(lines) + "\n}\n"
 
 
 def build_page(state, *, heading, hint, rotatable, assignable):
@@ -417,24 +551,31 @@ def build_page(state, *, heading, hint, rotatable, assignable):
         picker = ""
         if assignable:
             choices = "".join(
-                f'<a class="{"on" if role == name else ""}" href="/assign/{number}/{name}">{name}</a>'
+                f'<a class="btn {"on" if role == name else ""}" href="/assign/{number}/{name}">{name}</a>'
                 for name in COURSE_CAMERA_NAMES)
-            clear = f'<a class="{"on" if role is None else ""}" href="/assign/{number}/none">not used</a>'
+            clear = f'<a class="btn {"on" if role is None else ""}" href="/assign/{number}/none">not used</a>'
             picker = f'<span class=pick><span class=lbl>this is</span>{choices}{clear}</span>'
         turns = ""
         if rotatable:
             links = "".join(
-                f'<a class="{"on" if stream.rotation == value else ""}" href="/rotate/{number}/{value}">{value}</a>'
+                f'<a class="btn {"on" if stream.rotation == value else ""}" href="/rotate/{number}/{value}">{value}</a>'
                 for value in ROTATIONS)
             turns = f'<span class=rot><span class=lbl>rotation</span>{links}</span>'
         title = role if role else model_name(stream.camera["card"])
         cards.append(
             f'<div class=cam><img src="/stream/{number}" alt="camera {number}">'
-            f'<div class=bar><span class=n>[{number}]</span><span>{title}</span>{turns}{picker}</div></div>')
-    save = (f'<div class=save><a href="/save">Save {state.save_path.name}</a>'
-            f'<span class=msg>{state.message}</span></div>')
-    return (PAGE % {"width": PREVIEW_WIDTH // 2, "heading": heading, "hint": hint,
-                    "save": save, "cameras": "".join(cards)}).encode("utf-8")
+            f'<div class=bar><span class=n>[{number}]</span><span>{title}</span>{turns}{picker}</div>'
+            f'<div class=eye><img src="/model/{number}" alt="what the policy sees">'
+            f'<p>What a pi0 policy receives: this frame padded into 224x224. '
+            f'The black bars are pixels the model never gets.</p></div></div>')
+    sizes = "".join(
+        f'<a class="btn {"on" if (width, height) == tuple(state.sensor) else ""}" '
+        f'href="/size/{width}/{height}">{width}x{height}</a>'
+        for width, height in state.sizes) or '<span class=lbl>(could not be read from the hardware)</span>'
+    return (PAGE % {"width": PANEL_WIDTH, "heading": heading, "hint": hint,
+                    "file": state.save_path.name, "message": state.message,
+                    "sizes": sizes, "fill": fill_note(*state.sensor),
+                    "cameras": "".join(cards)}).encode("utf-8")
 
 
 def serve_preview(state, *, port, heading, hint, rotatable=True, assignable=False):
@@ -453,14 +594,15 @@ def serve_preview(state, *, port, heading, hint, rotatable=True, assignable=Fals
         def log_message(self, *_args):
             pass  # One line per JPEG would bury the instructions printed above.
 
-        def _stream(self, number):
+        def _stream(self, number, *, model=False):
             stream = streams[number - 1]
+            source = stream.model_jpeg if model else stream.jpeg
             self.send_response(200)
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
             self.end_headers()
             try:
                 while True:
-                    jpeg = stream.jpeg()
+                    jpeg = source()
                     if jpeg is None:
                         time.sleep(0.05)
                         continue
@@ -488,8 +630,13 @@ def serve_preview(state, *, port, heading, hint, rotatable=True, assignable=Fals
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if parts[0] == "stream" and parts[1].isdigit() and 1 <= int(parts[1]) <= len(streams):
-                self._stream(int(parts[1]))
+            if parts[0] in ("stream", "model") and parts[1].isdigit() and 1 <= int(parts[1]) <= len(streams):
+                self._stream(int(parts[1]), model=parts[0] == "model")
+                return
+            if parts[0] == "size" and len(parts) == 3:
+                state.set_capture_size(int(parts[1]), int(parts[2]))
+                print(f"  capture size {parts[1]}x{parts[2]}")
+                self._redirect_home()
                 return
             if parts[0] == "rotate" and len(parts) == 3 and rotatable:
                 number, value = int(parts[1]), int(parts[2])
@@ -525,12 +672,12 @@ def serve_preview(state, *, port, heading, hint, rotatable=True, assignable=Fals
         server.server_close()
 
 
-def start_streams(cameras):
+def start_streams(cameras, *, size=(CAPTURE_WIDTH, CAPTURE_HEIGHT)):
     """Every camera opened for the page; the ones that refuse are named, not fatal."""
     streams = []
     for number, camera in enumerate(cameras, 1):
         stream = CameraStream(camera, rotation=camera.get("rotation", 0))
-        if stream.start():
+        if stream.start(*size):
             streams.append(stream)
         else:
             print(f"  [{number}] could not be opened; close whatever is using it and run this again")
@@ -570,7 +717,7 @@ def run_list(args):
     if not streams:
         print("\nNo camera could be opened for viewing.")
         return 1
-    state = PreviewState(streams, save_path=args.cameras)
+    state = PreviewState(streams, save_path=args.cameras, sizes=shared_sizes(cameras))
     try:
         serve_preview(state, port=args.port, assignable=True,
                       heading="Which camera is which?",
@@ -745,18 +892,18 @@ def run_preview(cameras, *, port=DEFAULT_PORT, snapshot=None, save_path="cameras
                for name, camera in cameras.items()]
     if snapshot is not None:
         return 0 if write_snapshot(entries, snapshot) else 1
-    streams = start_streams(entries)
+    # The file stores sizes after rotation, so read them back to sensor order before the
+    # cameras are opened; otherwise every turn would swap them again.
+    first = next(iter(cameras.values()))
+    sensor = size_for(first["width"] or CAPTURE_WIDTH, first["height"] or CAPTURE_HEIGHT,
+                      first["rotation"])
+    streams = start_streams(entries, size=sensor)
     if len(streams) != len(entries):
         for stream in streams:
             stream.close()
         print("Not every configured camera could be opened, so orientation cannot be settled here.")
         return 1
-    # The file stores sizes after rotation, so read them back to sensor order before the
-    # page starts changing rotations; otherwise every turn would swap them again.
-    first = next(iter(cameras.values()))
-    sensor = size_for(first["width"] or CAPTURE_WIDTH, first["height"] or CAPTURE_HEIGHT,
-                      first["rotation"])
-    state = PreviewState(streams, save_path=save_path, sensor=sensor,
+    state = PreviewState(streams, save_path=save_path, sensor=sensor, sizes=shared_sizes(entries),
                          fps=first["fps"] or CAPTURE_FPS, fourcc=first["fourcc"] or CAPTURE_FOURCC)
     try:
         serve_preview(state, port=port,
