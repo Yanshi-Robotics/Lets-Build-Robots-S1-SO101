@@ -37,6 +37,8 @@ sys.modules["so101_cartesian_demo"] = demo
 visual = load("visual_control", ROOT / "IK/so101_visual_control.py")
 teleop = load("teleop_log", ROOT / "Teleop/so101_teleop_log.py")
 cameras = load("camera_check", ROOT / "Cameras/so101_camera_check.py")
+sys.modules["so101_camera_check"] = cameras
+policy_view = load("policy_view", ROOT / "Cameras/so101_policy_view.py")
 load("so101_ee_teleop", ROOT / "IK/so101_ee_teleop.py")
 
 
@@ -1172,6 +1174,77 @@ class NumericalTests(unittest.TestCase):
                                        self.kinematics.forward_kinematics(seed), atol=1e-8)
 
 
+class PolicyViewTests(unittest.TestCase):
+    """The panels claim to show what a policy receives, so they must reproduce it exactly.
+
+    Every transform here is checked against the function LeRobot itself calls. An
+    approximation would be worse than no picture: it would look authoritative while
+    teaching the wrong thing about where the padding goes.
+    """
+
+    def frames(self):
+        import numpy as np
+
+        generator = np.random.default_rng(0)
+        for height, width in ((480, 640), (720, 1280), (640, 480)):
+            yield generator.integers(0, 255, (height, width, 3), dtype=np.uint8)
+
+    def test_the_pi0_panel_matches_lerobots_centred_padding(self):
+        import numpy as np
+        import torch
+        from lerobot.policies.common.vla_utils import resize_with_pad_torch
+
+        for frame in self.frames():
+            mine = policy_view.resized(frame, (224, 224), "centred")
+            tensor = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(0)
+            theirs = resize_with_pad_torch(tensor, 224, 224)[0].permute(1, 2, 0).numpy()
+            self.assertEqual(mine.shape, theirs.shape)
+            # Compare where the padding is rather than pixel values: the two use different
+            # resamplers, but a bar in the wrong place is the failure that matters.
+            np.testing.assert_array_equal(mine.sum(axis=(1, 2)) == 0, theirs.sum(axis=(1, 2)) == 0)
+            np.testing.assert_array_equal(mine.sum(axis=(0, 2)) == 0, theirs.sum(axis=(0, 2)) == 0)
+
+    def test_the_smolvla_panel_matches_lerobots_top_left_padding(self):
+        import numpy as np
+        import torch
+        from lerobot.policies.common.vla_utils import resize_with_pad
+
+        for frame in self.frames():
+            mine = policy_view.resized(frame, (512, 512), "top-left")
+            tensor = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(0).float() / 255
+            theirs = resize_with_pad(tensor, 512, 512, pad_value=0)[0].permute(1, 2, 0).numpy()
+            self.assertEqual(mine.shape, theirs.shape)
+            np.testing.assert_array_equal(mine.sum(axis=(1, 2)) == 0, theirs.sum(axis=(1, 2)) == 0)
+            np.testing.assert_array_equal(mine.sum(axis=(0, 2)) == 0, theirs.sum(axis=(0, 2)) == 0)
+
+    def test_the_two_conventions_put_the_bars_in_different_places(self):
+        import numpy as np
+
+        # If these ever agreed, one of them would be wrong: that difference is the whole
+        # reason the page shows SmolVLA next to the pi0 family.
+        frame = np.full((480, 640, 3), 255, dtype=np.uint8)
+        centred = policy_view.resized(frame, (512, 512), "centred")
+        top_left = policy_view.resized(frame, (512, 512), "top-left")
+        self.assertTrue((centred[0] == 0).all() and (centred[-1] == 0).all())  # bars on both edges
+        self.assertTrue((top_left[0] == 0).all() and (top_left[-1] != 0).any())  # bar only on top
+
+    def test_act_receives_the_frame_untouched(self):
+        import numpy as np
+
+        frame = next(self.frames())
+        np.testing.assert_array_equal(policy_view.resized(frame, None, None), frame)
+
+    def test_every_listed_policy_is_one_this_program_can_reproduce(self):
+        # A policy whose resizing lives in its backbone's own processor cannot be drawn
+        # honestly here, so it is named in the footnote instead of guessed at.
+        for policy in policy_view.POLICIES:
+            self.assertIn(policy["pad"], (None, "centred", "top-left"), policy["id"])
+            self.assertTrue(policy["note"].strip(), policy["id"])
+        self.assertIn("GR00T", policy_view.NOT_DRAWN)
+        listed = {policy["id"] for policy in policy_view.POLICIES}
+        self.assertEqual(listed, {"act", "pi0", "pi05", "smolvla"})
+
+
 class CameraCheckTests(unittest.TestCase):
     """The camera program's judgements, exercised without a camera attached.
 
@@ -1308,25 +1381,20 @@ class CameraCheckTests(unittest.TestCase):
         self.assertEqual(cameras.route_parts("/"), [])
         self.assertEqual(cameras.route_parts("/rotate/2/180"), ["rotate", "2", "180"])
 
-    def test_only_the_live_views_hold_a_connection_each(self):
-        """The model-eye panels must not be a second stream per camera.
+    def test_the_check_page_holds_one_connection_per_camera(self):
+        """The check page streams the live views and nothing else.
 
-        A browser allows only a handful of connections to one origin. With two endless
-        MJPEG responses per camera they were all consumed, and clicking a rotation button
-        had no connection left to travel on: the page looked frozen rather than broken.
+        Every endless MJPEG response consumes one of the browser's few connections to an
+        origin. A second stream per camera consumed them all, and a click on a rotation
+        button then had none left to travel on: the page looked frozen rather than broken.
+        What a policy receives lives in its own program, partly for this reason.
         """
         with tempfile.TemporaryDirectory() as directory:
             state = self.page_state([0, 0], save_path=Path(directory) / "cameras.json")
             page = cameras.build_page(state, heading="h", hint="", rotatable=True, assignable=True).decode()
-        # Live views are streamed directly...
         self.assertIn('src="/stream/1"', page)
         self.assertIn('src="/stream/2"', page)
-        # ...while the 224 panels are fetched by the refresh script, one short request at a time.
-        # Note the leading space: `data-src="/model/1"` contains `src="/model/` as a substring,
-        # so the check has to look for a bare src attribute rather than any occurrence.
-        self.assertNotIn(' src="/model/', page)
-        self.assertIn('data-src="/model/1"', page)
-        self.assertIn("setInterval(refreshEyes", page)
+        self.assertNotIn("/model/", page)
 
     def test_switching_size_releases_the_camera_before_opening_it_again(self):
         """A camera cannot be held open twice.

@@ -251,29 +251,6 @@ def encode_jpeg(frame):
     return buffer.tobytes() if encoded else None
 
 
-def pad_to_square(frame, side):
-    """Scale the long edge to `side` and centre the result on black, losing nothing.
-
-    This is what `resize_with_pad` does inside the pi0 family before the vision encoder,
-    reproduced here so the page can show what the policy actually receives. The bars are
-    the cost of a non-square frame: a 16:9 picture fills 56 percent of the square, 4:3
-    fills 75 percent.
-    """
-    import cv2
-    import numpy
-
-    if frame is None:
-        return None
-    height, width = frame.shape[:2]
-    scale = side / max(width, height)
-    resized = cv2.resize(frame, (max(1, round(width * scale)), max(1, round(height * scale))),
-                         interpolation=cv2.INTER_AREA)
-    canvas = numpy.zeros((side, side, frame.shape[2]), dtype=frame.dtype)
-    top, left = (side - resized.shape[0]) // 2, (side - resized.shape[1]) // 2
-    canvas[top:top + resized.shape[0], left:left + resized.shape[1]] = resized
-    return canvas
-
-
 def open_for_preview(path, *, width=None, height=None):
     """A camera opened at the given capture size, or None when something else holds it."""
     import cv2
@@ -385,10 +362,6 @@ class CameraStream:
         """The newest frame as JPEG bytes."""
         return encode_jpeg(self.current())
 
-    def model_jpeg(self):
-        """What a pi0-family policy receives: the frame padded into a 224 square."""
-        return encode_jpeg(pad_to_square(self.current(), MODEL_IMAGE_SIZE))
-
     def reopen(self, width, height):
         """Switch capture size without dropping the page's connections.
 
@@ -462,9 +435,6 @@ PAGE = """<!doctype html><meta charset=utf-8><title>SO-101 cameras</title>
  a.btn.rec.on{border-color:#7ab7ff}
  .why{color:#888;font-size:12px;max-width:60em;margin:-8px 0 18px}
  .lbl{color:#777;font-size:12px;align-self:center}
- .eye{border-top:1px solid #333;padding:10px;display:flex;gap:10px;align-items:center}
- .eye img{width:112px;height:112px;flex:none;border:1px solid #333;border-radius:4px}
- .eye p{margin:0;color:#888;font-size:12px;line-height:1.5}
  code{background:#000;padding:1px 5px;border-radius:4px;color:#9f9}
 </style>
 <h1>%(heading)s</h1>
@@ -473,17 +443,6 @@ PAGE = """<!doctype html><meta charset=utf-8><title>SO-101 cameras</title>
 <div class=bars><span class=lbl>capture size</span>%(sizes)s<span class=lbl>%(fill)s</span></div>
 <p class=why>%(why)s</p>
 <div class=row>%(cameras)s</div>
-<script>
- // Refresh the model-eye stills on a timer. They only need to show framing, and a
- // stream each would exhaust the browser's connections to this origin.
- function refreshEyes() {
-   document.querySelectorAll('img.eye-img').forEach(function (img) {
-     img.src = img.dataset.src + '?t=' + Date.now();
-   });
- }
- refreshEyes();
- setInterval(refreshEyes, 700);
-</script>
 """
 
 PANEL_WIDTH = 320
@@ -610,10 +569,7 @@ def build_page(state, *, heading, hint, rotatable, assignable):
         title = role if role else model_name(stream.camera["card"])
         cards.append(
             f'<div class=cam><img src="/stream/{number}" alt="camera {number}">'
-            f'<div class=bar><span class=n>[{number}]</span><span>{title}</span>{turns}{picker}</div>'
-            f'<div class=eye><img class=eye-img data-src="/model/{number}" alt="what the policy sees">'
-            f'<p>What a pi0 policy receives: this frame padded into 224x224. '
-            f'The black bars are pixels the model never gets.</p></div></div>')
+            f'<div class=bar><span class=n>[{number}]</span><span>{title}</span>{turns}{picker}</div></div>')
     sizes = "".join(
         f'<a class="btn {"rec " if (width, height) == (CAPTURE_WIDTH, CAPTURE_HEIGHT) else ""}'
         f'{"on" if (width, height) == tuple(state.sensor) else ""}" '
@@ -645,24 +601,6 @@ def serve_preview(state, *, port, heading, hint, rotatable=True, assignable=Fals
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
             pass  # One line per JPEG would bury the instructions printed above.
-
-        def _still(self, jpeg):
-            """One JPEG over a short-lived request.
-
-            The model-eye panels are served this way rather than as a second stream per
-            camera. A browser allows only a handful of connections to one origin, and two
-            endless MJPEG responses per camera used them all up: the click on a rotation
-            button then had no connection left and simply waited.
-            """
-            if jpeg is None:
-                self.send_error(503)
-                return
-            self.send_response(200)
-            self.send_header("Content-Type", "image/jpeg")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(jpeg)))
-            self.end_headers()
-            self.wfile.write(jpeg)
 
         def _stream(self, number):
             stream = streams[number - 1]
@@ -702,9 +640,6 @@ def serve_preview(state, *, port, heading, hint, rotatable=True, assignable=Fals
                 return
             if parts[0] == "stream" and parts[1].isdigit() and 1 <= int(parts[1]) <= len(streams):
                 self._stream(int(parts[1]))
-                return
-            if parts[0] == "model" and parts[1].isdigit() and 1 <= int(parts[1]) <= len(streams):
-                self._still(streams[int(parts[1]) - 1].model_jpeg())
                 return
             if parts[0] == "size" and len(parts) == 3:
                 state.set_capture_size(int(parts[1]), int(parts[2]))
