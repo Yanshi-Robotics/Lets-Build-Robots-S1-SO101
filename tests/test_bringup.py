@@ -1270,29 +1270,55 @@ class CameraCheckTests(unittest.TestCase):
     def test_a_quarter_turn_swaps_the_dimensions_that_get_written_down(self):
         # LeRobot validates width and height against the frame after rotation, so the pair
         # written into cameras.json has to follow the quarter turns.
-        upright = {"width": 1280, "height": 720, "rotation": 0}
-        self.assertEqual(cameras.rotated_size(upright, 0), (1280, 720))
-        self.assertEqual(cameras.rotated_size(upright, 180), (1280, 720))
-        self.assertEqual(cameras.rotated_size(upright, 90), (720, 1280))
-        self.assertEqual(cameras.rotated_size(upright, -90), (720, 1280))
-        # Going back from a quarter turn restores the original pair rather than swapping again.
-        turned = {"width": 720, "height": 1280, "rotation": 90}
-        self.assertEqual(cameras.rotated_size(turned, 90), (720, 1280))
-        self.assertEqual(cameras.rotated_size(turned, 0), (1280, 720))
+        self.assertEqual(cameras.size_for(1280, 720, 0), (1280, 720))
+        self.assertEqual(cameras.size_for(1280, 720, 180), (1280, 720))
+        self.assertEqual(cameras.size_for(1280, 720, 90), (720, 1280))
+        self.assertEqual(cameras.size_for(1280, 720, -90), (720, 1280))
+        # Being its own inverse is what lets one helper both read a rotated pair back to
+        # sensor order and write it out again.
+        self.assertEqual(cameras.size_for(*cameras.size_for(1280, 720, 90), 90), (1280, 720))
 
-    def test_the_printed_configuration_is_valid_json_carrying_the_chosen_rotations(self):
-        configured = self.configured()
-        printed = json.loads(cameras.cameras_json(configured, [90, 180]))
-        self.assertEqual(printed["top"]["rotation"], 90)
-        self.assertEqual((printed["top"]["width"], printed["top"]["height"]), (720, 1280))
-        self.assertEqual(printed["wrist"]["rotation"], 180)
-        self.assertEqual((printed["wrist"]["width"], printed["wrist"]["height"]), (1280, 720))
-        # It has to be loadable by the same reader that validates cameras.json.
+    def page_state(self, rotations, *, save_path, roles=("top", "wrist")):
+        streams = [SimpleNamespace(rotation=rotation,
+                                   camera={"path": f"/dev/video{index}", "card": "cam", "role": role})
+                   for index, (rotation, role) in enumerate(zip(rotations, roles))]
+        return cameras.PreviewState(streams, save_path=save_path)
+
+    def test_the_page_saves_a_configuration_the_loader_accepts(self):
         with tempfile.TemporaryDirectory() as directory:
-            file = Path(directory) / "cameras.json"
-            file.write_text(cameras.cameras_json(configured, [90, 180]), encoding="utf-8")
-            reloaded = cameras.load_cameras_file(file)
+            target = Path(directory) / "cameras.json"
+            state = self.page_state([90, 180], save_path=target)
+            state.save()
+            self.assertIn("Saved", state.message)
+            reloaded = cameras.load_cameras_file(target)
         self.assertEqual(reloaded["top"]["rotation"], 90)
+        self.assertEqual(reloaded["wrist"]["rotation"], 180)
+        self.assertEqual((reloaded["top"]["width"], reloaded["top"]["height"]), (720, 1280))
+
+    def test_saving_before_both_views_are_chosen_writes_nothing(self):
+        # A half-filled cameras.json would fail later, at recording time, where it is
+        # far more expensive to notice.
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "cameras.json"
+            state = self.page_state([0, 0], save_path=target, roles=("top", None))
+            state.save()
+            self.assertFalse(target.exists())
+            self.assertIn("wrist", state.message)
+
+    def test_one_role_cannot_sit_on_two_cameras(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.page_state([0, 0], save_path=Path(directory) / "cameras.json")
+            state.assign(2, "top")  # camera 1 held top; it must let go
+            self.assertEqual(state.roles, {2: "top"})
+            state.assign(1, "wrist")
+            self.assertEqual(state.roles, {2: "top", 1: "wrist"})
+
+    def test_a_saved_rotation_does_not_swap_the_sizes_a_second_time_on_reopening(self):
+        # The file stores sizes after rotation. Reading them back as if they were sensor
+        # order would swap them again on every visit to the page.
+        sensor = cameras.size_for(720, 1280, 90)
+        self.assertEqual(sensor, (1280, 720))
+        self.assertEqual(cameras.size_for(*sensor, 90), (720, 1280))
 
 
 if __name__ == "__main__":

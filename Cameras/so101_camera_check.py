@@ -313,45 +313,131 @@ def get_cv2_rotation_code(rotation):
             -90: cv2.ROTATE_90_COUNTERCLOCKWISE}[rotation]
 
 
+CAPTURE_WIDTH, CAPTURE_HEIGHT = 1280, 720  # What recording asks for; the page previews smaller.
+CAPTURE_FPS, CAPTURE_FOURCC = 30, "MJPG"
+
+
+def size_for(width, height, rotation):
+    """A `width` x `height` frame as it measures after `rotation`.
+
+    LeRobot validates width and height against the frame *after* rotation, so a quarter
+    turn swaps them. The function is its own inverse, which is what lets one helper both
+    read a rotated pair back to sensor order and write it out again.
+    """
+    return (height, width) if rotation in (90, -90) else (width, height)
+
 PAGE = """<!doctype html><meta charset=utf-8><title>SO-101 cameras</title>
 <style>
  body{font:14px system-ui,sans-serif;margin:0;padding:20px;background:#111;color:#eee}
  h1{font-size:16px;margin:0 0 4px}
- p{margin:0 0 18px;color:#aaa}
- .row{display:flex;flex-wrap:wrap;gap:16px}
+ .hint{margin:0 0 14px;color:#aaa}
+ .save{display:flex;align-items:center;gap:12px;margin:0 0 18px}
+ .save a{background:#7ab7ff;color:#111;font-weight:700;text-decoration:none;border-radius:6px;padding:7px 14px}
+ .save .msg{color:#9f9}
+ .row{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start}
  .cam{background:#1c1c1c;border:1px solid #333;border-radius:10px;overflow:hidden;width:%(width)dpx}
  .cam img{display:block;width:100%%;background:#000}
- .bar{display:flex;align-items:center;gap:8px;padding:8px 10px;font-size:13px}
+ .bar{display:flex;align-items:center;gap:8px;padding:8px 10px;font-size:13px;flex-wrap:wrap}
  .n{font-weight:700;color:#7ab7ff}
- .rot{margin-left:auto;display:flex;gap:4px}
- .rot a{color:#ddd;text-decoration:none;border:1px solid #444;border-radius:5px;padding:2px 7px;font-size:12px}
- .rot a.on{background:#7ab7ff;color:#111;border-color:#7ab7ff}
+ .pick,.rot{display:flex;gap:4px}
+ .pick{width:100%%}
+ .rot{margin-left:auto}
+ .bar a{color:#ddd;text-decoration:none;border:1px solid #444;border-radius:5px;padding:2px 7px;font-size:12px}
+ .bar a.on{background:#7ab7ff;color:#111;border-color:#7ab7ff}
+ .lbl{color:#777;font-size:12px;align-self:center}
  code{background:#000;padding:1px 5px;border-radius:4px;color:#9f9}
 </style>
 <h1>%(heading)s</h1>
-<p>%(hint)s</p>
+<p class=hint>%(hint)s</p>
+%(save)s
 <div class=row>%(cameras)s</div>
 """
 
 
-def build_page(streams, *, heading, hint, rotatable):
+class PreviewState:
+    """What the page lets an operator change, and where Save writes it.
+
+    Roles and rotations live here rather than on the streams because both are answers
+    about the configuration, not about the capture: the same camera keeps delivering
+    frames while the operator changes their mind about which view it is.
+    """
+
+    def __init__(self, streams, *, save_path, fps=CAPTURE_FPS, fourcc=CAPTURE_FOURCC,
+                 sensor=(CAPTURE_WIDTH, CAPTURE_HEIGHT)):
+        self.streams = streams
+        self.save_path = Path(save_path)
+        self.fps, self.fourcc = fps, fourcc
+        self.sensor = sensor  # unrotated, so a rotation change never compounds
+        self.roles = {}
+        self.message = ""
+        for number, stream in enumerate(streams, 1):
+            if stream.camera.get("role") in COURSE_CAMERA_NAMES:
+                self.roles[number] = stream.camera["role"]
+
+    def assign(self, number, role):
+        """One role belongs to one camera, so assigning it takes it off any other."""
+        self.roles = {held: name for held, name in self.roles.items() if name != role}
+        if role in COURSE_CAMERA_NAMES:
+            self.roles[number] = role
+        else:
+            self.roles.pop(number, None)
+        self.message = ""
+
+    def configuration(self):
+        entries = {}
+        for name in COURSE_CAMERA_NAMES:
+            number = next((held for held, role in self.roles.items() if role == name), None)
+            if number is None:
+                return None
+            stream = self.streams[number - 1]
+            width, height = size_for(*self.sensor, stream.rotation)
+            entries[name] = {"type": "opencv", "index_or_path": str(stream.camera["path"]),
+                             "width": width, "height": height, "fps": self.fps,
+                             "fourcc": self.fourcc, "rotation": stream.rotation}
+        return entries
+
+    def save(self):
+        """Write cameras.json, or say what is still missing. Never a partial file."""
+        entries = self.configuration()
+        if entries is None:
+            unset = [name for name in COURSE_CAMERA_NAMES
+                     if name not in self.roles.values()]
+            self.message = f"Choose which camera is {' and which is '.join(unset)} first."
+            return
+        self.save_path.parent.mkdir(parents=True, exist_ok=True)
+        self.save_path.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+        self.message = f"Saved {self.save_path}."
+        print(f"  saved {self.save_path}")
+
+
+def build_page(state, *, heading, hint, rotatable, assignable):
     cards = []
-    for number, stream in enumerate(streams, 1):
-        buttons = ""
+    for number, stream in enumerate(state.streams, 1):
+        role = state.roles.get(number)
+        picker = ""
+        if assignable:
+            choices = "".join(
+                f'<a class="{"on" if role == name else ""}" href="/assign/{number}/{name}">{name}</a>'
+                for name in COURSE_CAMERA_NAMES)
+            clear = f'<a class="{"on" if role is None else ""}" href="/assign/{number}/none">not used</a>'
+            picker = f'<span class=pick><span class=lbl>this is</span>{choices}{clear}</span>'
+        turns = ""
         if rotatable:
             links = "".join(
                 f'<a class="{"on" if stream.rotation == value else ""}" href="/rotate/{number}/{value}">{value}</a>'
                 for value in ROTATIONS)
-            buttons = f'<span class=rot>{links}</span>'
+            turns = f'<span class=rot><span class=lbl>rotation</span>{links}</span>'
+        title = role if role else model_name(stream.camera["card"])
         cards.append(
             f'<div class=cam><img src="/stream/{number}" alt="camera {number}">'
-            f'<div class=bar><span class=n>[{number}]</span>'
-            f'<span>{model_name(stream.camera["card"])}</span>{buttons}</div></div>')
+            f'<div class=bar><span class=n>[{number}]</span><span>{title}</span>{turns}{picker}</div></div>')
+    save = (f'<div class=save><a href="/save">Save {state.save_path.name}</a>'
+            f'<span class=msg>{state.message}</span></div>')
     return (PAGE % {"width": PREVIEW_WIDTH // 2, "heading": heading, "hint": hint,
-                    "cameras": "".join(cards)}).encode("utf-8")
+                    "save": save, "cameras": "".join(cards)}).encode("utf-8")
 
 
-def serve_preview(streams, *, port, heading, hint, rotatable=False):
+def serve_preview(state, *, port, heading, hint, rotatable=True, assignable=False):
     """A local page showing every stream live, until Ctrl-C.
 
     A page rather than a desktop window because LeRobot pins opencv-python-headless:
@@ -360,6 +446,8 @@ def serve_preview(streams, *, port, heading, hint, rotatable=False):
     over an SSH port forward, which a window never could.
     """
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    streams = state.streams
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -383,12 +471,19 @@ def serve_preview(streams, *, port, heading, hint, rotatable=False):
             except (BrokenPipeError, ConnectionResetError):
                 pass  # The viewer closed the tab or reloaded.
 
+        def _redirect_home(self):
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+
         def do_GET(self):
             parts = [part for part in self.path.split("/") if part]
             if not parts:
-                body = build_page(streams, heading=heading, hint=hint, rotatable=rotatable)
+                body = build_page(state, heading=heading, hint=hint,
+                                  rotatable=rotatable, assignable=assignable)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -396,21 +491,31 @@ def serve_preview(streams, *, port, heading, hint, rotatable=False):
             if parts[0] == "stream" and parts[1].isdigit() and 1 <= int(parts[1]) <= len(streams):
                 self._stream(int(parts[1]))
                 return
-            if rotatable and parts[0] == "rotate" and len(parts) == 3:
+            if parts[0] == "rotate" and len(parts) == 3 and rotatable:
                 number, value = int(parts[1]), int(parts[2])
                 if 1 <= number <= len(streams) and value in ROTATIONS:
                     streams[number - 1].rotation = value
+                    state.message = ""
                     print(f"  [{number}] rotation {value}")
-                self.send_response(303)
-                self.send_header("Location", "/")
-                self.end_headers()
+                self._redirect_home()
+                return
+            if parts[0] == "assign" and len(parts) == 3 and assignable:
+                number = int(parts[1])
+                if 1 <= number <= len(streams):
+                    state.assign(number, parts[2])
+                    print(f"  [{number}] is {parts[2]}")
+                self._redirect_home()
+                return
+            if parts[0] == "save":
+                state.save()
+                self._redirect_home()
                 return
             self.send_error(404)
 
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     server.daemon_threads = True
     print(f"\nOpen  http://127.0.0.1:{port}  in a browser.")
-    print("Press Ctrl-C here when you are done looking.")
+    print("Press Ctrl-C here when you are done.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -465,12 +570,14 @@ def run_list(args):
     if not streams:
         print("\nNo camera could be opened for viewing.")
         return 1
+    state = PreviewState(streams, save_path=args.cameras)
     try:
-        serve_preview(streams, port=args.port,
+        serve_preview(state, port=args.port, assignable=True,
                       heading="Which camera is which?",
                       hint="Wave a hand in front of one lens: the panel that moves is that camera. "
-                           "The view of the whole workbench is <code>top</code>; the view from the "
-                           "gripper is <code>wrist</code>. Note their numbers.")
+                           "Mark the view of the whole workbench as <code>top</code> and the view from "
+                           "the gripper as <code>wrist</code>, turn each picture the right way up, "
+                           "then save.")
     finally:
         for stream in streams:
             stream.close()
@@ -628,36 +735,13 @@ def model_name(card):
     return parts[0] if parts and all(part == parts[0] for part in parts) else str(card)
 
 
-def rotated_size(camera, rotation):
-    """width and height as they must be written for a given rotation.
-
-    LeRobot validates these against the frame after rotation, so 90 and -90 swap them.
-    """
-    width, height = camera["width"], camera["height"]
-    if (camera["rotation"] in (90, -90)) != (rotation in (90, -90)):
-        width, height = height, width
-    return width, height
-
-
-def cameras_json(cameras, rotations):
-    """The cameras.json for the rotations settled on, ready to copy into the file."""
-    entries = {}
-    for name, rotation in zip(cameras, rotations):
-        camera = cameras[name]
-        width, height = rotated_size(camera, rotation)
-        entries[name] = {"type": "opencv", "index_or_path": camera["path"],
-                         "width": width, "height": height, "fps": camera["fps"],
-                         "fourcc": camera["fourcc"], "rotation": rotation}
-    return json.dumps(entries, indent=2)
-
-
-def run_preview(cameras, *, port=DEFAULT_PORT, snapshot=None):
+def run_preview(cameras, *, port=DEFAULT_PORT, snapshot=None, save_path="cameras.json"):
     """Both configured views live, with the four rotations one click apart.
 
     This is the acceptance step the numbers cannot cover: a stream that opens is not yet
     a stream that is the right way up, and rotation is part of the model's input.
     """
-    entries = [{"card": name, "path": camera["path"], "rotation": camera["rotation"]}
+    entries = [{"card": name, "role": name, "path": camera["path"], "rotation": camera["rotation"]}
                for name, camera in cameras.items()]
     if snapshot is not None:
         return 0 if write_snapshot(entries, snapshot) else 1
@@ -667,21 +751,22 @@ def run_preview(cameras, *, port=DEFAULT_PORT, snapshot=None):
             stream.close()
         print("Not every configured camera could be opened, so orientation cannot be settled here.")
         return 1
+    # The file stores sizes after rotation, so read them back to sensor order before the
+    # page starts changing rotations; otherwise every turn would swap them again.
+    first = next(iter(cameras.values()))
+    sensor = size_for(first["width"] or CAPTURE_WIDTH, first["height"] or CAPTURE_HEIGHT,
+                      first["rotation"])
+    state = PreviewState(streams, save_path=save_path, sensor=sensor,
+                         fps=first["fps"] or CAPTURE_FPS, fourcc=first["fourcc"] or CAPTURE_FOURCC)
     try:
-        serve_preview(streams, port=port,
+        serve_preview(state, port=port,
                       heading="Which way up is each image?",
-                      hint="Click a rotation until the picture looks right. The gripper should enter "
+                      hint="Click a rotation until the picture looks right: the gripper should enter "
                            "the wrist view from the bottom, and the workbench should sit square in the "
-                           "top view. Press Ctrl-C in the terminal when done.",
-                      rotatable=True)
+                           "top view. Then save.")
     finally:
-        rotations = [stream.rotation for stream in streams]
         for stream in streams:
             stream.close()
-        for name, rotation in zip(cameras, rotations):
-            cameras[name] = {**cameras[name], "rotation": rotation}
-    print("cameras.json for what you settled on:")
-    print(cameras_json(cameras, rotations))
     return 0
 
 
@@ -742,6 +827,7 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="mode", required=True)
     listing = commands.add_parser("list", help="every camera that delivers frames, with one frame from each")
     listing.add_argument("--verbose", action="store_true", help="also print why each path was chosen")
+    listing.add_argument("--cameras", default="cameras.json", help="where the page's Save button writes")
     listing.add_argument("--snapshot", help="write one still per camera to this file instead of serving a page")
     listing.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"port for the viewing page (default {DEFAULT_PORT})")
     check = commands.add_parser("check", help="verify cameras.json, then show both views")
@@ -763,7 +849,8 @@ def main(argv=None):
             if args.frames < 2:
                 parser.error("at least two frames are needed to tell a moving stream from a frozen one")
             return run_check(args)
-        return run_preview(load_cameras_file(args.cameras), port=args.port, snapshot=args.snapshot)
+        return run_preview(load_cameras_file(args.cameras), port=args.port,
+                           snapshot=args.snapshot, save_path=args.cameras)
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         return 130
