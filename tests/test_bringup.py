@@ -36,6 +36,7 @@ demo = load("cartesian_demo", ROOT / "IK/so101_cartesian_demo.py")
 sys.modules["so101_cartesian_demo"] = demo
 visual = load("visual_control", ROOT / "IK/so101_visual_control.py")
 teleop = load("teleop_log", ROOT / "Teleop/so101_teleop_log.py")
+cameras = load("camera_check", ROOT / "Cameras/so101_camera_check.py")
 load("so101_ee_teleop", ROOT / "IK/so101_ee_teleop.py")
 
 
@@ -1169,6 +1170,102 @@ class NumericalTests(unittest.TestCase):
                 viewer.get_actuated_joint_names(), seed, 0, travel)))
             np.testing.assert_allclose(loaded.get_transform("gripper_frame_link"),
                                        self.kinematics.forward_kinematics(seed), atol=1e-8)
+
+
+class CameraCheckTests(unittest.TestCase):
+    """The camera program's judgements, exercised without a camera attached.
+
+    Everything tested here decides something an operator would otherwise have to notice by
+    eye: which path names a camera, and whether two configured streams are fit to record.
+    """
+
+    def configured(self, **overrides):
+        entry = {"path": "/dev/video0", "width": 1280, "height": 720,
+                 "fps": 30, "fourcc": "MJPG", "rotation": 0}
+        return {name: {**entry, **overrides.get(name, {})} for name in ("top", "wrist")}
+
+    def measured(self, fps=30.0, identical=0, frames=90):
+        return {name: {"fps": fps, "identical": identical, "frames": frames,
+                       "width": 1280, "height": 720} for name in ("top", "wrist")}
+
+    def test_by_id_is_preferred_only_while_it_names_one_camera(self):
+        links = {"/dev/video4": [("by-id", Path("/dev/v4l/by-id/usb-Model-video-index0")),
+                                 ("by-path", Path("/dev/v4l/by-path/pci-0-usb-0:4.3:1.0-video-index0"))]}
+        alone, _ = cameras.preferred_path(Path("/dev/video4"), links, model_is_duplicated=False)
+        self.assertEqual(alone.parent.name, "by-id")
+        # Two cameras of one model: udev keeps a single by-id link and it points at whichever
+        # enumerated last, so the link that exists is the wrong thing to write down.
+        duplicated, reason = cameras.preferred_path(Path("/dev/video4"), links, model_is_duplicated=True)
+        self.assertEqual(duplicated.parent.name, "by-path")
+        self.assertIn("serial", reason)
+
+    def test_a_camera_with_no_link_at_all_reports_the_bare_number_as_unstable(self):
+        path, reason = cameras.preferred_path(Path("/dev/video9"), {}, model_is_duplicated=False)
+        self.assertEqual(str(path), "/dev/video9")
+        self.assertIn("changes when the camera is replugged", reason)
+
+    def test_two_entries_on_one_camera_are_named_before_anything_is_opened(self):
+        # One camera entered twice also fails to open the second time. That failure must not
+        # be reported as "could not be opened", which sends the operator to the wrong problem.
+        verdict, detail = cameras.verdict(self.configured(), {}, {"top": "usb-1-4.4", "wrist": "usb-1-4.4"})
+        self.assertEqual(verdict, "SAME CAMERA")
+        self.assertIn("usb-1-4.4", detail)
+
+    def test_a_frozen_stream_is_not_ready_even_at_full_rate(self):
+        results = self.measured()
+        results["wrist"] = {**results["wrist"], "identical": 89}
+        verdict, detail = cameras.verdict(self.configured(), results,
+                                          {"top": "usb-1-4.4", "wrist": "usb-1-4.3"})
+        self.assertEqual(verdict, "NOT READY")
+        self.assertIn("wrist", detail)
+
+    def test_a_still_workbench_does_not_fail_on_repeated_frames(self):
+        # Identical neighbours are normal when nothing moves; only an entirely unchanging
+        # buffer means the stream stopped.
+        results = self.measured(identical=88)
+        verdict, _ = cameras.verdict(self.configured(), results,
+                                     {"top": "usb-1-4.4", "wrist": "usb-1-4.3"})
+        self.assertEqual(verdict, "READY")
+
+    def test_a_stream_below_its_configured_rate_reports_the_number(self):
+        results = self.measured()
+        results["top"] = {**results["top"], "fps": 21.4}
+        verdict, detail = cameras.verdict(self.configured(), results,
+                                          {"top": "usb-1-4.4", "wrist": "usb-1-4.3"})
+        self.assertEqual(verdict, "NOT READY")
+        self.assertIn("21.4", detail)
+        self.assertIn("30", detail)
+
+    def test_an_unopened_camera_is_undecided_rather_than_failed(self):
+        results = {"top": self.measured()["top"]}
+        verdict, detail = cameras.verdict(self.configured(), results,
+                                          {"top": "usb-1-4.4", "wrist": "usb-1-4.3"})
+        self.assertEqual(verdict, "CANNOT TELL")
+        self.assertIn("wrist", detail)
+
+    def write_config(self, directory, entries):
+        file = Path(directory) / "cameras.json"
+        file.write_text(json.dumps(entries), encoding="utf-8")
+        return file
+
+    def test_the_configuration_must_carry_both_course_view_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            file = self.write_config(directory, {"top": {"type": "opencv", "index_or_path": "/dev/video0"}})
+            with self.assertRaises(RuntimeError) as raised:
+                cameras.load_cameras_file(file)
+            self.assertIn("wrist", str(raised.exception))
+
+    def test_a_rotation_lerobot_cannot_express_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entry = {"type": "opencv", "index_or_path": "/dev/video0", "rotation": 45}
+            file = self.write_config(directory, {"top": entry, "wrist": dict(entry)})
+            with self.assertRaises(RuntimeError) as raised:
+                cameras.load_cameras_file(file)
+            self.assertIn("45", str(raised.exception))
+
+    def test_the_four_rotations_are_exactly_lerobots_own(self):
+        from lerobot.cameras.configs import Cv2Rotation
+        self.assertEqual(set(cameras.ROTATIONS), {rotation.value for rotation in Cv2Rotation})
 
 
 if __name__ == "__main__":

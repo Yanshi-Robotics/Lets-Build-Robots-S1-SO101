@@ -8,11 +8,14 @@ __pycache__/
 # 校准结果：跟着这一台实物走，换机器就不对
 calibration/
 
-# 第 7 课 prepare 从 TheRobotStudio 锁定 commit 下载的模型，随时可重取
+# 第 8 课 prepare 从 TheRobotStudio 锁定 commit 下载的模型，随时可重取
 models/
 
-# 第 7 课三维控制程序每次运行写一份调试日志，只留最近 20 份，出问题时把最新那份发出来
+# 第 8 课三维控制程序每次运行写一份调试日志，只留最近 20 份，出问题时把最新那份发出来
 IK/logs/
 
-# 第 8 课的诊断工具与官方 lerobot-record 的产物都写在这里，跟着这一台实物走
+# 第 7 课的诊断工具与官方 lerobot-record 的产物都写在这里，跟着这一台实物走
 Teleop/logs/
+
+# 第 9 课的摄像头配置：设备路径与画面方向跟着这一台实物和它的 USB 口走
+cameras.json

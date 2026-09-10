@@ -20,9 +20,10 @@
 ## 仓库里有什么
 
 - **`Bringup/`**：`so101_bus_check.py` 读一条总线上的六台电机；`so101_calibrate.py` 记录每个关节的中位和活动范围。第 6 课用。
+- **`Cameras/`**：`so101_camera_check.py` 把视频节点按背后的物理相机分组、给出各自该用的稳定路径，再按 `cameras.json` 打开两台相机，分别测出单开与同开的速率，并把两路画面显示出来供确定方向。第 9 课用。
 - **`IK/`**：`so101_cartesian_demo.py` 下载锁定模型，并用 LeRobot 自带的 IK 解一步笛卡尔位移；`so101_visual_control.py` 先自检，再打开网页显示机械臂当前姿态且不上电，点击启用某个模式才上电：LeRobot 的键盘设备、示教臂、或拖出目标交给 IK 求解。`so101_ee_teleop.py` 是键盘控制的无界面版本，能跑起来的最小形态。第 8 课用。三个文件必须放在同一个文件夹：两个控制程序从第一个里取模型相关的函数。
 - **`Teleop/`**：`so101_teleop_log.py` 打印两只臂的保护与校准寄存器、把两只臂对着读，并给 `lerobot-record` 录下的数据打分。遥操作本身仍然用官方的 `lerobot-teleoperate`。第 7 课用。
-- **`tests/`**：76 条测试，用假硬件跑这些程序。
+- **`tests/`**：86 条测试，用假硬件跑这些程序。
 - **`Teleop/logs/`**（不进 git）：诊断程序每次运行一份调试日志，只留最近 20 份，`lerobot-record` 录下的数据也放这里。出问题时把最新那份发出来。
 - **`tools/`**：`build_control_poses.py` 计算课程原理图里画的姿态。
 
@@ -73,7 +74,7 @@ python IK/so101_cartesian_demo.py preview --model-dir models/so101 --delta-mm 0 
 改过程序，提交前先跑测试：
 
 ```bash
-python tests/test_bringup.py                            # 只用假硬件，末行是 OK (skipped=16)
+python tests/test_bringup.py                            # 只用假硬件，末行是 OK (skipped=17)
 python tests/test_bringup.py --model-dir models/so101   # 加上数值 IK 检查，末行是 OK
 ```
 
