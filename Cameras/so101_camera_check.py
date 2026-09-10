@@ -132,43 +132,133 @@ def preferred_path(node, links, *, model_is_duplicated):
     return node, "no stable link exists; this number changes when the camera is replugged"
 
 
-def run_list(args):
-    links = stable_links()
-    nodes = video_nodes()
-    if not nodes:
-        print("No /dev/video* node exists. Plug the cameras in and run this again.")
-        return 1
+def survey():
+    """Every camera that can actually deliver frames, in a stable order, with its best path.
+
+    Node-level detail is collected here but not printed by default: an operator choosing
+    between two cameras needs one line per camera, not one line per /dev entry.
+    """
+    links, nodes = stable_links(), video_nodes()
     groups = {}
     for node, capability in nodes:
         key = capability["bus_info"] if capability else f"unknown:{node}"
         groups.setdefault(key, []).append((node, capability))
-    # How many separate cameras report each model name. Two of the same model is what breaks
-    # by-id, so it is counted once here rather than guessed at per node.
+    # Two cameras of one model is what breaks by-id, so it is counted across the whole
+    # machine once, rather than guessed at from a single node.
     buses_per_card = {}
     for bus, members in groups.items():
         card = next((capability["card"] for _, capability in members if capability), None)
         if card:
             buses_per_card.setdefault(card, set()).add(bus)
-    print(f"{len(nodes)} node(s) on {len(groups)} physical camera(s).")
-    for bus, members in groups.items():
+    cameras, notes = [], []
+    for bus, members in sorted(groups.items()):
         card = next((capability["card"] for _, capability in members if capability), "unknown device")
-        print("")
-        print(f"=== {card}  on {bus} ===")
         for node, capability in members:
             if capability is None:
-                print(f"  {node}  cannot be queried; another program may hold it open")
+                notes.append(f"{node} could not be queried; another program may be holding it open")
                 continue
             if not capability["captures"]:
-                print(f"  {node}  no capture capability (metadata node); never put this in cameras.json")
+                notes.append(f"{node} carries metadata, not images; it is never a camera path")
                 continue
             duplicated = len(buses_per_card.get(capability["card"], set())) > 1
             path, reason = preferred_path(node, links, model_is_duplicated=duplicated)
-            print(f"  {node}  captures video")
-            print(f"      use: {path}")
-            print(f"      because {reason}.")
+            cameras.append({"node": node, "card": card, "bus": bus, "path": path,
+                            "reason": reason, "duplicated": duplicated})
+    return cameras, notes
+
+
+def grab_one_frame(path):
+    """One frame from a camera, opened and closed again; None when it delivers nothing.
+
+    Cameras are opened one at a time here. Three at once can exceed what a shared USB
+    controller carries, and a failure to open would then look like a broken camera.
+    """
+    import cv2
+
+    capture = cv2.VideoCapture(str(path), cv2.CAP_V4L2)
+    if not capture.isOpened():
+        capture.release()
+        return None
+    try:
+        capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        # The first frames off a UVC camera are often stale or half exposed.
+        for _ in range(8):
+            received, frame = capture.read()
+        return frame if received else None
+    finally:
+        capture.release()
+
+
+def show_frames(cameras, *, height=360, snapshot=None):
+    """One frame per camera, side by side, each labelled with the number printed above.
+
+    This is the step that answers which camera is which. No amount of device text can:
+    the overhead camera and the wrist camera are the same model on this bench, and only
+    the picture tells them apart.
+    """
+    import cv2
+    import numpy
+
+    panels = []
+    for number, camera in enumerate(cameras, 1):
+        frame = grab_one_frame(camera["path"])
+        if frame is None:
+            print(f"  [{number}] delivered no frame; another program may be holding it open")
+            continue
+        scale = height / frame.shape[0]
+        panel = cv2.resize(frame, (max(1, int(frame.shape[1] * scale)), height))
+        panels.append(label(panel, [f"[{number}]  {model_name(camera['card'])}"], cv2,
+                            up_arrow=False, scale=0.6))
+    if not panels:
+        return False
+    board = numpy.hstack(panels)
+    if snapshot:
+        target = Path(snapshot)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(target), board)
+        print(f"Wrote {target}.")
+        return True
+    window = "Which camera is which - press any key to close"
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    cv2.imshow(window, board)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+    return True
+
+
+def run_list(args):
+    cameras, notes = survey()
+    if not cameras:
+        print("No camera delivers frames on this computer. Plug them in and run this again.")
+        for note in notes:
+            print(f"  {note}")
+        return 1
+
+    print(f"Found {len(cameras)} camera(s) that deliver frames.\n")
+    for number, camera in enumerate(cameras, 1):
+        print(f"  [{number}] {model_name(camera['card'])}")
+        print(f"      {camera['path']}")
+    if any(camera["duplicated"] for camera in cameras):
+        print("\nTwo cameras of one model report no serial number, so the paths above name the USB")
+        print("socket rather than the camera. Leave each camera in the socket it is in now.")
+    if args.verbose:
+        print("\nWhy each path was chosen:")
+        for number, camera in enumerate(cameras, 1):
+            print(f"  [{number}] {camera['node']} on {camera['bus']}: {camera['reason']}.")
+        for note in notes:
+            print(f"  {note}")
+
+    print("\nNow look at the pictures. The view looking down at the workbench is `top`;")
+    print("the view from the gripper is `wrist`. Note their numbers, then copy those two")
+    print("paths into cameras.json.")
+    if args.snapshot is None and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        print("\nNo display here, so nothing can be shown. Run this again with --snapshot out.jpg")
+        print("and open that file.")
+        return 0
     print("")
-    print("Which of these is `top` and which is `wrist` cannot be read from any of the text above.")
-    print("Run `preview` on a path and look at the picture; that is the only thing that settles it.")
+    show_frames(cameras, snapshot=args.snapshot)
     return 0
 
 
@@ -300,21 +390,38 @@ def say_verdict(name, detail, cameras):
 
 # --- the viewer ---------------------------------------------------------------------
 
-def label(frame, lines, cv2):
-    """Burn the caption into a copy of the frame, so what is shown carries its own identity."""
+def label(frame, lines, cv2, *, up_arrow=True, scale=0.8):
+    """Burn the caption into a copy of the frame, so what is shown carries its own identity.
+
+    The up arrow belongs to the orientation viewer, where the question is which edge of
+    the picture the model will see as up. While identifying cameras there is no such
+    question yet, and the arrow only competes with the number, so it is optional.
+    """
     import numpy
 
     canvas = numpy.ascontiguousarray(frame)
+    step = int(34 * scale / 0.8)
     for row, text in enumerate(lines):
-        origin = (12, 30 + row * 30)
-        cv2.putText(canvas, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 5, cv2.LINE_AA)
-        cv2.putText(canvas, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-    # An arrow at the top edge: the only reliable way to say "this side is up in the data"
-    # is to point at it in the picture the model will receive.
-    top = (canvas.shape[1] // 2, 18)
-    cv2.arrowedLine(canvas, (top[0], top[1] + 46), top, (0, 0, 0), 8, tipLength=0.4)
-    cv2.arrowedLine(canvas, (top[0], top[1] + 46), top, (255, 255, 255), 3, tipLength=0.4)
+        origin = (12, int(30 * scale / 0.8) + row * step)
+        cv2.putText(canvas, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 5, cv2.LINE_AA)
+        cv2.putText(canvas, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 2, cv2.LINE_AA)
+    if up_arrow:
+        # The only reliable way to say "this side is up in the data" is to point at it in
+        # the picture the model will receive.
+        top = (canvas.shape[1] // 2, 18)
+        cv2.arrowedLine(canvas, (top[0], top[1] + 46), top, (0, 0, 0), 8, tipLength=0.4)
+        cv2.arrowedLine(canvas, (top[0], top[1] + 46), top, (255, 255, 255), 3, tipLength=0.4)
     return canvas
+
+
+def model_name(card):
+    """The camera's model as one name.
+
+    V4L2 hands back whatever the device reports, and these modules report their name
+    twice with a colon between. Printing that verbatim wastes the width the number needs.
+    """
+    parts = [part.strip() for part in str(card).split(":") if part.strip()]
+    return parts[0] if parts and all(part == parts[0] for part in parts) else str(card)
 
 
 def compose(opened, cameras, rotations, chosen, *, height, cv2):
@@ -468,7 +575,9 @@ def run_check(args):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="mode", required=True)
-    commands.add_parser("list", help="every video node, grouped by physical camera")
+    listing = commands.add_parser("list", help="every camera that delivers frames, with one frame from each")
+    listing.add_argument("--verbose", action="store_true", help="also print why each path was chosen")
+    listing.add_argument("--snapshot", help="write the frames to this file instead of opening a window")
     check = commands.add_parser("check", help="verify cameras.json, then show both views")
     check.add_argument("--cameras", default="cameras.json", help="the LeRobot camera configuration to verify")
     check.add_argument("--frames", type=int, default=90, help="frames per measurement (90 is about 3s at 30 FPS)")
