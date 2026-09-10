@@ -1299,6 +1299,15 @@ class CameraCheckTests(unittest.TestCase):
         self.assertEqual((reloaded["wrist"]["width"], reloaded["wrist"]["height"]),
                          (cameras.CAPTURE_WIDTH, cameras.CAPTURE_HEIGHT))
 
+    def test_a_cache_busting_query_string_still_routes(self):
+        # The page appends ?t=<now> when refreshing the stills. A parser that splits the
+        # raw path sees "1?t=1757..." instead of "1", and every refresh 404s: the panels
+        # go to a broken-image icon while the rest of the page looks fine.
+        self.assertEqual(cameras.route_parts("/model/1?t=1757000000000"), ["model", "1"])
+        self.assertEqual(cameras.route_parts("/model/1"), ["model", "1"])
+        self.assertEqual(cameras.route_parts("/"), [])
+        self.assertEqual(cameras.route_parts("/rotate/2/180"), ["rotate", "2", "180"])
+
     def test_only_the_live_views_hold_a_connection_each(self):
         """The model-eye panels must not be a second stream per camera.
 

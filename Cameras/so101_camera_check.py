@@ -581,6 +581,15 @@ def rendered_configuration(entries):
     return "{\n" + ",\n".join(lines) + "\n}\n"
 
 
+def route_parts(path):
+    """Path segments of a request, with any query string dropped.
+
+    The page appends `?t=<now>` when refreshing the model-eye stills to defeat caching,
+    so a parser that splits the raw path sees "1?t=1757..." where it expects "1".
+    """
+    return [part for part in path.split("?", 1)[0].split("/") if part]
+
+
 def build_page(state, *, heading, hint, rotatable, assignable):
     cards = []
     for number, stream in enumerate(state.streams, 1):
@@ -680,7 +689,7 @@ def serve_preview(state, *, port, heading, hint, rotatable=True, assignable=Fals
             self.end_headers()
 
         def do_GET(self):
-            parts = [part for part in self.path.split("/") if part]
+            parts = route_parts(self.path)
             if not parts:
                 body = build_page(state, heading=heading, hint=hint,
                                   rotatable=rotatable, assignable=assignable)
