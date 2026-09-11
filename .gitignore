@@ -22,3 +22,6 @@ cameras.json
 
 # 笛卡尔控制程序每次运行写一个日志目录（run.log + ticks.jsonl），只留最近 30 次
 Cartesian/logs/
+
+# 手柄配对结果：轴号和键号跟着这一只手柄走
+Cartesian/gamepad_map.json

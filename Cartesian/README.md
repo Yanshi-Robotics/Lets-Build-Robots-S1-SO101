@@ -164,6 +164,22 @@ jq -c '[.t, .target.source, .err_mm.goal, .err_mm.meas, .lead_limited]' Cartesia
 jq -c 'select(.solve) | .solve' Cartesian/logs/latest/ticks.jsonl
 ```
 
+## Gamepad: pairing first
+
+```sh
+.venv/bin/python Cartesian/gamepad_setup.py --model-dir models/so101
+```
+
+Gamepad control is locked until a pad has been paired. The pairing page draws the pad
+next to the arm and asks for one control at a time: the control glows, the arm shows what
+it will do, you move or press it on the real pad, the wizard records which axis or button
+that was and moves on. Ten steps: left stick forward / right, right stick forward / right,
+LT, RT, A, B, Start, Back. The result is `Cartesian/gamepad_map.json` (per pad, not in
+git). A control you already used is refused; *Restart pairing* starts over.
+
+The pad is read through the Linux joystick interface (`/dev/input/js*`, `gamepad.py`),
+no extra packages. Unplugging mid-way is detected; plugging in later is picked up.
+
 ## Tests
 
 ```sh

@@ -310,6 +310,132 @@ class ControlLoopTests(unittest.TestCase):
         self.assertTrue(ticks[-1]["torque"])
 
 
+class FakePad:
+    """Stands in for gamepad.Gamepad: the test sets axes/buttons and queues changes."""
+
+    def __init__(self, n_axes=8, n_buttons=16):
+        self.name = "fake"
+        self.connected = True
+        self.error = None
+        self.axes = [0.0] * n_axes
+        self.buttons = [False] * n_buttons
+        self.axes[4] = self.axes[5] = -1.0   # triggers rest at -1
+        self._changes = []
+
+    def snapshot(self):
+        return list(self.axes), list(self.buttons)
+
+    def drain(self):
+        out, self._changes = self._changes, []
+        return out
+
+    def press(self, idx, down=True):
+        from gamepad import Change
+        self.buttons[idx] = down
+        self._changes.append(Change("button", idx, 1.0 if down else 0.0))
+
+    def stop(self):
+        pass
+
+
+class GamepadWizardTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import socket
+        import viser
+        from gamepad_setup import Wizard
+        from viewer import WEB_PORT
+        with socket.socket() as s:
+            busy = s.connect_ex(("127.0.0.1", WEB_PORT)) == 0
+        if busy:
+            raise unittest.SkipTest(f"port {WEB_PORT} is in use")
+        cls.tmp = tempfile.mkdtemp()
+        cls.log = RunLog(Path(cls.tmp), "test")
+        cls.server = viser.ViserServer(host="127.0.0.1", port=WEB_PORT, verbose=False)
+        cls.wizard = Wizard(model(), cls.server, cls.log, map_path=Path(cls.tmp) / "map.json")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.stop()
+        cls.log.close()
+
+    def setUp(self):
+        self.pad = FakePad()
+        w = self.wizard
+        w.pad = self.pad
+        w.mapping = {"device": "fake", "axes": {}, "buttons": {}}
+        w.index, w.done = 0, False
+        w._begin_step()
+
+    def ticks(self, n):
+        for _ in range(n):
+            self.wizard._detect()
+
+    def push_axis(self, idx, value, hold=8):
+        self.pad.axes[idx] = value
+        self.ticks(hold)
+        self.pad.axes[idx] = -1.0 if idx in (4, 5) else 0.0
+        self.ticks(2)
+
+    def press(self, idx):
+        self.pad.press(idx, True)
+        self.ticks(2)
+        self.pad.press(idx, False)
+        self.ticks(2)
+
+    def test_full_pairing_writes_map(self):
+        w = self.wizard
+        self.push_axis(1, -1.0)   # left stick forward: Linux reports up as negative
+        self.assertEqual(w.mapping["axes"]["move_x"], {"axis": 1, "sign": -1, "kind": "stick", "rest": 0.0})
+        self.assertEqual(w.index, 1)
+        self.push_axis(0, 1.0)    # left stick right
+        self.push_axis(3, -1.0)   # right stick forward
+        self.push_axis(2, 1.0)    # right stick right
+        self.push_axis(4, 1.0)    # LT: -1 -> +1
+        self.assertEqual(w.mapping["axes"]["pitch_down"]["kind"], "trigger")
+        self.push_axis(5, 1.0)    # RT
+        for idx in (0, 1, 7, 6):  # A B Start Back
+            self.press(idx)
+        self.assertTrue(w.done)
+        written = json.loads((Path(self.tmp) / "map.json").read_text())
+        self.assertEqual(written["buttons"], {"gripper_open": 0, "gripper_close": 1, "hold": 7, "stop": 6})
+        self.assertEqual(set(written["axes"]), {"move_x", "move_y", "move_z", "roll", "pitch_down", "pitch_up"})
+
+    def test_small_or_brief_axis_motion_is_ignored(self):
+        w = self.wizard
+        self.push_axis(1, -0.4)          # not far enough
+        self.assertEqual(w.index, 0)
+        self.pad.axes[1] = -1.0
+        self.ticks(2)                    # not long enough
+        self.pad.axes[1] = 0.0
+        self.ticks(2)
+        self.assertEqual(w.index, 0)
+
+    def test_reused_control_is_refused(self):
+        w = self.wizard
+        self.push_axis(1, -1.0)          # move_x <- axis 1
+        self.push_axis(1, 1.0)           # asked for move_y, gave the same axis
+        self.assertEqual(w.index, 1)
+        self.assertIn("already", w.message)
+        self.push_axis(0, 1.0)           # the right one
+        self.assertEqual(w.index, 2)
+        w.index = 6
+        w._begin_step()
+        self.press(0)                    # gripper_open <- button 0
+        self.press(0)                    # gripper_close: same button, refused
+        self.assertEqual(w.index, 7)
+        self.press(1)
+        self.assertEqual(w.index, 8)
+
+    def test_restart_clears_mapping(self):
+        w = self.wizard
+        self.push_axis(1, -1.0)
+        w.restart()
+        w._do_restart()
+        self.assertEqual(w.index, 0)
+        self.assertEqual(w.mapping["axes"], {})
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", type=Path, required=True)
