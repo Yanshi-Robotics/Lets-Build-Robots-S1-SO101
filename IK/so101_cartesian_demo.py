@@ -153,11 +153,14 @@ REGULARIZATION = 1e-2
 # arm it is, then: the shoulder needs the gain, and this course does not drive wrist_roll hard
 # enough to meet the twitchiness that made issue #1333 lower it.
 SERVO_P_COEFFICIENT = 32
-# Torque_Limit lives in SRAM, so unlike P it can be set once the arm is live. LeRobot caps the
-# gripper at 50 % and leaves the other five motors at 100 %; a teaching arm has no reason to
-# have its full stall torque available to a program.
-# ⚠️ Percent of stall torque, and the arm has to hold itself up out of this budget.
-ARM_TORQUE_LIMIT_PCT = 60
+# ⛔ There is no arm torque cap here, and adding one needs a measurement first.
+# This file briefly set Torque_Limit to 60 % of stall on the five arm motors, on the reasoning
+# that a teaching program has no business with the whole of it. That reasoning was not measured,
+# and 2026-09-10 on the bench the arm would not move at all from its folded rest pose. Lifting
+# itself out of that pose is the largest torque this arm is ever asked for -- a 7.4 V SO-101
+# carries about 200 g at the gripper -- so a cap picked out of the air is exactly the kind of
+# number that turns "will not move" into a mystery.
+# ⚠️ LeRobot caps the gripper at 50 % and leaves the other five at 100 %. That is what runs.
 # The gripper's scale is not a choice of ours: SOFollower gives that motor MotorNormMode
 # RANGE_0_100, so 0 and 100 are the two ends of whatever range Lesson 6 recorded.
 GRIPPER_MIN_PCT, GRIPPER_MAX_PCT = 0.0, 100.0
@@ -187,14 +190,6 @@ WORKSPACE_MARGIN_M = 0.02
 # The servo this course uses. LeRobot names it in SOFollower's own motor table; the encoder
 # resolution that goes with it is looked up rather than written down (see degrees_per_step).
 MOTOR_MODEL = "sts3215"
-
-
-class FollowingLost(Exception):
-    """The gripper stopped making progress towards the pose it was being asked to reach.
-
-    ⛔ Whoever raises this does not release torque, and whoever catches it does not either: an
-    arm that is being held up drops when it is let go. This only ends the control loop.
-    """
 
 
 # ══ The pinned model ═════════════════════════════════════════════════════════════════════════
@@ -459,6 +454,45 @@ def load_servo(directory, **kwargs):
     return PlacoServo(path, **kwargs), limits
 
 
+# A motor pulling harder than this is leaning on something rather than waiting to be asked.
+# ⚠️ A rule of thumb, not a measurement: holding the arm up against gravity already reads a fair
+# fraction of this, and Feetech's own overload protection does not trip until 80 % for two
+# seconds. It only chooses which sentence to print, so being roughly right is enough.
+STALL_LOAD_PCT = 40.0
+
+
+def stall_report(reason, commanded, measured, loads, budget_deg):
+    """The stall, with the readings that say which kind of stall it is.
+
+    ⭐ A motor being asked for almost nothing and a motor leaning hard on something look
+    identical from outside: either way the arm sits still. `Present_Load` is the drive's duty
+    cycle, so it tells the two apart, and the gap between command and measurement says whether
+    the command had any authority in the first place. ⛔ Printing the reason without these two
+    numbers is what turns "it does not move" into an afternoon.
+    """
+    rows = []
+    for name in JOINTS:
+        if name not in commanded or name not in measured:
+            continue
+        gap = float(commanded[name]) - float(measured[name])
+        load = loads.get(name)
+        rows.append(f"    {name:<14} told {float(commanded[name]):+7.2f}, sitting at "
+                    f"{float(measured[name]):+7.2f}  ({gap:+5.2f} deg)"
+                    + (f"  pulling {load:5.1f} %" if load is not None else ""))
+    if not loads:
+        verdict = ""
+    elif max(loads.values()) > STALL_LOAD_PCT:
+        verdict = ("\n\nThe motors are pulling and the arm is still not moving, so something is "
+                   "in the way, or this is more than the arm can lift from where it is standing. "
+                   "⛔ Move it somewhere it has room before trying again.")
+    else:
+        verdict = ("\n\nThe motors are barely pulling, so they are not being asked for enough "
+                   f"force: a command may lead the arm by at most {budget_deg:.1f} deg, and on "
+                   "this servo that lead is the force. Measure what this arm needs with "
+                   "--measure-following, then raise MAX_JOINT_SPEED_RAD_S to match it.")
+    return reason + "\n\n" + "\n".join(rows) + verdict
+
+
 # ══ The chased pose ══════════════════════════════════════════════════════════════════════════
 
 def clamp_into_bounds(pose, bounds):
@@ -598,22 +632,19 @@ def read_pose_before_power(robot):
         robot.bus.disconnect(disable_torque=False)
 
 
-def limit_arm_torque(robot, percent=ARM_TORQUE_LIMIT_PCT):
-    """Cap what the five arm motors are allowed to pull, once the arm is live.
+def motor_loads(robot):
+    """What each motor is actually pulling, as a percentage of its stall torque.
 
-    LeRobot caps the gripper at half its stall torque and leaves the other five at all of it.
-    `Torque_Limit` is a SRAM register, so unlike the P coefficient it can be set after connect
-    without taking torque off and dropping the arm. Feetech's scale is per mille of stall torque.
-
-    ⚠️ The arm holds itself up out of this budget, so it cannot go very low. Returns what was
-    written so the caller can say it out loud rather than change the arm's behaviour quietly.
+    ⭐ The one reading that tells a stall apart from a command that never arrived. Feetech
+    defines `Present_Load` as "voltage duty cycle of the drive", in tenths of a percent, so a
+    motor leaning hard on something reads near 100 while a motor being asked for almost nothing
+    reads near zero -- and those two look identical from the outside.
     """
-    if not 0 < percent <= 100:
-        raise ValueError("A torque limit is a percentage of stall torque, above zero")
-    value = int(round(percent * 10))
-    for name in JOINTS:
-        robot.bus.write("Torque_Limit", name, value, normalize=False)
-    return {name: percent for name in JOINTS}
+    try:
+        reading = robot.bus.sync_read("Present_Load", normalize=False)
+    except Exception:                              # noqa: BLE001 - a diagnostic, never a failure
+        return {}
+    return {name: abs(int(value)) / 10 for name, value in reading.items()}
 
 
 # Registers worth reading back before trusting anything written down about them.
@@ -849,6 +880,10 @@ class ModelArm:
     def stop_pushing(self, degrees):
         """Nothing to stop pushing against. Present so the loop is written once, not twice."""
 
+    def loads(self):
+        """A model arm pulls nothing, and says so rather than inventing a figure."""
+        return {}
+
     def release(self):
         self.holding = False
 
@@ -864,10 +899,8 @@ class LiveArm:
 
     is_live = True
 
-    def __init__(self, port, robot_id, calibration_dir, p_coefficient=SERVO_P_COEFFICIENT,
-                 torque_limit_pct=ARM_TORQUE_LIMIT_PCT):
+    def __init__(self, port, robot_id, calibration_dir, p_coefficient=SERVO_P_COEFFICIENT):
         from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
-        self.torque_limit_pct = torque_limit_pct
         self.robot = SO101Follower(SO101FollowerConfig(
             port=port, id=robot_id, calibration_dir=Path(calibration_dir),
             use_degrees=True, cameras={},
@@ -910,17 +943,21 @@ class LiveArm:
         if drifted:
             raise RuntimeError("Torque came on with motors being told to travel, not to hold:"
                                "\n    " + "\n    ".join(drifted))
-        limit_arm_torque(self.robot, self.torque_limit_pct)
 
     def stop_pushing(self, degrees):
         """Take the force out of a motor leaning on something, ⛔ without letting go of it."""
         park_the_goal(self.robot, as_observation(degrees))
+
+    def loads(self):
+        return motor_loads(self.robot)
 
     def release(self):
         self.robot.bus.disable_torque()
         self.holding = False
         self.robot.disconnect()
         self.robot.bus.connect()
+
+
 # ══ The keyboard ═════════════════════════════════════════════════════════════════════════════
 
 GRIPPER_CLOSE, GRIPPER_HOLD, GRIPPER_OPEN = 0, 1, 2
@@ -1006,7 +1043,34 @@ def control_loop(page, arm, servo, bounds, limits, leader=None, keyboard=None,
         note, keys = "", ""
         here = servo.gripper_xyz(measured)
 
-        if armed is None:
+        if (armed is not None or arm.holding) and page.take_end_request():
+            # -- the one place torque is released ------------------------------------------
+            ended = MODE_LABELS[armed] if armed else "The stopped mode"
+            arm.release()
+            armed, reference = None, None
+            commanded = dict(measured)
+            page.disarmed(f"{ended} ended. Motors released; the arm can be moved by hand again.")
+            print(f"{ended} ended, motors released.\n", flush=True)
+            status = "Released."
+
+        elif armed is None and arm.holding:
+            # -- stopped, and deliberately still holding ------------------------------------
+            # ⛔ A stall stops the mode; it does not let go, because an arm that is holding
+            # itself up drops when it is. The program stays alive so that End is still there:
+            # having to kill it and run --release-torque instead made every stall a chore.
+            commanded = dict(measured)
+            page.move_handle(here)
+            status = ("**Stopped, and still holding.** Support the arm and press End to release "
+                      "it, or pick a mode and press Enable to carry on.")
+            wanted = page.take_arm_request()
+            if wanted is not None:
+                armed, reference = wanted, servo.fk(measured)
+                page.set_gripper_target(measured.get("gripper", GRIPPER_MIN_PCT))
+                watch.reset()
+                page.armed(armed)
+                print(f"{MODE_LABELS[armed]} is live again.", flush=True)
+
+        elif armed is None:
             # -- read-only. The arm can be moved by hand and the page follows it. ------------
             commanded = dict(measured)
             page.move_handle(here)
@@ -1025,17 +1089,6 @@ def control_loop(page, arm, servo, bounds, limits, leader=None, keyboard=None,
             status = ("Nothing is powered. Move the arm by hand if you like, then pick a mode "
                       "and press Enable." if arm.is_live else
                       "No arm attached. Drag the handle to see what the solver does with it.")
-
-        elif page.take_end_request():
-            # -- the one place torque is released ------------------------------------------
-            ended = armed
-            arm.release()
-            armed, reference = None, None
-            commanded = dict(measured)
-            page.disarmed(f"{MODE_LABELS[ended]} ended. Motors released; the arm can be moved "
-                          "by hand again.")
-            print(f"{MODE_LABELS[ended]} ended, motors released.\n", flush=True)
-            status = "Released."
 
         elif armed == LEADER:
             # -- joint for joint, no solver in the path ------------------------------------
@@ -1062,8 +1115,18 @@ def control_loop(page, arm, servo, bounds, limits, leader=None, keyboard=None,
 
             stalled = watch.update(here, handle)
             if stalled:
+                # ⛔ Stop pushing, keep holding, stay alive. Releasing here would drop a raised
+                # arm, and exiting here would leave the operator with a locked arm and a command
+                # to look up -- so the mode ends, End stays on the page, and the reading that
+                # says which kind of stall this was is printed rather than guessed at.
                 arm.stop_pushing(measured)
-                raise FollowingLost(stalled)
+                note = stall_report(stalled, commanded, measured, arm.loads(),
+                                    servo.max_joint_step_deg)
+                print("\nSTOP-HOLD: " + note.replace("\n\n", "\n           "), flush=True)
+                armed, reference = None, None
+                page.disarmed(note, holding=True)
+                page.show(measured, commanded, "**Stopped, and still holding.**", note, keys)
+                continue
 
             commanded = servo.servo_step(measured, reference)
             commanded["gripper"] = step_towards(commanded.get("gripper", 0.0),

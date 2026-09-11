@@ -142,6 +142,23 @@ class SolverTests(unittest.TestCase):
         self.assertLess(max(abs(still[name] - parked[name]) for name in demo.JOINTS), 0.05,
                         "enabling from the parked pose must command nothing at all")
 
+    def test_nothing_caps_the_arms_torque_without_having_measured_it(self):
+        # ⛔ 2026-09-10 on the bench: this file set Torque_Limit to 60 % of stall on the five arm
+        # motors, on the reasoning that a teaching program has no business with all of it. The
+        # number was never measured, and lifting itself out of its folded rest pose is the
+        # largest torque this arm is ever asked for -- a 7.4 V SO-101 carries about 200 g. A cap
+        # picked out of the air is exactly what turns "it will not move" into a mystery.
+        # ⚠️ Adding one back needs a measurement first, and this test to be rewritten around it.
+        shared = (ROOT / "IK/so101_cartesian_demo.py").read_text(encoding="utf-8")
+        tree = ast.parse(shared)
+        written = [node.args[0].value for node in ast.walk(tree)
+                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                   and node.func.attr == "write" and node.args
+                   and isinstance(node.args[0], ast.Constant)]
+        self.assertNotIn("Torque_Limit", written, "a cap needs a measurement, not a guess")
+        self.assertNotIn("ARM_TORQUE_LIMIT_PCT", {node.id for node in ast.walk(tree)
+                                                  if isinstance(node, ast.Name)})
+
     def test_a_joint_the_model_cannot_express_is_named_with_the_way_back(self):
         # ⛔ Reproduced 2026-09-10 from the 2026-09-08 hardware log: this follower parks at
         # shoulder_lift -103.8 and wrist_flex -100.2, outside the pinned model. placo clamps its
@@ -607,11 +624,15 @@ class ControlLoopTests(unittest.TestCase):
             self.armed_as = mode
             self.handle = self.target.copy()
 
-        def disarmed(self, message=""):
+        def disarmed(self, message="", holding=False):
+            # ⭐ How a stall reaches the outside now: the loop stops the mode and says why, and
+            # deliberately keeps the motors held rather than ending the program.
             self.armed_as = None
+            if message:
+                self.stalled, self.still_holding = message, holding
 
         def show(self, measured, commanded, status, note="", keys=""):
-            self.seen.append((dict(measured), dict(commanded)))
+            self.seen.append((dict(measured), dict(commanded), self.armed_as))
             if len(self.seen) >= self.ticks:
                 raise StopIteration
 
@@ -623,16 +644,14 @@ class ControlLoopTests(unittest.TestCase):
         arm = demo.ModelArm(start) if arm is None else arm
         bounds = demo.bounds_dict(demo.DEFAULT_BOUNDS_M["min"], demo.DEFAULT_BOUNDS_M["max"])
         page = self.Page(target, ticks, mode)
-        stalled = None
+        page.stalled, page.still_holding = None, None
         # ⚠️ The loop paces itself to real time; the tests do not have that long.
         with patch.object(demo.time, "sleep", lambda _seconds: None):
             try:
                 demo.control_loop(page, arm, servo, bounds, limits, leader=leader)
             except StopIteration:
                 pass
-            except demo.FollowingLost as lost:
-                stalled = str(lost)
-        return servo, arm, page, stalled
+        return servo, arm, page, page.stalled
 
     def test_a_stalled_arm_is_commanded_up_to_its_budget_and_no_further(self):
         # ⭐ The judge. Against the version this replaced, the command stayed about 1.09 deg
@@ -646,7 +665,7 @@ class ControlLoopTests(unittest.TestCase):
         servo, _arm, page, _stalled = self.drive((0.30, 0.0, 0.25), 120, arm=Stuck(
             {**dict(zip(demo.JOINTS, demo.PREVIEW_JOINTS_DEG)), "gripper": 0.0}))
         leads = [max(abs(commanded[name] - measured[name]) for name in demo.JOINTS)
-                 for measured, commanded in page.seen if page.armed_as]
+                 for measured, commanded, live in page.seen if live]
         budget = servo.max_joint_step_deg
         self.assertGreater(max(leads), budget * 0.9,
                            "a held-back arm must be commanded with the whole budget")
@@ -659,12 +678,12 @@ class ControlLoopTests(unittest.TestCase):
         self.assertIsNone(stalled, "a reachable target is not a stall")
         self.assertLess(float(numpy.linalg.norm(reached - page.target)) * 1000, demo.ARRIVED_MM)
         moved = [numpy.linalg.norm(servo.gripper_xyz(b) - servo.gripper_xyz(a))
-                 for (_m, a), (_n, b) in zip(page.seen, page.seen[1:])]
+                 for (_m, a, _x), (_n, b, _y) in zip(page.seen, page.seen[1:])]
         a_tick = demo.REF_LINEAR_SPEED_MPS * demo.CONTROL_DT
         self.assertLessEqual(max(moved), a_tick * 1.05, "the gripper outran the set speed")
         # ⭐ And once it is there, it stops pushing: the command settles onto the measurement.
-        settled = page.seen[-1]
-        self.assertLess(max(abs(settled[1][name] - settled[0][name]) for name in demo.JOINTS), 0.05)
+        measured, commanded, _live = page.seen[-1]
+        self.assertLess(max(abs(commanded[name] - measured[name]) for name in demo.JOINTS), 0.05)
 
     def test_a_target_it_cannot_reach_is_stopped_without_being_let_go(self):
         # ⛔ Stopping is not releasing. The force comes out of the motors -- the goal is parked
@@ -683,8 +702,54 @@ class ControlLoopTests(unittest.TestCase):
                 {**dict(zip(demo.JOINTS, demo.PREVIEW_JOINTS_DEG)), "gripper": 0.0}))
         self.assertIsNotNone(stalled, "an unreachable target must be reported, not chased for ever")
         self.assertIn("stopped closing", stalled)
+        self.assertTrue(_page.still_holding, "a stall stops the mode and keeps the arm held")
         self.assertEqual(released, [], "a stall must never release the arm")
         self.assertEqual(len(parked), 1, "it must stop pushing, exactly once")
+        # ⛔ And the program is still running afterwards, with the mode ended.
+        self.assertIsNone(_page.armed_as)
+
+    def test_a_stall_leaves_end_working_so_the_arm_can_be_put_down(self):
+        # ⛔ 2026-09-10 on the bench: a stall ended the whole program, which left the operator
+        # holding a locked arm and a release command to go and look up. Being stuck is not a
+        # reason to take away the one control that can put the arm down.
+        page = visual.ViserPage.__new__(visual.ViserPage)
+        page._lock = __import__("threading").Lock()
+        page._armed, page._holding, page._note = None, False, ""
+        page.enable_button = SimpleNamespace(disabled=False)
+        page.end_button = SimpleNamespace(disabled=False)
+        page.mode_dropdown = SimpleNamespace(disabled=False, value="")
+        page.handle = SimpleNamespace(visible=True)
+        page.notice = SimpleNamespace(content="")
+
+        page.armed(demo.HANDLE)
+        self.assertFalse(page.end_button.disabled)
+        page.disarmed("stopped", holding=True)
+        self.assertFalse(page.end_button.disabled, "End must survive a stall")
+        page._request_end()
+        self.assertTrue(page.take_end_request(), "and it must still be pressable")
+        page.disarmed("released", holding=False)
+        self.assertTrue(page.end_button.disabled, "nothing to end once the motors are off")
+        page._request_end()
+        self.assertFalse(page.take_end_request())
+
+    def test_the_stall_report_says_whether_the_motors_were_pulling(self):
+        # ⭐ A motor asked for almost nothing and a motor leaning on something look identical
+        # from outside. Present_Load is the duty cycle, so it is what tells them apart, and
+        # without it "it does not move" is an afternoon rather than a sentence.
+        commanded = {**dict(zip(demo.JOINTS, (0.0, -96.0, 92.0, 78.0, 9.0))), "gripper": 0.0}
+        measured = {**dict(zip(demo.JOINTS, (0.0, -100.0, 92.0, 78.0, 9.0))), "gripper": 0.0}
+        pushing = demo.stall_report("stuck", commanded, measured,
+                                    dict.fromkeys(demo.JOINTS, 85.0), 4.0)
+        self.assertIn("shoulder_lift", pushing)
+        self.assertIn("+4.00 deg", pushing, "the gap the command actually had")
+        self.assertIn("85.0 %", pushing)
+        self.assertIn("something is in the way", pushing)
+        idle = demo.stall_report("stuck", commanded, measured,
+                                 dict.fromkeys(demo.JOINTS, 3.0), 4.0)
+        self.assertIn("barely pulling", idle)
+        self.assertIn("--measure-following", idle)
+        # ⚠️ No loads read at all is not a verdict, so it does not print one.
+        self.assertNotIn("barely pulling", demo.stall_report("stuck", commanded, measured, {}, 4.0))
 
     def test_the_jaw_does_not_jump_when_a_mode_starts(self):
         # 2026-09-09 on hardware: the slider sat at its default while the jaw read 1.8, so

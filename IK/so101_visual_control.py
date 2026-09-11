@@ -149,6 +149,7 @@ class ViserPage:
         self._arm_request = None
         self._end_request = False
         self._armed = None
+        self._holding = False
         self._note = ""
         self.server = None
 
@@ -262,9 +263,11 @@ class ViserPage:
             self._armed = mode
         self._refresh_controls()
 
-    def disarmed(self, message=""):
+    def disarmed(self, message="", holding=False):
+        """No mode is live. ⚠️ `holding` says the motors are still on, which End must stay for."""
         with self._lock:
             self._armed = None
+            self._holding = bool(holding)
         self._refresh_controls()
         if message:
             self.notice.content = message
@@ -278,7 +281,7 @@ class ViserPage:
 
     def _request_end(self):
         with self._lock:
-            if self._armed is not None:
+            if self._armed is not None or self._holding:
                 self._end_request = True
 
     def _chosen_mode(self):
@@ -287,9 +290,11 @@ class ViserPage:
 
     def _refresh_controls(self):
         with self._lock:
-            armed = self._armed
+            armed, holding = self._armed, self._holding
         self.enable_button.disabled = armed is not None
-        self.end_button.disabled = armed is None
+        # ⛔ End stays available while the motors are on, mode or no mode. A stall ends the mode
+        # and keeps holding, and the operator still has to be able to put the arm down.
+        self.end_button.disabled = armed is None and not holding
         self.mode_dropdown.disabled = armed is not None
         self.handle.visible = armed != model.LEADER
 
@@ -587,15 +592,10 @@ def run(args):
         print("Nothing is powered. Move the arm by hand if you like; press Enable in a mode to "
               "start.\n", flush=True)
     try:
+        # ⭐ A stall no longer ends the program. It ends the mode, keeps the motors held, and
+        # leaves End on the page -- because the arm being stuck is not a reason to take the one
+        # control away that can put it down. The loop returns only when the operator stops it.
         model.control_loop(page, arm, servo, bounds, limits, leader=leader, keyboard=keyboard)
-    except model.FollowingLost as lost:
-        # ⛔ Stopped and still held. The force is already out of the motors -- the loop parked
-        # the goal where they stand before raising -- but letting go is a decision made with a
-        # hand on the arm, so the program says how and stops.
-        print(f"\nSTOP-HOLD: {lost}\n"
-              "           The mode is stopped and the arm is still held where it stands.",
-              file=sys.stderr, flush=True)
-        raise
     except BaseException:
         raise
     finally:

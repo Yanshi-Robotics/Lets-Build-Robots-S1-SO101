@@ -114,7 +114,7 @@ class ConsolePage:
     def armed(self, mode):
         print(f"{model.MODE_LABELS[mode]} is live. Ctrl+C stops.\n", flush=True)
 
-    def disarmed(self, message=""):
+    def disarmed(self, message="", holding=False):
         if message:
             print(message, flush=True)
 
@@ -164,12 +164,10 @@ def run(args):
         page = ConsolePage(bounds)
         page.move_handle(servo.gripper_xyz(degrees))
         arm.open_bus()
+        # ⚠️ A stall stops the mode and keeps the motors held; the loop stays running and prints
+        # why. With no End button here, Ctrl+C is how a session finishes, and it does not
+        # release either -- the command that does is printed below.
         model.control_loop(page, arm, servo, bounds, limits, keyboard=teleop)
-    except model.FollowingLost as lost:
-        print(f"\nSTOP-HOLD: {lost}\n"
-              "           Stopped, and the arm is still held where it stands.",
-              file=sys.stderr, flush=True)
-        raise
     finally:
         if arm.holding:
             print("\n" + model_release_notice(args), file=sys.stderr, flush=True)
