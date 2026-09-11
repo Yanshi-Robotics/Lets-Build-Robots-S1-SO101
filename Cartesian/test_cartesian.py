@@ -511,6 +511,43 @@ class GamepadMapFileTests(unittest.TestCase):
             self.assertIsNone(load_map(path, "Unknown"))
 
 
+class DofTrajectoryTests(unittest.TestCase):
+    """The clips behind Lesson 8's six-degree-of-freedom animations (Cartesian/6dof-demo)."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "6dof-demo"))
+        import trajectories
+        cls.t = trajectories
+        cls.data = trajectories.build(MODEL_DIR, None)      # SO-101 only; the Panda needs a download
+
+    def test_translation_clips_move_one_axis_only(self):
+        for axis, key in enumerate(("x", "y", "z")):
+            P = np.array(self.data["clips"][key]["tool_position"])
+            span = P.max(axis=0) - P.min(axis=0)
+            self.assertAlmostEqual(span[axis], 2 * self.t.TRAVEL_M, delta=0.002, msg=key)
+            for other in range(3):
+                if other != axis:
+                    self.assertLess(span[other], 0.001, f"{key} leaked into axis {other}")
+
+    def test_orientation_clips_hold_the_tool_point(self):
+        m = Model(MODEL_DIR)
+        for key, amplitude in (("pitch", self.t.PITCH_RAD), ("roll", self.t.ROLL_RAD)):
+            clip = self.data["clips"][key]
+            P = np.array(clip["tool_position"])
+            self.assertLess(np.max(P.max(axis=0) - P.min(axis=0)), 0.002, key)
+            angles = [m.decompose(np.array(R), yaw=m.tool_yaw(np.array(q)))[1 if key == "pitch" else 2]
+                      for R, q in zip(clip["tool_rotation"], clip["frames"])]
+            self.assertAlmostEqual(max(angles) - min(angles), 2 * amplitude, delta=math.radians(1.0), msg=key)
+
+    def test_clips_are_ping_pong_loops(self):
+        for key, clip in self.data["clips"].items():
+            frames = np.array(clip["frames"])
+            self.assertEqual(len(frames), round(self.t.FPS * self.t.CLIP_SECONDS))
+            # the sine wave returns to zero: the last frame is one step short of the first, within one step of travel
+            self.assertLess(np.linalg.norm(np.array(clip["tool_position"][-1]) - np.array(clip["tool_position"][0])), 0.012, key)
+
+
 class GamepadIntegrateTests(unittest.TestCase):
     def test_waist_turns_about_the_base_and_reach_slides_out(self):
         from gamepad_control import GamepadState, WAIST_SPEED_RAD_S, LINEAR_SPEED_MPS, integrate

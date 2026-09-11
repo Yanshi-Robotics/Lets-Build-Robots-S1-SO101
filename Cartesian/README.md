@@ -94,6 +94,7 @@ built-in 2.8 degree tilt which is included in that zero).
 | `so101_arm.py` | 1, 6 | `Arm` (LeRobot `SO101Follower`), `FakeArm`, degree/radian conversion |
 | `so101_leader.py` | 2 | `Leader` (LeRobot `SO101Leader`), joint goals from a hand-moved arm |
 | `fetch_model.py` | — | downloads the URDF, meshes and licence at a pinned commit |
+| `6dof-demo/` | — | the six-degree-of-freedom animations for Lesson 8 and everything to re-render them (own README) |
 | `gamepad.py` | 2 | Linux joystick reader (`/dev/input/js*`) |
 | `gamepad_control.py` | 2 | paired axes/buttons -> velocities -> a moving `Target` |
 | `gamepad_pairing.py` | 2 | the pairing steps (pure state machine) and the per-control explanations |

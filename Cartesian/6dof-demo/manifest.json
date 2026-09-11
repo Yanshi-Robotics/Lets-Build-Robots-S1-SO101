@@ -1,0 +1,143 @@
+{
+  "generated": "2026-09-11",
+  "kind": "3d-teaching-animation",
+  "renderer": "Blender Workbench CPU",
+  "hardwareEvidence": false,
+  "so101Commit": "7629d2ad9853d10fb903093a33ef6114099d97e5",
+  "pandaCommit": "63c4d67e337017f9d8b298c900e9aabdb69296e7",
+  "fps": 15,
+  "clips": {
+    "dof-x": "SO-101, tool along base x",
+    "dof-y": "SO-101, tool along base y",
+    "dof-z": "SO-101, tool along base z",
+    "dof-pitch": "SO-101, tool pitch about its y axis",
+    "dof-roll": "SO-101, tool roll about its approach axis",
+    "dof-yaw-panda": "Franka Panda, hand yaw about the vertical axis with fixed position",
+    "jet-roll": "schematic aircraft, roll",
+    "jet-pitch": "schematic aircraft, pitch",
+    "jet-yaw": "schematic aircraft, yaw",
+    "gimbal-lock": "three nested rings, middle ring to 90 degrees"
+  },
+  "assets": [
+    {
+      "name": "dof-pitch-poster",
+      "file": "dof-pitch-poster.png",
+      "bytes": 191944,
+      "sha256": "9124088900e0c95ba5d573c2fd2dad4ec05b51d0fbe9bc9f19070f1e8352bc50"
+    },
+    {
+      "name": "dof-pitch",
+      "file": "dof-pitch.webp",
+      "bytes": 339562,
+      "sha256": "039db07896404a80095c529dbe0d41a2b4aac1039f596dea50129b63d1fc89d5"
+    },
+    {
+      "name": "dof-roll-poster",
+      "file": "dof-roll-poster.png",
+      "bytes": 197863,
+      "sha256": "8dfce9f94f100e976548f473ca133d8c30e76fe11adfe9077920525efb79a4f8"
+    },
+    {
+      "name": "dof-roll",
+      "file": "dof-roll.webp",
+      "bytes": 424878,
+      "sha256": "1271e29ef901c3406d414218b055acd38a857d97eea64a744311ebcbb7a973cf"
+    },
+    {
+      "name": "dof-x-poster",
+      "file": "dof-x-poster.png",
+      "bytes": 188502,
+      "sha256": "703fa80b79665533fa0c89b837b71a8723af782678e12f8fb381eefa2434ed43"
+    },
+    {
+      "name": "dof-x",
+      "file": "dof-x.webp",
+      "bytes": 348916,
+      "sha256": "5161bbebe5e332b76808269e6026c16e9b7597af395ea4569703407e1415b575"
+    },
+    {
+      "name": "dof-y-poster",
+      "file": "dof-y-poster.png",
+      "bytes": 187951,
+      "sha256": "a049a42a757bf1f3edbd9a8bedbc364cac63da1633002d3790744ff9d1b3f0c5"
+    },
+    {
+      "name": "dof-y",
+      "file": "dof-y.webp",
+      "bytes": 405962,
+      "sha256": "71b3070026fb726998e94437cb77365c61db0f64a5ee98aa89b200edf06eeee7"
+    },
+    {
+      "name": "dof-yaw-panda-poster",
+      "file": "dof-yaw-panda-poster.png",
+      "bytes": 173662,
+      "sha256": "05a33ffe1e7bfd6b27d70ce7b60360e66f47ffd28af7a65cdd27ba9e96abd9c6"
+    },
+    {
+      "name": "dof-yaw-panda",
+      "file": "dof-yaw-panda.webp",
+      "bytes": 298502,
+      "sha256": "7d4841e7ea2025cafc59ece54f73057e32fb31d4a97b79a0ed326b7abd2b3a56"
+    },
+    {
+      "name": "dof-z-poster",
+      "file": "dof-z-poster.png",
+      "bytes": 190779,
+      "sha256": "2ef09646e436fc0536a80f82fe4a04c27ac6efbf5bd73eaa38cab68280aeac46"
+    },
+    {
+      "name": "dof-z",
+      "file": "dof-z.webp",
+      "bytes": 357212,
+      "sha256": "f81422abf11965c25dd0820172c1464184e27bb9888e78cb2c7aa4e1a9474445"
+    },
+    {
+      "name": "gimbal-lock-poster",
+      "file": "gimbal-lock-poster.png",
+      "bytes": 159378,
+      "sha256": "fded93cf7efa45049280d1a0b0bc4ed7171f5f86ecea73a718349a695429bf41"
+    },
+    {
+      "name": "gimbal-lock",
+      "file": "gimbal-lock.webp",
+      "bytes": 483602,
+      "sha256": "5fe165c4941c60e253a39181282dda5ab0af942b1ec730e9875e6f2bfa53c446"
+    },
+    {
+      "name": "jet-pitch-poster",
+      "file": "jet-pitch-poster.png",
+      "bytes": 109378,
+      "sha256": "ab1aa639bb9366a94cf1dce91b437212e38c9a6d65c085186f728856d39135e1"
+    },
+    {
+      "name": "jet-pitch",
+      "file": "jet-pitch.webp",
+      "bytes": 152180,
+      "sha256": "428b34cecc637c2d61ff46e97a4c24a456b8151eeda286d1fcc8af66f92245d0"
+    },
+    {
+      "name": "jet-roll-poster",
+      "file": "jet-roll-poster.png",
+      "bytes": 110345,
+      "sha256": "b713655029fb43d1773433cb365d9853d359c8d3d4fb59a70bb15e5ef6c055fa"
+    },
+    {
+      "name": "jet-roll",
+      "file": "jet-roll.webp",
+      "bytes": 137366,
+      "sha256": "d5a7bd2ad8e412e5fc2c171b04ccec0f61629569f6406dc8f6001b75de33b4ed"
+    },
+    {
+      "name": "jet-yaw-poster",
+      "file": "jet-yaw-poster.png",
+      "bytes": 108180,
+      "sha256": "9950b87d10e5faeed18e3411e51f8d38b708418b8475b6f1029967d1b50c9976"
+    },
+    {
+      "name": "jet-yaw",
+      "file": "jet-yaw.webp",
+      "bytes": 139136,
+      "sha256": "dbef728c7ba87cdb970b32cbb9f401cbd73ca391d0c4a8e07fa9310e98355065"
+    }
+  ]
+}
