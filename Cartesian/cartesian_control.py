@@ -37,7 +37,7 @@ from so101_arm import SERVO_P_COEFFICIENT, Arm, FakeArm, deg_from_q, q_from_deg 
 from so101_leader import Leader  # noqa: E402
 from so101_model import ARM_JOINTS, GRIPPER_INDEX, Model  # noqa: E402
 from solver import Solver  # noqa: E402
-from target import HOLD, MODE_GAMEPAD, MODE_LEADER, RELEASE, STOP, CommandBox, TargetBox  # noqa: E402
+from target import HOLD, LEADER_CHECK, MODE_GAMEPAD, MODE_LEADER, RELEASE, STOP, CommandBox, TargetBox  # noqa: E402
 from viewer import LOOPBACK, WEB_PORT, Viewer, ensure_port_free  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
@@ -86,12 +86,14 @@ def parse_args(argv=None) -> argparse.Namespace:
 class ControlLoop:
     def __init__(self, model: Model, solver: Solver, arm, limits: planner.Limits, hz: float,
                  targets: TargetBox, commands: CommandBox, viewer: Viewer, log: RunLog,
-                 gamepad_map: dict | None = None, leader: Leader | None = None, bounds=None):
+                 gamepad_map_path: Path | None = None, leader_factory=None, bounds=None):
         self.model, self.solver, self.arm, self.limits = model, solver, arm, limits
-        self.gamepad_map, self.leader = gamepad_map, leader
+        self.gamepad_map_path = gamepad_map_path
         self.pad: Gamepad | None = None
         self.gamepad: GamepadSource | None = None
         self._gamepad_polled = 0.0
+        self.leader_factory = leader_factory      # () -> Leader, or None when no --leader-port was given
+        self.leader: Leader | None = None
         self.bounds_min, self.bounds_max = bounds if bounds else (DEFAULT_BOUNDS_MIN_M, DEFAULT_BOUNDS_MAX_M)
         self.dt = 1.0 / hz
         self.targets, self.commands, self.viewer, self.log = targets, commands, viewer, log
@@ -117,12 +119,10 @@ class ControlLoop:
                 self.pad.stop()
 
     def _check_gamepad(self, now: float) -> None:
-        """Hot-plug: find a pad when there is none, notice when it goes away."""
+        """Hot-plug: find a pad when there is none, notice when it goes away. One glob per second."""
         if now - self._gamepad_polled < GAMEPAD_POLL_S:
             return
         self._gamepad_polled = now
-        if self.gamepad_map is None:
-            return   # status was set once at start: not paired
         if self.pad is not None and self.pad.connected:
             return
         if self.pad is not None:   # was there, now gone
@@ -135,11 +135,34 @@ class ControlLoop:
             return
         self.pad = Gamepad(devices[0][0])
         self.pad.start()
-        self.gamepad = GamepadSource(self.pad, self.gamepad_map)
-        paired = self.gamepad_map.get("device")
-        note = "" if paired == self.pad.name else f" (paired with {paired})"
-        self.viewer.set_source_status(MODE_GAMEPAD, True, f"{self.pad.name}{note}")
-        self.log.event("gamepad ready", device=self.pad.name, path=str(devices[0][0]), paired_with=paired)
+        mapping = load_map(self.gamepad_map_path, self.pad.name) if self.gamepad_map_path else None
+        if mapping is None:
+            self.gamepad = None
+            self.viewer.set_source_status(MODE_GAMEPAD, False, f"{self.pad.name}: not paired — run gamepad_setup.py")
+            self.log.event("gamepad found but not paired", device=self.pad.name, path=str(devices[0][0]))
+            return
+        self.gamepad = GamepadSource(self.pad, mapping)
+        self.viewer.set_source_status(MODE_GAMEPAD, True, self.pad.name)
+        self.log.event("gamepad ready", device=self.pad.name, path=str(devices[0][0]))
+
+    def _check_leader(self) -> None:
+        """Open the leader port and verify its calibration. A failure is shown, never fatal."""
+        if self.leader_factory is None:
+            self.viewer.set_source_status(MODE_LEADER, False, "start with --leader-port")
+            return
+        if self.leader is not None:
+            self.viewer.set_source_status(MODE_LEADER, True, "connected")
+            return
+        try:
+            leader = self.leader_factory()
+            leader.connect()
+        except Exception as e:   # wrong port, unplugged, calibration mismatch: all end up here
+            self.log.warning("leader check failed", error=str(e))
+            self.viewer.set_source_status(MODE_LEADER, False, f"check failed: {e}")
+            return
+        self.leader = leader
+        self.log.event("leader connected", q_deg=leader.read_deg())
+        self.viewer.set_source_status(MODE_LEADER, True, "connected")
 
     def _sync_from(self, q: np.ndarray, source: str) -> tuple[int, object]:
         target = self.model.target_from_q(q)
@@ -158,10 +181,7 @@ class ControlLoop:
         last_synced_q = q_meas.copy()
         log.event("loop start", live=self.live, hz=1.0 / self.dt, q_deg=deg_from_q(q_meas))
 
-        if self.gamepad_map is None:
-            self.viewer.set_source_status(MODE_GAMEPAD, False, "Not paired — run gamepad_setup.py")
-        if self.leader is not None:
-            self.viewer.set_source_status(MODE_LEADER, True, "connected")
+        self._check_leader()   # once at start; the page's button retries
 
         tick = 0
         t_prev = time.monotonic()
@@ -181,6 +201,9 @@ class ControlLoop:
                 log.event("button", name=button)
                 if button.startswith("mode:"):
                     continue   # logged, nothing else to do: the loop reads viewer.mode every tick
+                if button == LEADER_CHECK:
+                    self._check_leader()
+                    continue
                 if button == HOLD and self.viewer.mode is None:
                     log.warning("hold refused: no control mode enabled")
                     continue
@@ -343,22 +366,16 @@ def main(argv=None) -> int:
     q0 = q_from_deg(arm.read_deg())
     log.event("arm connected", mode=arm.mode, q_deg=deg_from_q(q0), torque=arm.torque_on)
 
-    # The leader is connected here, before the page, so a wrong port fails the start-up
-    # instead of surprising you later. `connect()` checks that the motors on the port
-    # carry the leader's calibration; the follower's `connect()` did the same for its port.
-    leader = None
+    # The leader is optional: it is opened by the control thread (at start and whenever
+    # the page's "Check leader arm" button is pressed), and a failure only greys out
+    # that row. `Leader.connect()` checks the motors carry the leader's calibration.
+    leader_factory = None
     if args.leader_port:
         if live and args.leader_port == args.port:
             raise SystemExit(f"--leader-port and --port are both {args.port}")
-        leader = Leader(args.leader_port, args.leader_id, args.leader_calibration_dir)
-        leader.connect()
-        log.event("leader connected", port=args.leader_port, q_deg=leader.read_deg())
+        leader_factory = lambda: Leader(args.leader_port, args.leader_id, args.leader_calibration_dir)  # noqa: E731
     initial = model.target_from_q(q0)
     targets, commands = TargetBox(initial), CommandBox()
-
-    mapping = load_map(args.gamepad_map)
-    if mapping is None:
-        log.event("gamepad not paired", path=str(args.gamepad_map))
 
     viewer = Viewer(model, args.bounds_min_m, args.bounds_max_m, LOOPBACK, args.web_port, live,
                     targets, commands, initial)
@@ -366,7 +383,8 @@ def main(argv=None) -> int:
     print(f"open http://{LOOPBACK}:{args.web_port}  (logs: {log.dir})", flush=True)
 
     loop = ControlLoop(model, solver, arm, limits, hz, targets, commands, viewer, log,
-                       gamepad_map=mapping, leader=leader, bounds=(args.bounds_min_m, args.bounds_max_m))
+                       gamepad_map_path=args.gamepad_map, leader_factory=leader_factory,
+                       bounds=(args.bounds_min_m, args.bounds_max_m))
     loop.start()
     try:
         while loop.thread.is_alive():
@@ -377,8 +395,8 @@ def main(argv=None) -> int:
         return 0
     finally:
         loop.stop()
-        if leader is not None:
-            leader.close()
+        if loop.leader is not None:
+            loop.leader.close()
         arm.close(release_torque=args.release_torque)
         log.event("closed", torque_released=args.release_torque and live)
         log.close()

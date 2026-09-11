@@ -68,6 +68,7 @@ class JointCommand:
 
 
 HOLD, STOP, RELEASE = "hold", "stop", "release"
+LEADER_CHECK = "leader-check"   # (re)try opening the leader arm's port
 
 # Where the target comes from. One mode is enabled at a time on the page (or none, the
 # default: the page only shows the arm); the control loop reads it every tick.

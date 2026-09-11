@@ -179,24 +179,30 @@ and follow* is refused until a source is enabled.
 * **Gamepad** — sticks push the target along at up to 0.08 m/s, triggers pitch it, the
   right stick rolls it, A/B open/close the gripper, Start/Back are *Hold and follow* /
   *Stop*. The ball and sliders follow so you see what the pad is asking for. The row
-  says *No gamepad detected* until a pad is plugged in (it is looked for every second,
-  so plugging in later works) and *Not paired* until `gamepad_setup.py` has been run.
-  If the pad goes away while enabled, the mode drops back to none.
+  says *No gamepad detected* until a pad is plugged in — pads are looked for once a
+  second (one directory listing, no measurable load), so plugging in after start works,
+  and so does swapping pads. A pad that has never been paired shows *not paired — run
+  gamepad_setup.py*; the pairing file keeps one entry per pad, so a pad paired once is
+  recognised next time. If the pad goes away while enabled, the mode drops back to none.
 * **Leader arm** — a second SO-101 moved by hand; its joints become the goal directly
   (no solving), the ball jumps to where that lands, speed and lead limits still apply.
-  Needs `--leader-port /dev/ttyACM1` on the command line (`--leader-id`,
-  `--leader-calibration-dir calibration/leader`); the row says *start with
-  --leader-port* otherwise.
+  Give its port on the command line (`--leader-port /dev/ttyACM1`, plus `--leader-id`,
+  `--leader-calibration-dir calibration/leader`). The row can only be enabled once the
+  check passes: the port opens and its motors carry the leader's calibration (LeRobot's
+  `is_calibrated` compares the homing offsets and limits stored in the servos with the
+  calibration file). The check runs once at start and again whenever you press *Check
+  leader arm*, so a leader plugged in later, or a wrong port fixed, just needs the
+  button. A failing check greys the row out and says why; it never stops the program —
+  someone who only wants the gamepad is not held up by a leader arm.
 
 Switching never jumps: the target stays where it is until the new source moves it.
 In gamepad and leader modes the page only displays the target; the mouse does not set it.
 
-**Start-up check on the ports.** Both arms are opened before the page comes up, and each
-must carry its own calibration in the motors (LeRobot's `is_calibrated` compares the
-homing offsets and limits stored in the servos with the calibration file). A follower
-port that holds the leader's numbers, or the other way round, or the same port given
-twice, fails the start with a message instead of writing one arm's calibration into the
-other.
+**What must work for the program to start at all**: the model, and — with `--port` — the
+follower arm: its port opens and its motors carry the follower calibration. A follower
+port that holds the leader's numbers (arms swapped), or `--leader-port` equal to
+`--port`, fails the start with a message; nothing is ever written into the motors to
+"fix" a mismatch.
 
 ## Gamepad: pairing first
 

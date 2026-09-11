@@ -248,8 +248,8 @@ class ControlLoopTests(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         log = RunLog(Path(tmp), "test")
         loop = ControlLoop(m, s, arm, limits, 100.0, targets, commands, viewer, log,
-                           gamepad_map={} if gamepad else None, leader=leader)
-        loop.pad, loop.gamepad = pad, gamepad     # an already-open pad, as hot-plug would leave it
+                           leader_factory=(lambda: leader) if leader else None)
+        loop.pad, loop.gamepad = pad, gamepad     # an already-open, paired pad, as hot-plug would leave it
         loop.start()
         t0 = time.monotonic()
         for offset, action in actions:
@@ -321,6 +321,9 @@ class ControlLoopTests(unittest.TestCase):
     def test_leader_mode_copies_joints_without_solving(self):
         class FakeLeader:
             deg = dict(FakeArm().read_deg())
+
+            def connect(self):
+                pass
 
             def read_deg(self):
                 return dict(self.deg)
@@ -397,6 +400,20 @@ class FakePad:
         pass
 
 
+class GamepadMapFileTests(unittest.TestCase):
+    def test_per_device_read_write_and_old_format(self):
+        from gamepad_control import load_map, read_maps, write_map
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "map.json"
+            self.assertIsNone(load_map(path, "any"))
+            path.write_text(json.dumps({"device": "Old", "axes": {"move_x": {"axis": 1, "sign": -1, "kind": "stick", "rest": 0.0}}, "buttons": {"hold": 7}}))
+            self.assertEqual(load_map(path, "Old")["buttons"], {"hold": 7})       # first file version still reads
+            write_map(path, "New", {"axes": {}, "buttons": {"stop": 6}})
+            self.assertEqual(set(read_maps(path)), {"Old", "New"})               # old pad kept, new added
+            self.assertEqual(load_map(path, "New")["buttons"], {"stop": 6})
+            self.assertIsNone(load_map(path, "Unknown"))
+
+
 class GamepadWizardTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -458,7 +475,7 @@ class GamepadWizardTests(unittest.TestCase):
         self.assertTrue(w.done)
         w._mirror_pad()          # the loop keeps drawing after completion; must not index past the last step
         w._demo_arm(0.3)
-        written = json.loads((Path(self.tmp) / "map.json").read_text())
+        written = json.loads((Path(self.tmp) / "map.json").read_text())["pads"]["fake"]
         self.assertEqual(written["buttons"], {"gripper_open": 0, "gripper_close": 1, "hold": 7, "stop": 6})
         self.assertEqual(set(written["axes"]), {"move_x", "move_y", "move_z", "roll", "pitch_down", "pitch_up"})
 

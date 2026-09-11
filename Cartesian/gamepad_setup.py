@@ -29,6 +29,7 @@ from viser.extras import ViserUrdf
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gamepad import Gamepad, discover  # noqa: E402
+from gamepad_control import write_map  # noqa: E402
 from gamepad_view import PadView, pad_wxyz  # noqa: E402
 from runlog import RunLog  # noqa: E402
 from so101_arm import MODEL_START_DEG, q_from_deg  # noqa: E402
@@ -193,11 +194,12 @@ class Wizard:
     def _finish(self) -> None:
         self.done = True
         self.view.highlight(None)
-        self.map_path.write_text(json.dumps(self.mapping, indent=2, ensure_ascii=False) + "\n")
+        write_map(self.map_path, self.mapping["device"], self.mapping)
         self.log.event("pairing complete", path=str(self.map_path), mapping=self.mapping)
         self.step_text.content = ("## Pairing complete\n\n"
-                                  f"Mapping written to `{self.map_path.name}`. Gamepad control is now unlocked "
-                                  "for the next stage. Move the sticks: the drawn pad follows.")
+                                  f"Mapping for **{self.mapping['device']}** written to `{self.map_path.name}`. "
+                                  "cartesian_control.py can now enable Gamepad with this pad. "
+                                  "Move the sticks: the drawn pad follows.")
         self.arm_label.text = ""
 
     def _advance(self) -> None:

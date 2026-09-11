@@ -24,11 +24,29 @@ ANGULAR_SPEED_RAD_S = 1.2     # pitch / roll rate at full trigger / stick
 PITCH_LIMIT_RAD = np.radians(120)   # keep the sliders' range; the arm cannot do more anyway
 
 
-def load_map(path: Path) -> dict | None:
+def read_maps(path: Path) -> dict[str, dict]:
+    """All pairings on file, keyed by the pad's device name. Missing file: none."""
     path = Path(path)
     if not path.exists():
-        return None
-    return json.loads(path.read_text())
+        return {}
+    data = json.loads(path.read_text())
+    if "pads" in data:
+        return data["pads"]
+    if "device" in data:            # first version of the file: one pad, unnamed section
+        return {data["device"]: {"axes": data["axes"], "buttons": data["buttons"]}}
+    return {}
+
+
+def write_map(path: Path, device: str, mapping: dict) -> None:
+    """Add or replace one pad's pairing, keeping the others."""
+    pads = read_maps(path)
+    pads[device] = {"axes": mapping["axes"], "buttons": mapping["buttons"]}
+    Path(path).write_text(json.dumps({"pads": pads}, indent=2, ensure_ascii=False) + "\n")
+
+
+def load_map(path: Path, device: str) -> dict | None:
+    """The pairing for this pad, or None if it has never been paired."""
+    return read_maps(path).get(device)
 
 
 @dataclass(frozen=True)

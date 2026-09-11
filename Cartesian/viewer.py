@@ -27,7 +27,7 @@ import viser.transforms as tf
 from viser.extras import ViserUrdf
 
 from so101_model import ARM_JOINTS, GRIPPER_INDEX, Model
-from target import HOLD, MODE_DRAG, MODE_GAMEPAD, MODE_LEADER, MODES, RELEASE, STOP, CommandBox, JointCommand, Target, TargetBox
+from target import HOLD, LEADER_CHECK, MODE_DRAG, MODE_GAMEPAD, MODE_LEADER, MODES, RELEASE, STOP, CommandBox, JointCommand, Target, TargetBox
 
 LOOPBACK = "127.0.0.1"   # the page has no login; local access only
 WEB_PORT = 4602          # registered in the machine-wide port table for the Season-1 viser page
@@ -125,11 +125,15 @@ class Viewer:
         with gui.add_folder("Control"):
             for mode in MODES:
                 self._mode_status[mode] = gui.add_markdown("")
+                if mode == MODE_LEADER:
+                    check = gui.add_button("Check leader arm", icon=viser.Icon.PLUG_CONNECTED,
+                                           hint="open --leader-port and verify it carries the leader calibration")
+                    check.on_click(lambda _: self.commands.push_button(LEADER_CHECK))
                 self._mode_button[mode] = gui.add_button(f"Enable {mode}")
                 self._mode_button[mode].on_click(lambda _, m=mode: self._toggle_mode(m))
         self.set_source_status(MODE_DRAG, True, "ready")
         self.set_source_status(MODE_GAMEPAD, False, "No gamepad detected")
-        self.set_source_status(MODE_LEADER, False, "start with --leader-port")
+        self.set_source_status(MODE_LEADER, False, "not checked yet")
 
         # --- sliders ----------------------------------------------------------------
         roll_lo, roll_hi = (math.degrees(v) for v in model.limits["wrist_roll"])
