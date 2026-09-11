@@ -184,10 +184,13 @@ other two show *waiting* until you disable it again. On the real arm, *Hold and 
 is refused until a source is enabled.
 
 * **Drag to move** — the ball, the sliders, the rings (above).
-* **Gamepad** — sticks push the target along at up to 0.08 m/s, triggers pitch it, the
-  right stick rolls it, A/B open/close the gripper, Start/Back are *Hold and follow* /
-  *Stop*. The ball and sliders follow so you see what the pad is asking for. The row
-  says *No gamepad detected* until a pad is plugged in — pads are looked for once a
+* **Gamepad** — the layout is Interbotix's X-Series arm layout (a five-joint arm like
+  this one) with Xbox names: LT / RT turn the whole arm about its base, the left stick
+  moves the tool up/down and out/in along the arm, the right stick pitches and rolls it,
+  B / X open / close the gripper while held, Start / Back are *Hold and follow* / *Stop*.
+  The target moves in cylindrical terms (waist angle, reach, height) at up to 0.08 m/s
+  and 0.8 rad/s. The ball and sliders follow so you see what the pad is asking for. The
+  row says *No gamepad detected* until a pad is plugged in — pads are looked for once a
   second (one directory listing, no measurable load), so plugging in after start works,
   and so does swapping pads. A pad that has never been paired shows *not paired — run
   gamepad_setup.py*; the pairing file keeps one entry per pad, so a pad paired once is
@@ -231,7 +234,7 @@ glows on the drawn pad, and the panel explains what it does and where the tool t
 is. A pad that is already paired skips straight to practice (*Restart pairing* to pair
 it again).
 
-Buttons that move something act **only while held**: A/B on the pad and the page's
+Buttons that move something act **only while held**: B/X on the pad and the page's
 *Open/Close gripper (hold)* buttons move the gripper at 60 %/s and stop the moment you
 let go. Nothing on the pad or the page commands "fully closed" in one press: a gripper
 told to close on an object keeps pushing, and on the real arm the command may lead the

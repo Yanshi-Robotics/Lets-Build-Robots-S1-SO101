@@ -296,20 +296,20 @@ class ControlLoopTests(unittest.TestCase):
     def test_gamepad_mode_pushes_the_target(self):
         from gamepad_control import GamepadSource, LINEAR_SPEED_MPS
         pad = FakePad()
-        mapping = {"axes": {"move_x": {"axis": 1, "sign": -1, "kind": "stick", "rest": 0.0},
-                            "pitch_down": {"axis": 5, "sign": 1, "kind": "trigger", "rest": -1.0}},
-                   "buttons": {"gripper_open": 0, "hold": 11, "stop": 10}}
+        mapping = {"axes": {"reach": {"axis": 0, "sign": 1, "kind": "stick", "rest": 0.0},
+                            "waist_left": {"axis": 4, "sign": 1, "kind": "trigger", "rest": -1.0}},
+                   "buttons": {"gripper_open": 1, "hold": 11, "stop": 10}}
         source = GamepadSource(pad, mapping)
 
         def push(t, c):
-            pad.axes[1] = -1.0
+            pad.axes[0] = 1.0           # left stick right: reach out, i.e. +x while the arm points along +x
 
         def release(t, c):
-            pad.axes[1] = 0.0
-            pad.press(0, True)          # hold A ...
+            pad.axes[0] = 0.0
+            pad.press(1, True)          # hold B ...
 
         def let_go(t, c):
-            pad.press(0, False)         # ... for 0.5 s, then let go: the gripper must stop where it is
+            pad.press(1, False)         # ... for 0.5 s, then let go: the gripper must stop where it is
 
         loop, viewer, ticks, m = self.run_loop(FakeArm(), 1.8, [(0.2, push), (0.7, release), (1.2, let_go)],
                                                gamepad=source, pad=pad, mode=MODE_GAMEPAD)
@@ -411,12 +411,30 @@ class GamepadMapFileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "map.json"
             self.assertIsNone(load_map(path, "any"))
-            path.write_text(json.dumps({"device": "Old", "axes": {"move_x": {"axis": 1, "sign": -1, "kind": "stick", "rest": 0.0}}, "buttons": {"hold": 7}}))
-            self.assertEqual(load_map(path, "Old")["buttons"], {"hold": 7})       # first file version still reads
-            write_map(path, "New", {"axes": {}, "buttons": {"stop": 6}})
-            self.assertEqual(set(read_maps(path)), {"Old", "New"})               # old pad kept, new added
-            self.assertEqual(load_map(path, "New")["buttons"], {"stop": 6})
+            axes = {k: {"axis": i, "sign": 1, "kind": "stick", "rest": 0.0} for i, k in enumerate(["move_z", "reach", "pitch", "roll", "waist_left", "waist_right"])}
+            buttons = {"gripper_open": 1, "gripper_close": 2, "hold": 7, "stop": 6}
+            write_map(path, "Old", {"axes": axes, "buttons": buttons})
+            write_map(path, "New", {"axes": {"reach": axes["reach"]}, "buttons": {"stop": 6}})   # an older layout
+            self.assertEqual(set(read_maps(path)), {"Old", "New"})               # both kept on file ...
+            self.assertEqual(load_map(path, "Old")["buttons"], buttons)
+            self.assertIsNone(load_map(path, "New"))                             # ... but the incomplete one is "not paired"
             self.assertIsNone(load_map(path, "Unknown"))
+
+
+class GamepadIntegrateTests(unittest.TestCase):
+    def test_waist_turns_about_the_base_and_reach_slides_out(self):
+        from gamepad_control import GamepadState, WAIST_SPEED_RAD_S, LINEAR_SPEED_MPS, integrate
+        t = Target((0.3, 0.0, 0.15), 0.0, 0.0, 30.0)
+        turned = integrate(t, GamepadState(waist_rate=1.0), 0.5, (-1, -1, -1), (1, 1, 1), (-3, 3))
+        self.assertAlmostEqual(math.hypot(*turned.xyz[:2]), 0.3, places=9)              # same reach
+        self.assertAlmostEqual(math.atan2(turned.xyz[1], turned.xyz[0]), WAIST_SPEED_RAD_S * 0.5, places=9)
+        out = integrate(t, GamepadState(reach_rate=1.0), 0.5, (-1, -1, -1), (1, 1, 1), (-3, 3))
+        self.assertAlmostEqual(out.xyz[0], 0.3 + LINEAR_SPEED_MPS * 0.5, places=9)
+        self.assertEqual(out.xyz[1], 0.0)
+        up = integrate(t, GamepadState(vz=-1.0), 0.5, (-1, -1, -1), (1, 1, 1), (-3, 3))
+        self.assertAlmostEqual(up.xyz[2], 0.15 - LINEAR_SPEED_MPS * 0.5, places=9)
+        nose_up = integrate(t, GamepadState(pitch_rate=1.0), 0.1, (-1, -1, -1), (1, 1, 1), (-3, 3))
+        self.assertLess(nose_up.pitch, 0.0)                                             # stick forward = nose up = pitch decreases
 
 
 class GamepadWizardTests(unittest.TestCase):
@@ -425,14 +443,16 @@ class GamepadWizardTests(unittest.TestCase):
         import socket
         import viser
         from gamepad_setup import Wizard
+        import os
         from viewer import WEB_PORT
+        port = int(os.environ.get("CARTESIAN_TEST_PORT", WEB_PORT))   # the page may be open on the default port
         with socket.socket() as s:
-            busy = s.connect_ex(("127.0.0.1", WEB_PORT)) == 0
+            busy = s.connect_ex(("127.0.0.1", port)) == 0
         if busy:
-            raise unittest.SkipTest(f"port {WEB_PORT} is in use")
+            raise unittest.SkipTest(f"port {port} is in use")
         cls.tmp = tempfile.mkdtemp()
         cls.log = RunLog(Path(cls.tmp), "test")
-        cls.server = viser.ViserServer(host="127.0.0.1", port=WEB_PORT, verbose=False)
+        cls.server = viser.ViserServer(host="127.0.0.1", port=port, verbose=False)
         cls.wizard = Wizard(model(), cls.server, cls.log, map_path=Path(cls.tmp) / "map.json")
 
     @classmethod
@@ -467,32 +487,32 @@ class GamepadWizardTests(unittest.TestCase):
     def test_full_pairing_writes_map(self):
         w = self.wizard
         self.push_axis(1, -1.0)   # left stick forward: Linux reports up as negative
-        self.assertEqual(w.mapping["axes"]["move_x"], {"axis": 1, "sign": -1, "kind": "stick", "rest": 0.0})
+        self.assertEqual(w.mapping["axes"]["move_z"], {"axis": 1, "sign": -1, "kind": "stick", "rest": 0.0})
         self.assertEqual(w.index, 1)
-        self.push_axis(0, 1.0)    # left stick right
-        self.push_axis(3, -1.0)   # right stick forward
-        self.push_axis(2, 1.0)    # right stick right
-        self.push_axis(4, 1.0)    # LT: -1 -> +1
-        self.assertEqual(w.mapping["axes"]["pitch_down"]["kind"], "trigger")
+        self.push_axis(0, 1.0)    # left stick right: reach
+        self.push_axis(3, -1.0)   # right stick forward: pitch
+        self.push_axis(2, 1.0)    # right stick right: roll
+        self.push_axis(4, 1.0)    # LT: -1 -> +1, waist left
+        self.assertEqual(w.mapping["axes"]["waist_left"]["kind"], "trigger")
         self.push_axis(5, 1.0)    # RT
-        for idx in (0, 1, 7, 6):  # A B Start Back
+        for idx in (1, 2, 7, 6):  # B X Start Back
             self.press(idx)
         self.assertTrue(w.done)
         w._mirror_pad()          # the loop keeps drawing after completion; must not index past the last step
         # practice: the pad now drives the simulated arm, with commentary on the control in use
         self.assertIsNotNone(w.practice)
-        x0 = w.practice_target.xyz[0]
-        self.pad.axes[1] = -1.0                      # left stick forward
+        z0 = w.practice_target.xyz[2]
+        self.pad.axes[1] = -1.0                      # left stick forward: up
         for i in range(25):
             w._practice_tick(0.02, 100.0 + i * 0.02)
-        self.assertGreater(w.practice_target.xyz[0], x0 + 0.03)
+        self.assertGreater(w.practice_target.xyz[2], z0 + 0.03)
         self.assertIn("Left stick", w.message)
         self.pad.axes[1] = 0.0
         w._practice_tick(0.02, 200.0)                # quiet for a long time: back to the idle text
         self.assertNotIn("Left stick", w.message)
         written = json.loads((Path(self.tmp) / "map.json").read_text())["pads"]["fake"]
-        self.assertEqual(written["buttons"], {"gripper_open": 0, "gripper_close": 1, "hold": 7, "stop": 6})
-        self.assertEqual(set(written["axes"]), {"move_x", "move_y", "move_z", "roll", "pitch_down", "pitch_up"})
+        self.assertEqual(written["buttons"], {"gripper_open": 1, "gripper_close": 2, "hold": 7, "stop": 6})
+        self.assertEqual(set(written["axes"]), {"move_z", "reach", "pitch", "roll", "waist_left", "waist_right"})
 
     def test_small_or_brief_axis_motion_is_ignored(self):
         w = self.wizard
@@ -506,18 +526,18 @@ class GamepadWizardTests(unittest.TestCase):
 
     def test_reused_control_is_refused(self):
         w = self.wizard
-        self.push_axis(1, -1.0)          # move_x <- axis 1
-        self.push_axis(1, 1.0)           # asked for move_y, gave the same axis
+        self.push_axis(1, -1.0)          # move_z <- axis 1
+        self.push_axis(1, 1.0)           # asked for reach, gave the same axis
         self.assertEqual(w.index, 1)
         self.assertIn("already", w.message)
         self.push_axis(0, 1.0)           # the right one
         self.assertEqual(w.index, 2)
         w.index = 6
         w._begin_step()
-        self.press(0)                    # gripper_open <- button 0
-        self.press(0)                    # gripper_close: same button, refused
+        self.press(1)                    # gripper_open <- button 1
+        self.press(1)                    # gripper_close: same button, refused
         self.assertEqual(w.index, 7)
-        self.press(1)
+        self.press(2)
         self.assertEqual(w.index, 8)
 
     def test_restart_clears_mapping(self):

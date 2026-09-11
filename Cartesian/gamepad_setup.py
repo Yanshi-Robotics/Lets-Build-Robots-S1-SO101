@@ -6,7 +6,8 @@ Open http://127.0.0.1:4602 . The page draws the gamepad and, next to it, the arm
 control being asked for glows; the arm shows what it will do. Move or press it on the
 real pad and the wizard records which axis or button that was, then moves on. When all
 steps are done the mapping is written to `Cartesian/gamepad_map.json`, which is what
-unlocks gamepad control of the arm.
+unlocks gamepad control of the arm. The layout is Interbotix's X-Series arm layout with
+Xbox names; see gamepad_control.py.
 
 Then comes practice: the simulated arm follows the pad exactly as the real one would in
 cartesian_control.py, the control you are using glows on the drawn pad, and the panel
@@ -66,15 +67,15 @@ PRACTICE_HOLD_S = 1.5      # keep explaining the last control this long after it
 
 # Practice narration: what each control does, shown while it is the one being used.
 EXPLAIN = {
-    "left_stick": "**Left stick** — moves the tool in the horizontal plane: forward/back is x, left/right is y. "
-                  "Push further to move faster; let go and the arm stops where it is.",
-    "right_stick": "**Right stick** — forward/back moves the tool up and down (z); left/right rolls the wrist "
+    "left_stick": "**Left stick** — forward/back moves the tool up and down; left/right slides it out and in "
+                  "along the arm. Push further to move faster; let go and the arm stops where it is.",
+    "right_stick": "**Right stick** — forward/back pitches the tool (nose up / down); left/right rolls the wrist "
                    "about the tool axis. The tool point stays put while rolling: the other joints compensate.",
-    "lt": "**LT** — pitches the tool down (nose toward the table). The pull depth sets the speed.",
-    "rt": "**RT** — pitches the tool up. Pitch is the only orientation the arm can choose freely "
-          "besides roll; yaw always follows the base.",
-    "a": "**A** — opens the gripper while held. Let go and it stops.",
-    "b": "**B** — closes the gripper while held. Let go and it stops; on the real arm keep it short "
+    "lt": "**LT** — turns the whole arm left about its base. The pull depth sets the speed.",
+    "rt": "**RT** — turns the whole arm right about its base. Turning the base is the only way this arm "
+          "changes where the tool faces in the horizontal plane.",
+    "b": "**B** — opens the gripper while held. Let go and it stops.",
+    "x": "**X** — closes the gripper while held. Let go and it stops; on the real arm keep it short "
          "on an object, the servo turns position error into force.",
     "start": "**Start** — on the real arm: torque on, start following. Nothing to do in this simulation.",
     "back": "**Back** — on the real arm: stop following, keep torque. Nothing to do in this simulation.",
@@ -94,21 +95,22 @@ class Step:
     hint_tilt: tuple[float, float] | None = None   # for sticks: which way to lean the knob in the hint
 
 
+# Interbotix X-Series layout with Xbox names (see gamepad_control.py). Order: sticks, triggers, buttons.
 STEPS = (
-    Step("move_x", "axis", "left_stick", "Push the LEFT stick fully FORWARD",
-         "tool moves forward (+x)", ("xyz", (1, 0, 0)), (0, 1)),
-    Step("move_y", "axis", "left_stick", "Push the LEFT stick fully RIGHT",
-         "tool moves right (−y)", ("xyz", (0, -1, 0)), (1, 0)),
-    Step("move_z", "axis", "right_stick", "Push the RIGHT stick fully FORWARD",
+    Step("move_z", "axis", "left_stick", "Push the LEFT stick fully FORWARD",
          "tool moves up (+z)", ("xyz", (0, 0, 1)), (0, 1)),
+    Step("reach", "axis", "left_stick", "Push the LEFT stick fully RIGHT",
+         "tool reaches out, away from the base", ("xyz", (1, 0, 0)), (1, 0)),
+    Step("pitch", "axis", "right_stick", "Push the RIGHT stick fully FORWARD",
+         "tool pitches up (nose rises)", ("pitch", -1), (0, 1)),
     Step("roll", "axis", "right_stick", "Push the RIGHT stick fully RIGHT",
          "wrist rolls (roll +)", ("roll", 1), (1, 0)),
-    Step("pitch_down", "axis", "lt", "Pull the LEFT trigger (LT) all the way",
-         "tool pitches down (pitch +)", ("pitch", 1)),
-    Step("pitch_up", "axis", "rt", "Pull the RIGHT trigger (RT) all the way",
-         "tool pitches up (pitch −)", ("pitch", -1)),
-    Step("gripper_open", "button", "a", "Press A", "gripper opens", ("gripper", 1)),
-    Step("gripper_close", "button", "b", "Press B", "gripper closes", ("gripper", -1)),
+    Step("waist_left", "axis", "lt", "Pull the LEFT trigger (LT) all the way",
+         "whole arm turns left about the base", ("waist", 1)),
+    Step("waist_right", "axis", "rt", "Pull the RIGHT trigger (RT) all the way",
+         "whole arm turns right about the base", ("waist", -1)),
+    Step("gripper_open", "button", "b", "Press B", "gripper opens while held", ("gripper", 1)),
+    Step("gripper_close", "button", "x", "Press X", "gripper closes while held", ("gripper", -1)),
     Step("hold", "button", "start", "Press Start", "real arm: torque on, start following", None),
     Step("stop", "button", "back", "Press Back (Select)", "real arm: stop following, keep torque", None),
 )
@@ -332,12 +334,12 @@ class Wizard:
 
         hinting = None if self.done or self.phase != "wait" else self.step.part   # the hint owns that knob
         if hinting != "left_stick":
-            self.view.set_stick("left_stick", value("move_y"), value("move_x"))
+            self.view.set_stick("left_stick", value("reach"), value("move_z"))
         if hinting != "right_stick":
-            self.view.set_stick("right_stick", value("roll"), value("move_z"))
-        self.view.set_trigger("lt", max(0.0, value("pitch_down")))
-        self.view.set_trigger("rt", max(0.0, value("pitch_up")))
-        for key, part in (("gripper_open", "a"), ("gripper_close", "b"), ("hold", "start"), ("stop", "back")):
+            self.view.set_stick("right_stick", value("roll"), value("pitch"))
+        self.view.set_trigger("lt", max(0.0, value("waist_left")))
+        self.view.set_trigger("rt", max(0.0, value("waist_right")))
+        for key, part in (("gripper_open", "b"), ("gripper_close", "x"), ("hold", "start"), ("stop", "back")):
             idx = self.mapping["buttons"].get(key)
             if idx is not None and idx < len(buttons):
                 self.view.set_button(part, buttons[idx])
@@ -355,6 +357,11 @@ class Wizard:
                 target = Target(target.xyz, target.pitch + DEMO_ANGLE_RAD * (0.5 + 0.5 * wave) * arg, target.roll, target.gripper_pct)
             elif what == "roll":
                 target = Target(target.xyz, target.pitch, target.roll + DEMO_ANGLE_RAD * (0.5 + 0.5 * wave) * arg, target.gripper_pct)
+            elif what == "waist":
+                x, y, z = target.xyz
+                a = math.atan2(y, x) + DEMO_ANGLE_RAD * (0.5 + 0.5 * wave) * arg
+                r = math.hypot(x, y)
+                target = target.with_xyz((r * math.cos(a), r * math.sin(a), z))
             elif what == "gripper":
                 pct = 30 + 70 * (0.5 + 0.5 * wave) if arg > 0 else 60 * (0.5 - 0.5 * wave)
                 target = Target(target.xyz, target.pitch, target.roll, pct)
@@ -375,10 +382,10 @@ class Wizard:
         # which control is doing the most right now?
         _, buttons = self.pad.snapshot()
         candidates = {
-            "left_stick": math.hypot(state.vx, state.vy),
-            "right_stick": math.hypot(state.vz, state.roll_rate),
-            "lt": max(0.0, state.pitch_rate), "rt": max(0.0, -state.pitch_rate),
-            "a": max(0.0, state.gripper_rate), "b": max(0.0, -state.gripper_rate),
+            "left_stick": math.hypot(state.reach_rate, state.vz),
+            "right_stick": math.hypot(state.pitch_rate, state.roll_rate),
+            "lt": max(0.0, state.waist_rate), "rt": max(0.0, -state.waist_rate),
+            "b": max(0.0, state.gripper_rate), "x": max(0.0, -state.gripper_rate),
             "start": 1.0 if "hold" in state.pressed else 0.0, "back": 1.0 if "stop" in state.pressed else 0.0,
         }
         part, strength = max(candidates.items(), key=lambda kv: kv[1])

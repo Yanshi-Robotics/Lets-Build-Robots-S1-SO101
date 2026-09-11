@@ -241,8 +241,9 @@ class ControlLoop:
                     if moved != current:
                         self.targets.set(moved, "gamepad")
                         self.viewer.sync_target(moved)
-                record["gamepad"] = {"vx": state.vx, "vy": state.vy, "vz": state.vz,
-                                     "pitch": state.pitch_rate, "roll": state.roll_rate, "pressed": list(state.pressed)}
+                record["gamepad"] = {"waist": state.waist_rate, "reach": state.reach_rate, "vz": state.vz,
+                                     "pitch": state.pitch_rate, "roll": state.roll_rate, "gripper": state.gripper_rate,
+                                     "pressed": list(state.pressed)}
 
             # 2b. leader arm: its joints are the goal; no solve
             if mode == MODE_LEADER and self.leader is not None and following:
