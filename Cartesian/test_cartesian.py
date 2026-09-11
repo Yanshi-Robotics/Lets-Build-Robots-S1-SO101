@@ -217,6 +217,10 @@ class NullViewer:
         self.synced: list[Target] = []
         self.pushes = 0
         self.mode = MODE_DRAG
+        self.statuses: list[tuple] = []
+
+    def set_source_status(self, mode, ok, text):
+        self.statuses.append((mode, ok, text))
 
     def sync_target(self, target: Target) -> None:
         self.synced.append(target)
@@ -230,7 +234,7 @@ class FakeLiveArm(FakeArm):
 
 
 class ControlLoopTests(unittest.TestCase):
-    def run_loop(self, arm, seconds, actions, gamepad=None, leader=None, mode=MODE_DRAG):
+    def run_loop(self, arm, seconds, actions, gamepad=None, pad=None, leader=None, mode=MODE_DRAG):
         """actions: list of (time_offset_s, callable(targets, commands)). Returns (loop, viewer, log dir)."""
         from cartesian_control import ControlLoop
         m = model()
@@ -243,7 +247,9 @@ class ControlLoopTests(unittest.TestCase):
         viewer.mode = mode
         tmp = tempfile.mkdtemp()
         log = RunLog(Path(tmp), "test")
-        loop = ControlLoop(m, s, arm, limits, 100.0, targets, commands, viewer, log, gamepad=gamepad, leader=leader)
+        loop = ControlLoop(m, s, arm, limits, 100.0, targets, commands, viewer, log,
+                           gamepad_map={} if gamepad else None, leader=leader)
+        loop.pad, loop.gamepad = pad, gamepad     # an already-open pad, as hot-plug would leave it
         loop.start()
         t0 = time.monotonic()
         for offset, action in actions:
@@ -303,7 +309,7 @@ class ControlLoopTests(unittest.TestCase):
             pad.press(0, True)
 
         loop, viewer, ticks, m = self.run_loop(FakeArm(), 1.6, [(0.2, push), (0.7, release)],
-                                               gamepad=source, mode=MODE_GAMEPAD)
+                                               gamepad=source, pad=pad, mode=MODE_GAMEPAD)
         start = ticks[0]["target"]["xyz"][0]
         end = ticks[-1]["target"]["xyz"][0]
         self.assertAlmostEqual(end - start, LINEAR_SPEED_MPS * 0.5, delta=0.006)   # 0.5 s at full stick
@@ -331,6 +337,12 @@ class ControlLoopTests(unittest.TestCase):
         self.assertAlmostEqual(ticks[-1]["q_goal_deg"]["shoulder_pan"], 25.0, places=3)
         self.assertAlmostEqual(ticks[-1]["q_cmd_deg"]["shoulder_pan"], 25.0, places=2)
         self.assertAlmostEqual(ticks[-1]["q_cmd_deg"]["gripper"], 80.0, places=2)
+
+    def test_hold_refused_without_a_mode(self):
+        arm = FakeLiveArm()
+        loop, viewer, ticks, m = self.run_loop(arm, 0.8, [(0.2, lambda t, c: c.push_button(HOLD))], mode=None)
+        self.assertFalse(any(t["following"] for t in ticks))
+        self.assertFalse(arm.torque_on)
 
     def test_live_arm_ignores_ball_until_hold(self):
         target = Target((0.25, 0.10, 0.12), math.radians(45), 0.0, 30.0)

@@ -168,22 +168,35 @@ jq -c '[.t, .target.source, .err_mm.goal, .err_mm.meas, .lead_limited]' Cartesia
 jq -c 'select(.solve) | .solve' Cartesian/logs/latest/ticks.jsonl
 ```
 
-## Three ways to drive it: one page, a dropdown
+## Three ways to drive it: one page, one enabled at a time
 
-The **Control** dropdown at the top of the page switches between:
+The **Control** panel at the top of the page has one row per source, each with an
+*Enable* button. Nothing is enabled at start: the page shows the arm and that is all.
+Enable one and the other two wait until you disable it again. On the real arm, *Hold
+and follow* is refused until a source is enabled.
 
 * **Drag to move** — the ball, the sliders, the rings (above).
 * **Gamepad** — sticks push the target along at up to 0.08 m/s, triggers pitch it, the
   right stick rolls it, A/B open/close the gripper, Start/Back are *Hold and follow* /
-  *Stop*. The ball and sliders follow so you see what the pad is asking for. Listed only
-  when a paired pad is plugged in (see below).
+  *Stop*. The ball and sliders follow so you see what the pad is asking for. The row
+  says *No gamepad detected* until a pad is plugged in (it is looked for every second,
+  so plugging in later works) and *Not paired* until `gamepad_setup.py` has been run.
+  If the pad goes away while enabled, the mode drops back to none.
 * **Leader arm** — a second SO-101 moved by hand; its joints become the goal directly
   (no solving), the ball jumps to where that lands, speed and lead limits still apply.
-  Listed only when started with `--leader-port /dev/ttyACM1` (`--leader-id`,
-  `--leader-calibration-dir calibration/leader`).
+  Needs `--leader-port /dev/ttyACM1` on the command line (`--leader-id`,
+  `--leader-calibration-dir calibration/leader`); the row says *start with
+  --leader-port* otherwise.
 
-Switching modes never jumps: the target stays where it is until the new source moves it.
+Switching never jumps: the target stays where it is until the new source moves it.
 In gamepad and leader modes the page only displays the target; the mouse does not set it.
+
+**Start-up check on the ports.** Both arms are opened before the page comes up, and each
+must carry its own calibration in the motors (LeRobot's `is_calibrated` compares the
+homing offsets and limits stored in the servos with the calibration file). A follower
+port that holds the leader's numbers, or the other way round, or the same port given
+twice, fails the start with a message instead of writing one arm's calibration into the
+other.
 
 ## Gamepad: pairing first
 

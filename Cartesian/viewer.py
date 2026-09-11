@@ -27,7 +27,7 @@ import viser.transforms as tf
 from viser.extras import ViserUrdf
 
 from so101_model import ARM_JOINTS, GRIPPER_INDEX, Model
-from target import HOLD, MODE_DRAG, MODE_GAMEPAD, MODE_LEADER, RELEASE, STOP, CommandBox, JointCommand, Target, TargetBox
+from target import HOLD, MODE_DRAG, MODE_GAMEPAD, MODE_LEADER, MODES, RELEASE, STOP, CommandBox, JointCommand, Target, TargetBox
 
 LOOPBACK = "127.0.0.1"   # the page has no login; local access only
 WEB_PORT = 4602          # registered in the machine-wide port table for the Season-1 viser page
@@ -72,11 +72,10 @@ def _rotation_about_z(wxyz_base, wxyz_now) -> float:
 
 class Viewer:
     def __init__(self, model: Model, bounds_min, bounds_max, host: str, port: int, live: bool,
-                 targets: TargetBox, commands: CommandBox, initial: Target,
-                 gamepad_available: bool = False, leader_available: bool = False):
+                 targets: TargetBox, commands: CommandBox, initial: Target):
         self.model = model
         self.live = live
-        self.mode = MODE_DRAG
+        self.mode: str | None = None    # nothing enabled until the user picks one
         self.targets = targets
         self.commands = commands
         self.server = viser.ViserServer(host=host, port=port, label="SO-101 Cartesian control", verbose=False)
@@ -118,20 +117,19 @@ class Viewer:
         for sphere in (self.ball_ok, self.ball_bad):
             sphere.on_drag(self._ball_free_drag)
 
-        # --- mode -------------------------------------------------------------------
-        modes = [MODE_DRAG]
-        if gamepad_available:
-            modes.append(MODE_GAMEPAD)
-        if leader_available:
-            modes.append(MODE_LEADER)
-        hints = []
-        if not gamepad_available:
-            hints.append("gamepad: run gamepad_setup.py and plug the pad in")
-        if not leader_available:
-            hints.append("leader arm: start with --leader-port")
-        self.mode_select = gui.add_dropdown("Control", modes, initial_value=MODE_DRAG,
-                                            hint=("; ".join(hints) or None))
-        self.mode_select.on_update(lambda _: self._set_mode(self.mode_select.value))
+        # --- modes: one row each, one enabled at a time ------------------------------
+        self._arm_buttons: list[viser.GuiButtonHandle] = []   # filled below in live mode
+        self._mode_ok: dict[str, bool] = {MODE_DRAG: True, MODE_GAMEPAD: False, MODE_LEADER: False}
+        self._mode_status: dict[str, viser.GuiMarkdownHandle] = {}
+        self._mode_button: dict[str, viser.GuiButtonHandle] = {}
+        with gui.add_folder("Control"):
+            for mode in MODES:
+                self._mode_status[mode] = gui.add_markdown("")
+                self._mode_button[mode] = gui.add_button(f"Enable {mode}")
+                self._mode_button[mode].on_click(lambda _, m=mode: self._toggle_mode(m))
+        self.set_source_status(MODE_DRAG, True, "ready")
+        self.set_source_status(MODE_GAMEPAD, False, "No gamepad detected")
+        self.set_source_status(MODE_LEADER, False, "start with --leader-port")
 
         # --- sliders ----------------------------------------------------------------
         roll_lo, roll_hi = (math.degrees(v) for v in model.limits["wrist_roll"])
@@ -179,6 +177,8 @@ class Viewer:
             hold.on_click(lambda _: self.commands.push_button(HOLD))
             stop.on_click(lambda _: self.commands.push_button(STOP))
             release.on_click(lambda _: self.commands.push_button(RELEASE))
+            self._arm_buttons = [hold, stop, release]
+            self._refresh_mode_panel()   # the arm buttons stay grey until a mode is enabled
 
         self.status = gui.add_markdown("starting")
         self._status_at = 0.0
@@ -190,9 +190,36 @@ class Viewer:
     def _set_ball_dragging(self, on: bool) -> None:
         self._ball_dragging = on
 
-    def _set_mode(self, mode: str) -> None:
-        self.mode = mode
-        self.commands.push_button(f"mode:{mode}")   # so the control loop logs the switch
+    def _toggle_mode(self, mode: str) -> None:
+        if self.mode == mode:
+            self.mode = None
+        elif self.mode is None and self._mode_ok[mode]:
+            self.mode = mode
+        else:
+            return
+        self.commands.push_button(f"mode:{self.mode}")   # so the control loop logs the switch
+        self._refresh_mode_panel()
+
+    def _refresh_mode_panel(self) -> None:
+        for mode in MODES:
+            button = self._mode_button[mode]
+            if self.mode == mode:
+                button.label, button.disabled = f"Disable {mode}", False
+            elif self.mode is not None:
+                button.label, button.disabled = f"waiting: {self.mode} is enabled", True
+            else:
+                button.label, button.disabled = f"Enable {mode}", not self._mode_ok[mode]
+        for button in self._arm_buttons:
+            button.disabled = self.mode is None
+
+    def set_source_status(self, mode: str, ok: bool, text: str) -> None:
+        """The control loop reports whether a source is usable (pad plugged in, leader connected)."""
+        self._mode_ok[mode] = ok
+        self._mode_status[mode].content = f"**{mode}** — {text}"
+        if not ok and self.mode == mode:      # the source went away under an enabled mode
+            self.mode = None
+            self.commands.push_button("mode:None")
+        self._refresh_mode_panel()
 
     async def _ball_free_drag(self, event) -> None:
         # async so viser delivers start / update / end in order (see viser's on_drag docs)

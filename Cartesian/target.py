@@ -69,8 +69,10 @@ class JointCommand:
 
 HOLD, STOP, RELEASE = "hold", "stop", "release"
 
-# Where the target comes from. The page offers these as a dropdown; the control loop reads it each tick.
+# Where the target comes from. One mode is enabled at a time on the page (or none, the
+# default: the page only shows the arm); the control loop reads it every tick.
 MODE_DRAG, MODE_GAMEPAD, MODE_LEADER = "Drag to move", "Gamepad", "Leader arm"
+MODES = (MODE_DRAG, MODE_GAMEPAD, MODE_LEADER)
 
 
 class CommandBox:

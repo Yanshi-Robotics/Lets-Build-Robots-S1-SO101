@@ -98,9 +98,14 @@ class Arm:
         bus = self.robot.bus
         bus.connect()
         if not bus.is_calibrated:
-            # LeRobot's own `connect()` would stop here and wait on input(); we know the
-            # answer (use the file), so write it and move on.
-            bus.write_calibration(self.robot.calibration)
+            # The motors' stored homing offsets and limits do not match the follower's
+            # calibration file: either this port is the leader arm, or the arm was
+            # recalibrated. Refuse rather than write the follower's numbers into it.
+            bus.disconnect(disable_torque=False)
+            raise RuntimeError(
+                f"motors on {self.robot.config.port} do not carry the follower calibration "
+                f"{self.calibration_path}: wrong port (leader and follower swapped?) or re-run calibration"
+            )
 
     def read_deg(self) -> dict[str, float]:
         return self.robot.bus.sync_read("Present_Position", num_retry=self.robot.config.num_read_retries)

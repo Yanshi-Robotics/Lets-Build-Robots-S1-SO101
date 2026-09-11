@@ -27,7 +27,12 @@ class Leader:
         bus = self.device.bus
         bus.connect()
         if not bus.is_calibrated:
-            bus.write_calibration(self.device.calibration)   # skip LeRobot's input() prompt
+            # same check as the follower: the motors must carry the leader's own calibration
+            bus.disconnect(disable_torque=False)
+            raise RuntimeError(
+                f"motors on {self.device.config.port} do not carry the leader calibration "
+                f"{self.device.calibration_fpath}: wrong port (leader and follower swapped?) or re-run calibration"
+            )
         self.device.configure()                              # torque off, position mode
 
     def read_deg(self) -> dict[str, float]:

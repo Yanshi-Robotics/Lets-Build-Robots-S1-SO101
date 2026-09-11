@@ -56,6 +56,7 @@ DEFAULT_BOUNDS_MAX_M = (0.40, 0.25, 0.45)
 ARM_MOVED_RAD = math.radians(0.5)
 # Leader mode: re-sync the goal only when the leader moved this much (its reading jitters by a tick).
 LEADER_CHANGED_RAD = math.radians(0.3)
+GAMEPAD_POLL_S = 1.0       # how often to look for a pad being plugged in (or having gone away)
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -85,9 +86,12 @@ def parse_args(argv=None) -> argparse.Namespace:
 class ControlLoop:
     def __init__(self, model: Model, solver: Solver, arm, limits: planner.Limits, hz: float,
                  targets: TargetBox, commands: CommandBox, viewer: Viewer, log: RunLog,
-                 gamepad: GamepadSource | None = None, leader: Leader | None = None, bounds=None):
+                 gamepad_map: dict | None = None, leader: Leader | None = None, bounds=None):
         self.model, self.solver, self.arm, self.limits = model, solver, arm, limits
-        self.gamepad, self.leader = gamepad, leader
+        self.gamepad_map, self.leader = gamepad_map, leader
+        self.pad: Gamepad | None = None
+        self.gamepad: GamepadSource | None = None
+        self._gamepad_polled = 0.0
         self.bounds_min, self.bounds_max = bounds if bounds else (DEFAULT_BOUNDS_MIN_M, DEFAULT_BOUNDS_MAX_M)
         self.dt = 1.0 / hz
         self.targets, self.commands, self.viewer, self.log = targets, commands, viewer, log
@@ -108,6 +112,34 @@ class ControlLoop:
         except Exception:
             self.log.exception("control loop died")
             self._stop.set()
+        finally:
+            if self.pad is not None:
+                self.pad.stop()
+
+    def _check_gamepad(self, now: float) -> None:
+        """Hot-plug: find a pad when there is none, notice when it goes away."""
+        if now - self._gamepad_polled < GAMEPAD_POLL_S:
+            return
+        self._gamepad_polled = now
+        if self.gamepad_map is None:
+            return   # status was set once at start: not paired
+        if self.pad is not None and self.pad.connected:
+            return
+        if self.pad is not None:   # was there, now gone
+            self.log.warning("gamepad lost", error=self.pad.error)
+            self.pad.stop()
+            self.pad, self.gamepad = None, None
+            self.viewer.set_source_status(MODE_GAMEPAD, False, "No gamepad detected")
+        devices = discover()
+        if not devices:
+            return
+        self.pad = Gamepad(devices[0][0])
+        self.pad.start()
+        self.gamepad = GamepadSource(self.pad, self.gamepad_map)
+        paired = self.gamepad_map.get("device")
+        note = "" if paired == self.pad.name else f" (paired with {paired})"
+        self.viewer.set_source_status(MODE_GAMEPAD, True, f"{self.pad.name}{note}")
+        self.log.event("gamepad ready", device=self.pad.name, path=str(devices[0][0]), paired_with=paired)
 
     def _sync_from(self, q: np.ndarray, source: str) -> tuple[int, object]:
         target = self.model.target_from_q(q)
@@ -126,12 +158,18 @@ class ControlLoop:
         last_synced_q = q_meas.copy()
         log.event("loop start", live=self.live, hz=1.0 / self.dt, q_deg=deg_from_q(q_meas))
 
+        if self.gamepad_map is None:
+            self.viewer.set_source_status(MODE_GAMEPAD, False, "Not paired — run gamepad_setup.py")
+        if self.leader is not None:
+            self.viewer.set_source_status(MODE_LEADER, True, "connected")
+
         tick = 0
         t_prev = time.monotonic()
         while not self._stop.is_set():
             t0 = time.monotonic()
             record: dict = {"tick": tick, "period_ms": (t0 - t_prev) * 1000.0}
             t_prev = t0
+            self._check_gamepad(t0)
 
             # 1. sense
             q_meas = q_from_deg(arm.read_deg())
@@ -143,6 +181,9 @@ class ControlLoop:
                 log.event("button", name=button)
                 if button.startswith("mode:"):
                     continue   # logged, nothing else to do: the loop reads viewer.mode every tick
+                if button == HOLD and self.viewer.mode is None:
+                    log.warning("hold refused: no control mode enabled")
+                    continue
                 if button == HOLD:
                     arm.hold()
                     q_cmd, q_goal = q_meas.copy(), q_meas.copy()
@@ -263,7 +304,7 @@ class ControlLoop:
         else:
             state = "simulated arm follows the ball"
         lines = [
-            f"**{mode}** · {self.viewer.mode} · {state}",
+            f"**{mode}** · {self.viewer.mode or 'no control mode enabled'} · {state}",
             f"target xyz = ({target.xyz[0]:.3f}, {target.xyz[1]:.3f}, {target.xyz[2]:.3f}) m · "
             f"pitch {math.degrees(target.pitch):.0f}° · roll {math.degrees(target.roll):.0f}° · gripper {target.gripper_pct:.0f}%",
             f"error: solver {goal_err.position_m * 1e3:.1f} mm · command {cmd_err.position_m * 1e3:.1f} mm · "
@@ -301,38 +342,31 @@ def main(argv=None) -> int:
     arm.connect()
     q0 = q_from_deg(arm.read_deg())
     log.event("arm connected", mode=arm.mode, q_deg=deg_from_q(q0), torque=arm.torque_on)
-    initial = model.target_from_q(q0)
-    targets, commands = TargetBox(initial), CommandBox()
 
-    gamepad_source, pad = None, None
-    mapping = load_map(args.gamepad_map)
-    devices = discover()
-    if mapping is None:
-        log.event("gamepad mode off: no mapping", path=str(args.gamepad_map))
-    elif not devices:
-        log.event("gamepad mode off: no gamepad plugged in")
-    else:
-        pad = Gamepad(devices[0][0])
-        pad.start()
-        gamepad_source = GamepadSource(pad, mapping)
-        log.event("gamepad ready", device=pad.name, path=str(devices[0][0]), paired_with=mapping.get("device"))
-        if mapping.get("device") != pad.name:
-            log.warning("gamepad differs from the paired one", paired=mapping.get("device"), found=pad.name)
-
+    # The leader is connected here, before the page, so a wrong port fails the start-up
+    # instead of surprising you later. `connect()` checks that the motors on the port
+    # carry the leader's calibration; the follower's `connect()` did the same for its port.
     leader = None
     if args.leader_port:
+        if live and args.leader_port == args.port:
+            raise SystemExit(f"--leader-port and --port are both {args.port}")
         leader = Leader(args.leader_port, args.leader_id, args.leader_calibration_dir)
         leader.connect()
         log.event("leader connected", port=args.leader_port, q_deg=leader.read_deg())
+    initial = model.target_from_q(q0)
+    targets, commands = TargetBox(initial), CommandBox()
+
+    mapping = load_map(args.gamepad_map)
+    if mapping is None:
+        log.event("gamepad not paired", path=str(args.gamepad_map))
 
     viewer = Viewer(model, args.bounds_min_m, args.bounds_max_m, LOOPBACK, args.web_port, live,
-                    targets, commands, initial,
-                    gamepad_available=gamepad_source is not None, leader_available=leader is not None)
+                    targets, commands, initial)
     log.event("page up", url=f"http://{LOOPBACK}:{args.web_port}")
     print(f"open http://{LOOPBACK}:{args.web_port}  (logs: {log.dir})", flush=True)
 
     loop = ControlLoop(model, solver, arm, limits, hz, targets, commands, viewer, log,
-                       gamepad=gamepad_source, leader=leader, bounds=(args.bounds_min_m, args.bounds_max_m))
+                       gamepad_map=mapping, leader=leader, bounds=(args.bounds_min_m, args.bounds_max_m))
     loop.start()
     try:
         while loop.thread.is_alive():
@@ -343,8 +377,6 @@ def main(argv=None) -> int:
         return 0
     finally:
         loop.stop()
-        if pad is not None:
-            pad.stop()
         if leader is not None:
             leader.close()
         arm.close(release_torque=args.release_torque)
