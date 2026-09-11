@@ -78,6 +78,19 @@ class CheckFailed(Exception):
     """One self-check item that has to be fixed before anything is started."""
 
 
+def release_command(args):
+    """The whole command, ready to paste.
+
+    ⚠️ An operator who has just been refused is holding an arm they cannot put down. Telling
+    them which flag to look up is not help; the four arguments they would have to retype are
+    already in `args`.
+    """
+    return (f"            python IK/so101_visual_control.py --release-torque \\\n"
+            f"                --model-dir {args.model_dir} --port {args.port} \\\n"
+            f"                --robot-id {args.robot_id} "
+            f"--calibration-dir {args.calibration_dir}")
+
+
 def validate_web_port(port):
     if not 1024 <= port <= 65535:
         raise ValueError("Choose an explicitly assigned unprivileged web port")
@@ -329,8 +342,10 @@ def self_check(args, arm, leader, servo, limits, bounds, wants_keyboard, keyboar
     if powered:
         raise CheckFailed(
             f"Torque is already enabled on {', '.join(powered)}.\n"
-            "        A previous run left the arm held. Support the arm, then release it with\n"
-            "        --release-torque, or cut DC power.")
+            "        A previous run stopped without ending its mode, so it deliberately did not\n"
+            "        let go -- releasing a raised arm drops it. Support the arm, then run:\n\n"
+            + release_command(args) + "\n\n"
+            "        Cutting DC power does the same thing instantly.")
     report("follower torque", "off on all six motors")
 
     disagreeing = model.calibration_disagrees(in_the_motors, arm.robot.calibration)
@@ -432,8 +447,9 @@ def measure_following(args):
     arm = model.LiveArm(args.port, args.robot_id, args.calibration_dir, p_coefficient=args.p_coefficient)
     observation, powered, in_the_motors = arm.read_before_power()
     if powered:
-        raise CheckFailed(f"Torque is already enabled on {', '.join(powered)}. Support the arm "
-                          "and release it with --release-torque first.")
+        raise CheckFailed(
+            f"Torque is already enabled on {', '.join(powered)}.\n"
+            "        Support the arm, then run:\n\n" + release_command(args))
     disagreeing = model.calibration_disagrees(in_the_motors, arm.robot.calibration)
     if disagreeing:
         raise CheckFailed(f"Calibration disagrees on {', '.join(disagreeing)}.\n        "
