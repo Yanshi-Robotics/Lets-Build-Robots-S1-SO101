@@ -69,6 +69,9 @@ class JointCommand:
 
 HOLD, STOP, RELEASE = "hold", "stop", "release"
 
+# Where the target comes from. The page offers these as a dropdown; the control loop reads it each tick.
+MODE_DRAG, MODE_GAMEPAD, MODE_LEADER = "Drag to move", "Gamepad", "Leader arm"
+
 
 class CommandBox:
     """Ring drags and hardware buttons, drained once per control tick."""

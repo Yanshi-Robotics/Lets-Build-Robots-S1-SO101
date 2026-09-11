@@ -23,7 +23,7 @@ from runlog import KEEP_RUNS, RunLog  # noqa: E402
 from so101_arm import FakeArm, deg_from_q, q_from_deg  # noqa: E402
 from so101_model import ARM_JOINTS, Model, calibration_half_travel_deg, rot_z  # noqa: E402
 from solver import Solver  # noqa: E402
-from target import HOLD, STOP, CommandBox, JointCommand, Target, TargetBox  # noqa: E402
+from target import HOLD, MODE_DRAG, MODE_GAMEPAD, MODE_LEADER, STOP, CommandBox, JointCommand, Target, TargetBox  # noqa: E402
 from viewer import _rotation_about_z  # noqa: E402
 
 MODEL_DIR: Path | None = None
@@ -216,6 +216,7 @@ class NullViewer:
     def __init__(self):
         self.synced: list[Target] = []
         self.pushes = 0
+        self.mode = MODE_DRAG
 
     def sync_target(self, target: Target) -> None:
         self.synced.append(target)
@@ -229,7 +230,7 @@ class FakeLiveArm(FakeArm):
 
 
 class ControlLoopTests(unittest.TestCase):
-    def run_loop(self, arm, seconds, actions):
+    def run_loop(self, arm, seconds, actions, gamepad=None, leader=None, mode=MODE_DRAG):
         """actions: list of (time_offset_s, callable(targets, commands)). Returns (loop, viewer, log dir)."""
         from cartesian_control import ControlLoop
         m = model()
@@ -239,9 +240,10 @@ class ControlLoopTests(unittest.TestCase):
         q0 = q_from_deg(arm.read_deg())
         targets, commands = TargetBox(m.target_from_q(q0)), CommandBox()
         viewer = NullViewer()
+        viewer.mode = mode
         tmp = tempfile.mkdtemp()
         log = RunLog(Path(tmp), "test")
-        loop = ControlLoop(m, s, arm, limits, 100.0, targets, commands, viewer, log)
+        loop = ControlLoop(m, s, arm, limits, 100.0, targets, commands, viewer, log, gamepad=gamepad, leader=leader)
         loop.start()
         t0 = time.monotonic()
         for offset, action in actions:
@@ -284,6 +286,51 @@ class ControlLoopTests(unittest.TestCase):
         self.assertAlmostEqual(last["q_cmd_deg"]["shoulder_pan"], math.degrees(0.5), places=2)
         self.assertAlmostEqual(last["q_goal_deg"]["elbow_flex"], 60.0, places=3)
         self.assertGreaterEqual(len(viewer.synced), 2)  # initial + ring
+
+    def test_gamepad_mode_pushes_the_target(self):
+        from gamepad_control import GamepadSource, LINEAR_SPEED_MPS
+        pad = FakePad()
+        mapping = {"axes": {"move_x": {"axis": 1, "sign": -1, "kind": "stick", "rest": 0.0},
+                            "pitch_down": {"axis": 5, "sign": 1, "kind": "trigger", "rest": -1.0}},
+                   "buttons": {"gripper_open": 0, "hold": 11, "stop": 10}}
+        source = GamepadSource(pad, mapping)
+
+        def push(t, c):
+            pad.axes[1] = -1.0
+
+        def release(t, c):
+            pad.axes[1] = 0.0
+            pad.press(0, True)
+
+        loop, viewer, ticks, m = self.run_loop(FakeArm(), 1.6, [(0.2, push), (0.7, release)],
+                                               gamepad=source, mode=MODE_GAMEPAD)
+        start = ticks[0]["target"]["xyz"][0]
+        end = ticks[-1]["target"]["xyz"][0]
+        self.assertAlmostEqual(end - start, LINEAR_SPEED_MPS * 0.5, delta=0.006)   # 0.5 s at full stick
+        self.assertEqual(ticks[-1]["target"]["source"], "gamepad")
+        self.assertEqual(ticks[-1]["target"]["gripper_pct"], 100.0)
+        self.assertGreater(len([t for t in ticks if "solve" in t]), 5)              # solved as the stick moved it
+        self.assertLess(ticks[-1]["err_mm"]["cmd"], 1.0)
+
+    def test_leader_mode_copies_joints_without_solving(self):
+        class FakeLeader:
+            deg = dict(FakeArm().read_deg())
+
+            def read_deg(self):
+                return dict(self.deg)
+
+        leader = FakeLeader()
+
+        def move(t, c):
+            leader.deg["shoulder_pan"] = 25.0
+            leader.deg["gripper"] = 80.0
+
+        loop, viewer, ticks, m = self.run_loop(FakeArm(), 1.5, [(0.2, move)], leader=leader, mode=MODE_LEADER)
+        self.assertEqual(len([t for t in ticks if "solve" in t]), 0)
+        self.assertEqual(ticks[-1]["target"]["source"], "leader")
+        self.assertAlmostEqual(ticks[-1]["q_goal_deg"]["shoulder_pan"], 25.0, places=3)
+        self.assertAlmostEqual(ticks[-1]["q_cmd_deg"]["shoulder_pan"], 25.0, places=2)
+        self.assertAlmostEqual(ticks[-1]["q_cmd_deg"]["gripper"], 80.0, places=2)
 
     def test_live_arm_ignores_ball_until_hold(self):
         target = Target((0.25, 0.10, 0.12), math.radians(45), 0.0, 30.0)

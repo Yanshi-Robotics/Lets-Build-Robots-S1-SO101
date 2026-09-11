@@ -86,6 +86,10 @@ built-in 2.8 degree tilt which is included in that zero).
 | `solver.py` | 4 | placo QP, iterated to convergence |
 | `planner.py` | 5 | speed limit and lead clamp, pure functions |
 | `so101_arm.py` | 1, 6 | `Arm` (LeRobot `SO101Follower`), `FakeArm`, degree/radian conversion |
+| `so101_leader.py` | 2 | `Leader` (LeRobot `SO101Leader`), joint goals from a hand-moved arm |
+| `gamepad.py` | 2 | Linux joystick reader (`/dev/input/js*`) |
+| `gamepad_control.py` | 2 | paired axes/buttons -> velocities -> a moving `Target` |
+| `gamepad_view.py`, `gamepad_setup.py` | — | 3D pad drawn from primitives; the pairing wizard |
 | `viewer.py` | 2 | the viser page: two arms, ball, sliders, rings, buttons, status |
 | `runlog.py` | — | one directory per run under `logs/` |
 | `cartesian_control.py` | loop | arguments, wiring, the control thread |
@@ -163,6 +167,23 @@ Quick extracts:
 jq -c '[.t, .target.source, .err_mm.goal, .err_mm.meas, .lead_limited]' Cartesian/logs/latest/ticks.jsonl | tail
 jq -c 'select(.solve) | .solve' Cartesian/logs/latest/ticks.jsonl
 ```
+
+## Three ways to drive it: one page, a dropdown
+
+The **Control** dropdown at the top of the page switches between:
+
+* **Drag to move** — the ball, the sliders, the rings (above).
+* **Gamepad** — sticks push the target along at up to 0.08 m/s, triggers pitch it, the
+  right stick rolls it, A/B open/close the gripper, Start/Back are *Hold and follow* /
+  *Stop*. The ball and sliders follow so you see what the pad is asking for. Listed only
+  when a paired pad is plugged in (see below).
+* **Leader arm** — a second SO-101 moved by hand; its joints become the goal directly
+  (no solving), the ball jumps to where that lands, speed and lead limits still apply.
+  Listed only when started with `--leader-port /dev/ttyACM1` (`--leader-id`,
+  `--leader-calibration-dir calibration/leader`).
+
+Switching modes never jumps: the target stays where it is until the new source moves it.
+In gamepad and leader modes the page only displays the target; the mouse does not set it.
 
 ## Gamepad: pairing first
 

@@ -35,7 +35,7 @@ from so101_arm import MODEL_START_DEG, q_from_deg  # noqa: E402
 from so101_model import ARM_JOINTS, GRIPPER_INDEX, Model  # noqa: E402
 from solver import Solver  # noqa: E402
 from target import Target  # noqa: E402
-from viewer import LOOPBACK, WEB_PORT, MEASURED_COLOR  # noqa: E402
+from viewer import LOOPBACK, WEB_PORT, MEASURED_COLOR, ensure_port_free  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 MAP_PATH = HERE / "gamepad_map.json"
@@ -63,33 +63,29 @@ class Step:
     key: str            # name in gamepad_map.json
     kind: str           # "axis" or "button"
     part: str           # part on the drawn pad to highlight
-    ask_zh: str
-    ask_en: str
-    does_zh: str
-    does_en: str
+    ask: str
+    does: str
     demo: tuple | None  # ("xyz", direction) | ("pitch", sign) | ("roll", sign) | ("gripper", sign) | None
     hint_tilt: tuple[float, float] | None = None   # for sticks: which way to lean the knob in the hint
 
 
 STEPS = (
-    Step("move_x", "axis", "left_stick", "把左摇杆向前推到底", "Push the LEFT stick fully FORWARD",
-         "末端向前（+x）", "tool moves forward (+x)", ("xyz", (1, 0, 0)), (0, 1)),
-    Step("move_y", "axis", "left_stick", "把左摇杆向右推到底", "Push the LEFT stick fully RIGHT",
-         "末端向右（−y）", "tool moves right (−y)", ("xyz", (0, -1, 0)), (1, 0)),
-    Step("move_z", "axis", "right_stick", "把右摇杆向前推到底", "Push the RIGHT stick fully FORWARD",
-         "末端向上（+z）", "tool moves up (+z)", ("xyz", (0, 0, 1)), (0, 1)),
-    Step("roll", "axis", "right_stick", "把右摇杆向右推到底", "Push the RIGHT stick fully RIGHT",
-         "手腕滚转（roll +）", "wrist rolls (roll +)", ("roll", 1), (1, 0)),
-    Step("pitch_down", "axis", "lt", "把左扳机 LT 按到底", "Pull the LEFT trigger (LT) all the way",
-         "工具低头（pitch +）", "tool pitches down (pitch +)", ("pitch", 1)),
-    Step("pitch_up", "axis", "rt", "把右扳机 RT 按到底", "Pull the RIGHT trigger (RT) all the way",
-         "工具抬头（pitch −）", "tool pitches up (pitch −)", ("pitch", -1)),
-    Step("gripper_open", "button", "a", "按 A", "Press A", "夹爪打开", "gripper opens", ("gripper", 1)),
-    Step("gripper_close", "button", "b", "按 B", "Press B", "夹爪关闭", "gripper closes", ("gripper", -1)),
-    Step("hold", "button", "start", "按 Start", "Press Start",
-         "真机：上力矩并开始跟随", "real arm: torque on, start following", None),
-    Step("stop", "button", "back", "按 Back（Select）", "Press Back (Select)",
-         "真机：停止跟随，保持力矩", "real arm: stop following, keep torque", None),
+    Step("move_x", "axis", "left_stick", "Push the LEFT stick fully FORWARD",
+         "tool moves forward (+x)", ("xyz", (1, 0, 0)), (0, 1)),
+    Step("move_y", "axis", "left_stick", "Push the LEFT stick fully RIGHT",
+         "tool moves right (−y)", ("xyz", (0, -1, 0)), (1, 0)),
+    Step("move_z", "axis", "right_stick", "Push the RIGHT stick fully FORWARD",
+         "tool moves up (+z)", ("xyz", (0, 0, 1)), (0, 1)),
+    Step("roll", "axis", "right_stick", "Push the RIGHT stick fully RIGHT",
+         "wrist rolls (roll +)", ("roll", 1), (1, 0)),
+    Step("pitch_down", "axis", "lt", "Pull the LEFT trigger (LT) all the way",
+         "tool pitches down (pitch +)", ("pitch", 1)),
+    Step("pitch_up", "axis", "rt", "Pull the RIGHT trigger (RT) all the way",
+         "tool pitches up (pitch −)", ("pitch", -1)),
+    Step("gripper_open", "button", "a", "Press A", "gripper opens", ("gripper", 1)),
+    Step("gripper_close", "button", "b", "Press B", "gripper closes", ("gripper", -1)),
+    Step("hold", "button", "start", "Press Start", "real arm: torque on, start following", None),
+    Step("stop", "button", "back", "Press Back (Select)", "real arm: stop following, keep torque", None),
 )
 
 
@@ -143,14 +139,14 @@ class Wizard:
             self.log.warning("gamepad lost", error=self.pad.error)
             self.pad.stop()
             self.pad = None
-            self.device_text.content = "**Gamepad unplugged** — plug it back in / 手柄断开了，插回去"
+            self.device_text.content = "**Gamepad unplugged** — plug it back in"
         now = time.monotonic()
         if now - self._last_poll < POLL_DEVICE_S:
             return False
         self._last_poll = now
         found = discover()
         if not found:
-            self.device_text.content = "**No gamepad found** — plug one in / 没检测到手柄，插上后自动开始"
+            self.device_text.content = "**No gamepad found** — plug one in; pairing starts by itself"
             return False
         path, name = found[0]
         self.pad = Gamepad(path)
@@ -191,15 +187,15 @@ class Wizard:
         self.view.highlight(None)
         s = self.step
         self.step_text.content = (f"### Step {self.index + 1} / {len(STEPS)}\n\n"
-                                  f"## {s.ask_zh}\n{s.ask_en}\n\n**作用 / does:** {s.does_zh} · {s.does_en}")
-        self.arm_label.text = f"{s.does_zh}  ·  {s.does_en}"
+                                  f"## {s.ask}\n\n**It will:** {s.does}")
+        self.arm_label.text = s.does
 
     def _finish(self) -> None:
         self.done = True
         self.view.highlight(None)
         self.map_path.write_text(json.dumps(self.mapping, indent=2, ensure_ascii=False) + "\n")
         self.log.event("pairing complete", path=str(self.map_path), mapping=self.mapping)
-        self.step_text.content = ("## 配对完成 / Pairing complete\n\n"
+        self.step_text.content = ("## Pairing complete\n\n"
                                   f"Mapping written to `{self.map_path.name}`. Gamepad control is now unlocked "
                                   "for the next stage. Move the sticks: the drawn pad follows.")
         self.arm_label.text = ""
@@ -215,27 +211,25 @@ class Wizard:
         kind = "trigger" if self.rest[idx] < TRIGGER_REST else "stick"
         for key, entry in self.mapping["axes"].items():
             if entry["axis"] == idx:
-                self.message = (f"⚠️ axis {idx} is already **{key}** — try a different control / "
-                                f"这个轴已经分配给 {key} 了，换一个")
+                self.message = f"⚠️ axis {idx} is already **{key}** — try a different control"
                 self.phase = "release"
                 self.log.warning("axis already used", axis=idx, used_for=key, asked=self.step.key)
                 return
         self.mapping["axes"][self.step.key] = {"axis": idx, "sign": 1 if delta > 0 else -1, "kind": kind,
                                                "rest": round(self.rest[idx], 3)}
-        self.message = f"✅ axis {idx} ({kind}, {'+' if delta > 0 else '−'}) — let go / 松开"
+        self.message = f"✅ axis {idx} ({kind}, {'+' if delta > 0 else '−'}) — now let go"
         self.phase = "release"
         self.log.event("axis mapped", step=self.step.key, axis=idx, sign=1 if delta > 0 else -1, kind=kind, delta=delta)
 
     def _record_button(self, idx: int) -> None:
         for key, used in self.mapping["buttons"].items():
             if used == idx:
-                self.message = (f"⚠️ button {idx} is already **{key}** — press a different one / "
-                                f"这个键已经分配给 {key} 了，换一个")
+                self.message = f"⚠️ button {idx} is already **{key}** — press a different one"
                 self.phase = "release"
                 self.log.warning("button already used", button=idx, used_for=key, asked=self.step.key)
                 return
         self.mapping["buttons"][self.step.key] = idx
-        self.message = f"✅ button {idx} — let go / 松开"
+        self.message = f"✅ button {idx} — now let go"
         self.phase = "release"
         self.log.event("button mapped", step=self.step.key, button=idx)
 
@@ -341,7 +335,7 @@ class Wizard:
                 got = "⬅ now"
             else:
                 got = ""
-            rows.append(f"| {s.key} | {s.does_en} | {got} |")
+            rows.append(f"| {s.key} | {s.does} | {got} |")
         self.progress.content = ((self.message + "\n\n") if self.message else "") + \
             "| step | does | mapped to |\n|---|---|---|\n" + "\n".join(rows)
 
@@ -379,6 +373,7 @@ def main(argv=None) -> int:
     p.add_argument("--logs-dir", type=Path, default=HERE / "logs")
     args = p.parse_args(argv)
 
+    ensure_port_free(LOOPBACK, args.web_port)
     log = RunLog(args.logs_dir, "gamepad-setup")
     model = Model(args.model_dir)
     server = viser.ViserServer(host=LOOPBACK, port=args.web_port, label="SO-101 gamepad pairing", verbose=False)

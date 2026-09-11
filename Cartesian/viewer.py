@@ -27,7 +27,7 @@ import viser.transforms as tf
 from viser.extras import ViserUrdf
 
 from so101_model import ARM_JOINTS, GRIPPER_INDEX, Model
-from target import HOLD, RELEASE, STOP, CommandBox, JointCommand, Target, TargetBox
+from target import HOLD, MODE_DRAG, MODE_GAMEPAD, MODE_LEADER, RELEASE, STOP, CommandBox, JointCommand, Target, TargetBox
 
 LOOPBACK = "127.0.0.1"   # the page has no login; local access only
 WEB_PORT = 4602          # registered in the machine-wide port table for the Season-1 viser page
@@ -43,11 +43,21 @@ COMMANDED_COLOR = (1.0, 0.55, 0.1, 0.35)   # RGBA: translucent orange ghost
 BALL_OK_COLOR = (40, 200, 90)
 BALL_UNREACHABLE_COLOR = (230, 50, 50)
 STATUS_HZ = 5            # status text is for eyes, not for control; 5 Hz is enough
+SLIDER_SYNC_HZ = 10      # how often gamepad / leader modes push the target back into the sliders
 CAMERA_POSITION_M = (0.45, -0.55, 0.35)   # where a new browser tab starts looking from
 CAMERA_LOOK_AT_M = (0.2, 0.0, 0.15)       # roughly the middle of the arm's workspace
 PITCH_SLIDER_DEG = 180   # +/- range. The three pitch joints can sum well past 90.
 GRIPPER_OPEN_PCT = 100.0   # LeRobot's gripper scale: 100 = fully open
 GRIPPER_CLOSED_PCT = 0.0
+
+
+def ensure_port_free(host: str, port: int) -> None:
+    """viser does not complain when the port is taken (two servers end up sharing it); we do."""
+    import socket
+    with socket.socket() as s:
+        if s.connect_ex((host, port)) == 0:
+            raise SystemExit(f"port {port} is already in use on {host}: close the other page "
+                             f"(gamepad_setup.py or cartesian_control.py) first, or pass --web-port")
 
 
 def _wxyz(R: np.ndarray) -> np.ndarray:
@@ -62,9 +72,11 @@ def _rotation_about_z(wxyz_base, wxyz_now) -> float:
 
 class Viewer:
     def __init__(self, model: Model, bounds_min, bounds_max, host: str, port: int, live: bool,
-                 targets: TargetBox, commands: CommandBox, initial: Target):
+                 targets: TargetBox, commands: CommandBox, initial: Target,
+                 gamepad_available: bool = False, leader_available: bool = False):
         self.model = model
         self.live = live
+        self.mode = MODE_DRAG
         self.targets = targets
         self.commands = commands
         self.server = viser.ViserServer(host=host, port=port, label="SO-101 Cartesian control", verbose=False)
@@ -105,6 +117,21 @@ class Viewer:
         self._grab_offset = np.zeros(3)
         for sphere in (self.ball_ok, self.ball_bad):
             sphere.on_drag(self._ball_free_drag)
+
+        # --- mode -------------------------------------------------------------------
+        modes = [MODE_DRAG]
+        if gamepad_available:
+            modes.append(MODE_GAMEPAD)
+        if leader_available:
+            modes.append(MODE_LEADER)
+        hints = []
+        if not gamepad_available:
+            hints.append("gamepad: run gamepad_setup.py and plug the pad in")
+        if not leader_available:
+            hints.append("leader arm: start with --leader-port")
+        self.mode_select = gui.add_dropdown("Control", modes, initial_value=MODE_DRAG,
+                                            hint=("; ".join(hints) or None))
+        self.mode_select.on_update(lambda _: self._set_mode(self.mode_select.value))
 
         # --- sliders ----------------------------------------------------------------
         roll_lo, roll_hi = (math.degrees(v) for v in model.limits["wrist_roll"])
@@ -156,11 +183,16 @@ class Viewer:
         self.status = gui.add_markdown("starting")
         self._status_at = 0.0
         self._syncing = False   # set while sync_target writes the widgets, so their callbacks stay quiet
+        self._sliders_synced_at = 0.0
 
     # ---- callbacks (viser thread) -----------------------------------------------------
 
     def _set_ball_dragging(self, on: bool) -> None:
         self._ball_dragging = on
+
+    def _set_mode(self, mode: str) -> None:
+        self.mode = mode
+        self.commands.push_button(f"mode:{mode}")   # so the control loop logs the switch
 
     async def _ball_free_drag(self, event) -> None:
         # async so viser delivers start / update / end in order (see viser's on_drag docs)
@@ -171,6 +203,8 @@ class Viewer:
         if event.phase == "end":
             self._ball_dragging = False
             return
+        if self.mode != MODE_DRAG:
+            return
         wanted = np.asarray(event.end_position) + self._grab_offset
         self.ball.position = np.clip(wanted, self._bounds_min, self._bounds_max)
         self._publish_target("ball")
@@ -180,8 +214,8 @@ class Viewer:
         self._publish_target("button")
 
     def _publish_target(self, source: str) -> None:
-        if self._syncing:
-            return
+        if self._syncing or self.mode != MODE_DRAG:
+            return   # in the other modes the page only shows the target, it does not set it
         p = self.ball.position
         self.targets.set(Target(xyz=(float(p[0]), float(p[1]), float(p[2])),
                                 pitch=math.radians(self.pitch.value), roll=math.radians(self.roll.value),
@@ -193,7 +227,7 @@ class Viewer:
         self._ring_base_angle[name] = float(self._last_q_goal[ARM_JOINTS.index(name)])
 
     def _ring_update(self, name: str) -> None:
-        if name not in self._ring_dragging:
+        if name not in self._ring_dragging or self.mode != MODE_DRAG:
             return
         delta = _rotation_about_z(self._ring_base_wxyz[name], self.rings[name].wxyz)
         self.commands.push_joint(JointCommand(joint=name, angle=self._ring_base_angle[name] + delta))
@@ -211,9 +245,12 @@ class Viewer:
         try:
             if not self._ball_dragging:
                 self.ball.position = np.asarray(target.xyz)
-            self.pitch.value = round(math.degrees(target.pitch))
-            self.roll.value = round(math.degrees(target.roll))
-            self.gripper.value = round(target.gripper_pct)
+            now = time.monotonic()
+            if now - self._sliders_synced_at >= 1.0 / SLIDER_SYNC_HZ:   # widgets are slower than the loop
+                self._sliders_synced_at = now
+                self.pitch.value = round(math.degrees(target.pitch))
+                self.roll.value = round(math.degrees(target.roll))
+                self.gripper.value = round(target.gripper_pct)
         finally:
             self._syncing = False
 
