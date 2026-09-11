@@ -108,6 +108,8 @@ class Viewer:
         self.tool_axes = scene.add_frame("/target/tool", axes_length=TOOL_AXES_LENGTH_M, axes_radius=0.002,
                                          origin_radius=0.0)
         self._ball_dragging = False
+        self._syncing = False   # set while sync_target writes the widgets, so their callbacks stay quiet
+        self._sliders_synced_at = 0.0
         self.ball.on_drag_start(lambda _: self._set_ball_dragging(True))
         self.ball.on_drag_end(lambda _: self._set_ball_dragging(False))
         self.ball.on_update(lambda _: self._publish_target("ball"))
@@ -117,13 +119,20 @@ class Viewer:
         for sphere in (self.ball_ok, self.ball_bad):
             sphere.on_drag(self._ball_free_drag)
 
-        # --- modes: one row each, one enabled at a time ------------------------------
+        # --- mode pages: a dropdown picks which one the sidebar shows -----------------
+        # Each mode has its own folder with its self-check status and its buttons; only the
+        # selected folder is visible. Enabling is still exclusive: while one mode is enabled
+        # the other pages show "waiting".
         self._arm_buttons: list[viser.GuiButtonHandle] = []   # filled below in live mode
         self._mode_ok: dict[str, bool] = {MODE_DRAG: True, MODE_GAMEPAD: False, MODE_LEADER: False}
         self._mode_status: dict[str, viser.GuiMarkdownHandle] = {}
         self._mode_button: dict[str, viser.GuiButtonHandle] = {}
-        with gui.add_folder("Control"):
-            for mode in MODES:
+        self._mode_folder: dict[str, viser.GuiFolderHandle] = {}
+        self.page_select = gui.add_dropdown("Mode", list(MODES), initial_value=MODE_DRAG)
+        self.page_select.on_update(lambda _: self._show_page(self.page_select.value))
+        for mode in MODES:
+            self._mode_folder[mode] = gui.add_folder(mode)
+            with self._mode_folder[mode]:
                 self._mode_status[mode] = gui.add_markdown("")
                 if mode == MODE_LEADER:
                     check = gui.add_button("Check leader arm", icon=viser.Icon.PLUG_CONNECTED,
@@ -131,28 +140,14 @@ class Viewer:
                     check.on_click(lambda _: self.commands.push_button(LEADER_CHECK))
                 self._mode_button[mode] = gui.add_button(f"Enable {mode}")
                 self._mode_button[mode].on_click(lambda _, m=mode: self._toggle_mode(m))
+                if mode == MODE_DRAG:
+                    self._build_target_widgets(gui, model, initial)
         self.set_source_status(MODE_DRAG, True, "ready")
         self.set_source_status(MODE_GAMEPAD, False, "No gamepad detected")
         self.set_source_status(MODE_LEADER, False, "not checked yet")
+        self._show_page(MODE_DRAG)
 
-        # --- sliders ----------------------------------------------------------------
-        roll_lo, roll_hi = (math.degrees(v) for v in model.limits["wrist_roll"])
-        with gui.add_folder("Target"):
-            self.pitch = gui.add_slider("pitch (deg)", -PITCH_SLIDER_DEG, PITCH_SLIDER_DEG, 1.0,
-                                        round(math.degrees(initial.pitch)),
-                                        hint="0 = tool level, pointing forward; positive = pointing down")
-            self.roll = gui.add_slider("roll (deg)", round(roll_lo), round(roll_hi), 1.0,
-                                       round(math.degrees(initial.roll)),
-                                       hint="0 = wrist_roll at zero; positive = positive wrist_roll")
-            self.gripper = gui.add_slider("gripper (%)", 0, 100, 1, round(initial.gripper_pct),
-                                          hint="LeRobot's 0 = closed, 100 = open")
-            open_btn = gui.add_button("Open gripper", icon=viser.Icon.ARROWS_HORIZONTAL)
-            close_btn = gui.add_button("Close gripper", icon=viser.Icon.ARROWS_JOIN)
-        for slider in (self.pitch, self.roll, self.gripper):
-            slider.on_update(lambda _: self._publish_target("slider"))
-        open_btn.on_click(lambda _: self._set_gripper(GRIPPER_OPEN_PCT))
-        close_btn.on_click(lambda _: self._set_gripper(GRIPPER_CLOSED_PCT))
-
+        # --- joint rings (scene, all modes) --------------------------------------------
         # --- joint rings ------------------------------------------------------------
         self.rings: dict[str, viser.TransformControlsHandle] = {}
         self._ring_base_wxyz: dict[str, np.ndarray] = {}
@@ -186,8 +181,28 @@ class Viewer:
 
         self.status = gui.add_markdown("starting")
         self._status_at = 0.0
-        self._syncing = False   # set while sync_target writes the widgets, so their callbacks stay quiet
-        self._sliders_synced_at = 0.0
+
+    def _build_target_widgets(self, gui: viser.GuiApi, model: Model, initial: Target) -> None:
+        """Sliders and gripper buttons: part of the Drag to move page."""
+        roll_lo, roll_hi = (math.degrees(v) for v in model.limits["wrist_roll"])
+        self.pitch = gui.add_slider("pitch (deg)", -PITCH_SLIDER_DEG, PITCH_SLIDER_DEG, 1.0,
+                                    round(math.degrees(initial.pitch)),
+                                    hint="0 = tool level, pointing forward; positive = pointing down")
+        self.roll = gui.add_slider("roll (deg)", round(roll_lo), round(roll_hi), 1.0,
+                                   round(math.degrees(initial.roll)),
+                                   hint="0 = wrist_roll at zero; positive = positive wrist_roll")
+        self.gripper = gui.add_slider("gripper (%)", 0, 100, 1, round(initial.gripper_pct),
+                                      hint="LeRobot's 0 = closed, 100 = open")
+        open_btn = gui.add_button("Open gripper", icon=viser.Icon.ARROWS_HORIZONTAL)
+        close_btn = gui.add_button("Close gripper", icon=viser.Icon.ARROWS_JOIN)
+        for slider in (self.pitch, self.roll, self.gripper):
+            slider.on_update(lambda _: self._publish_target("slider"))
+        open_btn.on_click(lambda _: self._set_gripper(GRIPPER_OPEN_PCT))
+        close_btn.on_click(lambda _: self._set_gripper(GRIPPER_CLOSED_PCT))
+
+    def _show_page(self, mode: str) -> None:
+        for m, folder in self._mode_folder.items():
+            folder.visible = m == mode
 
     # ---- callbacks (viser thread) -----------------------------------------------------
 
@@ -219,7 +234,7 @@ class Viewer:
     def set_source_status(self, mode: str, ok: bool, text: str) -> None:
         """The control loop reports whether a source is usable (pad plugged in, leader connected)."""
         self._mode_ok[mode] = ok
-        self._mode_status[mode].content = f"**{mode}** — {text}"
+        self._mode_status[mode].content = text
         if not ok and self.mode == mode:      # the source went away under an enabled mode
             self.mode = None
             self.commands.push_button("mode:None")

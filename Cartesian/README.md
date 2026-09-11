@@ -170,10 +170,11 @@ jq -c 'select(.solve) | .solve' Cartesian/logs/latest/ticks.jsonl
 
 ## Three ways to drive it: one page, one enabled at a time
 
-The **Control** panel at the top of the page has one row per source, each with an
-*Enable* button. Nothing is enabled at start: the page shows the arm and that is all.
-Enable one and the other two wait until you disable it again. On the real arm, *Hold
-and follow* is refused until a source is enabled.
+The **Mode** dropdown at the top of the sidebar picks which source the sidebar shows:
+its self-check status and its buttons, nothing else. Each has an *Enable* button.
+Nothing is enabled at start: the page shows the arm and that is all. Enable one and the
+other two show *waiting* until you disable it again. On the real arm, *Hold and follow*
+is refused until a source is enabled.
 
 * **Drag to move** — the ball, the sliders, the rings (above).
 * **Gamepad** — sticks push the target along at up to 0.08 m/s, triggers pitch it, the
