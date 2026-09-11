@@ -370,6 +370,29 @@ class PlacoServo:
     def _unload(self):
         return {name: math.degrees(self.robot.get_joint(name)) for name in self.joint_names}
 
+    def use_recorded_travel(self, travel_deg):
+        """Replace the model's joint limits with the travel this arm recorded for itself.
+
+        ⭐ The URDF's limits describe an SO-101; Lesson 6 measured *this* SO-101. Where the two
+        disagree the arm is right, and it is right by more than a rounding error: this follower
+        rests at shoulder_lift -102.7 while the model stops at -100. That pose is not a fault,
+        it is simply where an unpowered arm falls.
+
+        ⛔ Giving the solver the model's number instead is what made the arm move on its own.
+        A seed outside the solver's limits has to be pulled inside them, and closing that gap is
+        a real command: 2.7 deg on this follower, with nobody asking for anything (measured
+        2026-09-10). Given the arm's own travel there is no gap, and the first tick moves nothing.
+
+        ⚠️ The recorded travel is the physical stop, so the solver may command up to it and no
+        further. It comes from the calibration file, which `calibration_disagrees` has already
+        checked against what the motors themselves hold.
+        """
+        for name, half in travel_deg.items():
+            if name in self.joint_names and name != "gripper":
+                self.robot.set_joint_limits(name, math.radians(-half), math.radians(half))
+                self.limits[name] = (-float(half), float(half))
+        return dict(self.limits)
+
     def inside_the_model(self, degrees):
         """The same pose with every joint pulled into the range the solver can represent."""
         pulled = dict(degrees)
@@ -949,19 +972,16 @@ def handle_after_keys(xyz, action, bounds, step_m):
 
 # ══ The control loop ═════════════════════════════════════════════════════════════════════════
 
-def refusal_to_arm(mode, measured, limits):
-    """Why this mode cannot be enabled from where the arm is standing, or nothing.
-
-    ⛔ Only the solving modes are refused. The leader mode has no solver in its path, and an
-    unpowered SO-101 falls onto its shoulder stop and rests outside the model -- refusing that
-    would refuse the one mode that works from where the arm actually parks.
-    """
-    if mode == LEADER:
-        return ""
-    outside = joints_outside_the_model(measured, limits)
-    if not outside:
-        return ""
-    return ("Not enabled, and nothing was powered:\n\n" + "\n\n".join(outside))
+# ⛔ There used to be a refusal here: the solving modes would not enable from a pose the pinned
+# model cannot represent, because the first solved tick pulled the arm into range with nobody
+# asking. The motion was real -- 2.7 deg on the follower measured 2026-09-10 -- but the cause
+# was handing the solver the URDF's limits instead of the travel this arm recorded for itself
+# in Lesson 6. Given its own travel, the solver can represent the pose the arm parks in, and
+# that first tick moves nothing at all.
+# ⚠️ Refusing it was also unusable in the room: an unpowered arm falls straight back to that
+# pose, so the operator was being asked to hold the arm up with one hand and click Enable with
+# the other. `PlacoServo.inside_the_model` stays as the last guard, because a seed outside the
+# solver's limits makes the QP infeasible and placo raises rather than returns.
 
 
 def control_loop(page, arm, servo, bounds, limits, leader=None, keyboard=None,
@@ -992,20 +1012,16 @@ def control_loop(page, arm, servo, bounds, limits, leader=None, keyboard=None,
             page.move_handle(here)
             wanted = page.take_arm_request()
             if wanted is not None:
-                note = refusal_to_arm(wanted, measured, limits)
-                if note:
-                    print("Not enabled:\n    " + note.replace("\n\n", "\n    "), flush=True)
-                else:
-                    arm.hold(measured)
-                    armed, reference = wanted, servo.fk(measured)
-                    commanded = dict(measured)
-                    # ⚠️ The jaw does not jump when a mode starts: the slider is moved to where
-                    # the gripper already is, not the other way round.
-                    page.set_gripper_target(measured.get("gripper", GRIPPER_MIN_PCT))
-                    watch.reset()
-                    page.armed(armed)
-                    print(f"{MODE_LABELS[armed]} is live. Press End on the page to stop and "
-                          "release.", flush=True)
+                arm.hold(measured)
+                armed, reference = wanted, servo.fk(measured)
+                commanded = dict(measured)
+                # ⚠️ The jaw does not jump when a mode starts: the slider is moved to where
+                # the gripper already is, not the other way round.
+                page.set_gripper_target(measured.get("gripper", GRIPPER_MIN_PCT))
+                watch.reset()
+                page.armed(armed)
+                print(f"{MODE_LABELS[armed]} is live. Press End on the page to stop and "
+                      "release.", flush=True)
             status = ("Nothing is powered. Move the arm by hand if you like, then pick a mode "
                       "and press Enable." if arm.is_live else
                       "No arm attached. Drag the handle to see what the solver does with it.")

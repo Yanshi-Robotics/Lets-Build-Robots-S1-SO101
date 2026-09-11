@@ -357,18 +357,23 @@ def self_check(args, arm, leader, servo, limits, bounds, wants_keyboard, keyboar
 
     degrees = model.joint_degrees(observation)
 
+    # ⭐ The solver is given this arm's own travel in place of the model's, now that the
+    # calibration it comes from has been checked against the motors. Without this the solver
+    # cannot represent the pose the arm parks in, and pulling the seed into range moves the arm
+    # 2.7 deg the moment a mode is enabled, with nobody asking (measured 2026-09-10).
+    travel = model.travel_degrees(arm.robot.calibration)
+    limits = servo.use_recorded_travel(travel)
+    wider = [name for name in model.JOINTS
+             if travel.get(name, 0) > model.model_limits(
+                 model.load_description(Path(args.model_dir) / model.URDF_NAME))[name][1] + 0.05]
+    report("joint limits", "this arm's recorded travel, which the solver now uses"
+           + (f"; wider than the model on {', '.join(wider)}" if wider else ""))
+
     # ⚠️ Reported, never refused. An unpowered SO-101 falls onto its shoulder stop and rests
     # there, so refusing this would refuse the pose the arm is always in when you walk up to it.
     on_a_stop = model.joints_on_a_stop(observation, arm.robot.calibration)
     report("joint travel", "no joint is against a stop" if not on_a_stop
            else f"{len(on_a_stop)} joint(s) resting on a stop; they will be held where they are")
-
-    # ⚠️ Also reported rather than refused here, because the leader mode works from a pose the
-    # model cannot express. The solving modes refuse it at the moment Enable is pressed.
-    past_the_model = model.joints_outside_the_model(degrees, limits)
-    report("model range", "every joint is inside the pinned model" if not past_the_model
-           else f"{len(past_the_model)} joint(s) past the model; the handle and arrow-key modes "
-                "will not enable until they are moved back")
 
     here = servo.gripper_xyz(degrees)
     widened = model.bounds_including(bounds, here)
@@ -471,6 +476,7 @@ def measure_following(args):
                           f"{', '.join(powered)}.\n        Support the arm, then run:\n\n"
                           + release_command(args))
     start = model.joint_degrees(observation)
+    limits = servo.use_recorded_travel(model.travel_degrees(arm.robot.calibration))
     blocked = (model.joints_on_a_stop(observation, arm.robot.calibration)
                + model.joints_outside_the_model(start, limits))
     if blocked:

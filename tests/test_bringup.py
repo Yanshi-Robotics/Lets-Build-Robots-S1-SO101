@@ -114,6 +114,34 @@ class SolverTests(unittest.TestCase):
         self.assertGreater(demo.REF_LINEAR_SPEED_MPS, 0)
         self.assertLess(demo.REF_LINEAR_SPEED_MPS, 0.5, "a teaching arm travels slowly")
 
+    def test_the_pose_the_arm_parks_in_commands_nothing(self):
+        # ⛔ 2026-09-10 on the bench: the handle mode refused to enable because shoulder_lift
+        # read -102.7 while the pinned model stops at -100. That pose is not a fault -- it is
+        # where an unpowered arm falls -- and refusing it asked the operator to hold the arm up
+        # with one hand and click with the other.
+        # ⭐ The cause was the solver being given the model's limits instead of this arm's own
+        # recorded travel. On the model's limits the seed has to be pulled into range, and
+        # closing that gap is a real command: 2.7 deg, with nobody asking. On the arm's travel
+        # there is no gap. This pins the difference.
+        if not args.model_dir:
+            self.skipTest("needs the pinned model")
+        parked = {"shoulder_pan": -5.4, "shoulder_lift": -102.7, "elbow_flex": 95.0,
+                  "wrist_flex": -92.0, "wrist_roll": 8.8, "gripper": 1.8}
+        travel = {"shoulder_pan": 110.0, "shoulder_lift": 104.5, "elbow_flex": 98.4,
+                  "wrist_flex": 104.8, "wrist_roll": 180.0}
+
+        on_the_model, _limits = demo.load_servo(str(args.model_dir))
+        held = on_the_model.servo_step(parked, on_the_model.fk(parked))
+        self.assertGreater(max(abs(held[name] - parked[name]) for name in demo.JOINTS), 2.0,
+                           "the model's limits are what used to move the arm")
+
+        on_the_arm, _limits = demo.load_servo(str(args.model_dir))
+        on_the_arm.use_recorded_travel(travel)
+        self.assertEqual(on_the_arm.inside_the_model(parked), parked, "nothing left to clamp")
+        still = on_the_arm.servo_step(parked, on_the_arm.fk(parked))
+        self.assertLess(max(abs(still[name] - parked[name]) for name in demo.JOINTS), 0.05,
+                        "enabling from the parked pose must command nothing at all")
+
     def test_a_joint_the_model_cannot_express_is_named_with_the_way_back(self):
         # ⛔ Reproduced 2026-09-10 from the 2026-09-08 hardware log: this follower parks at
         # shoulder_lift -103.8 and wrist_flex -100.2, outside the pinned model. placo clamps its

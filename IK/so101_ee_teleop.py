@@ -148,6 +148,10 @@ def run(args):
     if disagreeing:
         raise RuntimeError(f"Calibration disagrees on {', '.join(disagreeing)}.")
     degrees = model.joint_degrees(observation)
+    # ⭐ The solver gets this arm's own recorded travel, not the model's idea of an SO-101's:
+    # the two disagree by a couple of degrees at the shoulder, and the pose the arm parks in
+    # falls in the gap. See PlacoServo.use_recorded_travel.
+    limits = servo.use_recorded_travel(model.travel_degrees(arm.robot.calibration))
     refused = model.joints_outside_the_model(degrees, limits)
     if refused:
         raise RuntimeError("Nothing was powered:\n    " + "\n    ".join(refused))
