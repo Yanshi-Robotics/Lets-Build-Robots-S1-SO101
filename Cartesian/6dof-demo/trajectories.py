@@ -36,9 +36,13 @@ CLIP_SECONDS = 3.0            # one full back-and-forth
 TRAVEL_M = 0.04               # ± for x, y, z
 PITCH_RAD = math.radians(25)  # ±
 ROLL_RAD = math.radians(40)   # ±
-YAW_RAD = math.radians(40)    # ± on the Panda
-PANDA_HOME_DEG = (0, -30, 0, -120, 0, 90, 45)   # elbow bent, hand pointing down over the table
+YAW_RAD = math.radians(60)    # ± on the Panda: wide, so the elbow visibly swings while the hand stays
+PANDA_HOME_DEG = (0, -20, 0, -120, 0, 180, 45)   # elbow bent, hand level and pointing forward, wrist joints well inside their limits
 PANDA_TOOL = "panda_hand"
+PANDA_POSTURE_WEIGHT = 5e-3   # far below the hand task: the base follows the yaw only as far as the hand allows
+PANDA_BASE_FOLLOW = 0.9       # how much of the hand's yaw the base is asked to take on
+PANDA_ITERATIONS = 200        # QP steps per frame; the posture task makes convergence slower
+PANDA_POSITION_TOL_M = 0.002  # the hand may not drift more than this while yawing
 
 SO101_CLIPS = {
     "x": ("xyz", (1, 0, 0)), "y": ("xyz", (0, 1, 0)), "z": ("xyz", (0, 0, 1)),
@@ -88,6 +92,11 @@ def panda_yaw_clip(urdf: Path) -> dict:
     solver.mask_fbase(True)
     task = solver.add_frame_task(PANDA_TOOL, T0)
     task.configure("hand", "soft", 1.0, 1.0)
+    # The Panda has one joint more than a pose needs, so the elbow can swing without the hand
+    # moving. A weak posture task asks the base to follow the yaw: the whole arm visibly turns
+    # while the hand pose task (much heavier) keeps the hand's position exactly where it is.
+    posture = solver.add_joints_task()
+    posture.configure("posture", "soft", PANDA_POSTURE_WEIGHT)
     solver.add_regularization_task(1e-4)
     solver.mask_dof("panda_finger_joint1")
     solver.mask_dof("panda_finger_joint2")
@@ -104,11 +113,12 @@ def panda_yaw_clip(urdf: Path) -> dict:
         T = T0.copy()
         T[:3, :3] = rot_z(YAW_RAD * w) @ T0[:3, :3]      # same position, turned about the vertical axis
         task.T_world_frame = T
-        for _ in range(60):
+        posture.set_joint("panda_joint1", YAW_RAD * w * PANDA_BASE_FOLLOW)
+        for _ in range(PANDA_ITERATIONS):
             solver.solve(True)
             robot.update_kinematics()
         Tn = np.array(robot.get_T_world_frame(PANDA_TOOL))
-        if np.linalg.norm(Tn[:3, 3] - T0[:3, 3]) > 1e-3:
+        if np.linalg.norm(Tn[:3, 3] - T0[:3, 3]) > PANDA_POSITION_TOL_M:
             raise SystemExit("STOP: Panda hand position drifted during the yaw clip")
         rows.append([float(robot.get_joint(j)) for j in joints])
         tool_p.append([float(v) for v in Tn[:3, 3]])
