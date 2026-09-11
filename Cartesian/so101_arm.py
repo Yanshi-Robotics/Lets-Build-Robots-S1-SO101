@@ -24,6 +24,7 @@ from so101_model import ALL_JOINTS, ARM_JOINTS, GRIPPER, GRIPPER_INDEX
 # STS3215 factory position P gain. LeRobot writes 16, which makes the arm so soft that a
 # command leading the measured position by less than about 2.3 degrees does not move it.
 SERVO_P_COEFFICIENT = 32
+TORQUE_WRITE_RETRIES = 3   # an overloaded servo may answer a Torque_Enable write with an error bit once
 
 # Where the simulated arm starts: elbow bent, tool level, gripper a third open.
 MODEL_START_DEG = {"shoulder_pan": 0.0, "shoulder_lift": -30.0, "elbow_flex": 60.0,
@@ -126,8 +127,17 @@ class Arm:
         self.robot.bus.sync_write("Goal_Position", {name: float(goal[name]) for name in ALL_JOINTS})
 
     def release(self) -> None:
-        self.robot.bus.disable_torque()
-        self.torque_on = False
+        """Torque off on every motor, one by one: a servo in overload answers the write with
+        an error bit and LeRobot raises on it, which must not stop the other five."""
+        failed = {}
+        for name in ALL_JOINTS:
+            try:
+                self.robot.bus.disable_torque(name, num_retry=TORQUE_WRITE_RETRIES)
+            except RuntimeError as e:
+                failed[name] = str(e)
+        self.torque_on = bool(failed)
+        if failed:
+            raise RuntimeError(f"torque still on: {failed}")
 
     def close(self, release_torque: bool) -> None:
         """Default keeps torque on so the arm does not fall when the program exits."""

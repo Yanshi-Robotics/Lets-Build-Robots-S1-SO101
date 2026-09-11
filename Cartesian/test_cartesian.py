@@ -306,15 +306,20 @@ class ControlLoopTests(unittest.TestCase):
 
         def release(t, c):
             pad.axes[1] = 0.0
-            pad.press(0, True)
+            pad.press(0, True)          # hold A ...
 
-        loop, viewer, ticks, m = self.run_loop(FakeArm(), 1.6, [(0.2, push), (0.7, release)],
+        def let_go(t, c):
+            pad.press(0, False)         # ... for 0.5 s, then let go: the gripper must stop where it is
+
+        loop, viewer, ticks, m = self.run_loop(FakeArm(), 1.8, [(0.2, push), (0.7, release), (1.2, let_go)],
                                                gamepad=source, pad=pad, mode=MODE_GAMEPAD)
+        from gamepad_control import GRIPPER_SPEED_PCT_S
         start = ticks[0]["target"]["xyz"][0]
         end = ticks[-1]["target"]["xyz"][0]
         self.assertAlmostEqual(end - start, LINEAR_SPEED_MPS * 0.5, delta=0.006)   # 0.5 s at full stick
         self.assertEqual(ticks[-1]["target"]["source"], "gamepad")
-        self.assertEqual(ticks[-1]["target"]["gripper_pct"], 100.0)
+        self.assertAlmostEqual(ticks[-1]["target"]["gripper_pct"], 30.0 + GRIPPER_SPEED_PCT_S * 0.5, delta=4.0)
+        self.assertLess(ticks[-1]["target"]["gripper_pct"], 100.0)                  # did not run to the end
         self.assertGreater(len([t for t in ticks if "solve" in t]), 5)              # solved as the stick moved it
         self.assertLess(ticks[-1]["err_mm"]["cmd"], 1.0)
 
@@ -474,7 +479,17 @@ class GamepadWizardTests(unittest.TestCase):
             self.press(idx)
         self.assertTrue(w.done)
         w._mirror_pad()          # the loop keeps drawing after completion; must not index past the last step
-        w._demo_arm(0.3)
+        # practice: the pad now drives the simulated arm, with commentary on the control in use
+        self.assertIsNotNone(w.practice)
+        x0 = w.practice_target.xyz[0]
+        self.pad.axes[1] = -1.0                      # left stick forward
+        for i in range(25):
+            w._practice_tick(0.02, 100.0 + i * 0.02)
+        self.assertGreater(w.practice_target.xyz[0], x0 + 0.03)
+        self.assertIn("Left stick", w.message)
+        self.pad.axes[1] = 0.0
+        w._practice_tick(0.02, 200.0)                # quiet for a long time: back to the idle text
+        self.assertNotIn("Left stick", w.message)
         written = json.loads((Path(self.tmp) / "map.json").read_text())["pads"]["fake"]
         self.assertEqual(written["buttons"], {"gripper_open": 0, "gripper_close": 1, "hold": 7, "stop": 6})
         self.assertEqual(set(written["axes"]), {"move_x", "move_y", "move_z", "roll", "pitch_down", "pitch_up"})

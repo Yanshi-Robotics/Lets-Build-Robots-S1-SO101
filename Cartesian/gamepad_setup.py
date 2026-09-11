@@ -1,4 +1,4 @@
-"""Pair a gamepad with the SO-101: one control at a time, watched in 3D.
+"""Pair a gamepad with the SO-101, then practise on the simulated arm.
 
     python Cartesian/gamepad_setup.py --model-dir models/so101
 
@@ -7,6 +7,10 @@ control being asked for glows; the arm shows what it will do. Move or press it o
 real pad and the wizard records which axis or button that was, then moves on. When all
 steps are done the mapping is written to `Cartesian/gamepad_map.json`, which is what
 unlocks gamepad control of the arm.
+
+Then comes practice: the simulated arm follows the pad exactly as the real one would in
+cartesian_control.py, the control you are using glows on the drawn pad, and the panel
+explains what it does. A pad that is already paired goes straight to practice.
 
 No gamepad plugged in? The page says so and keeps looking.
 """
@@ -29,11 +33,12 @@ from viser.extras import ViserUrdf
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gamepad import Gamepad, discover  # noqa: E402
-from gamepad_control import write_map  # noqa: E402
+from gamepad_control import GamepadSource, integrate, load_map, write_map  # noqa: E402
 from gamepad_view import PadView, pad_wxyz  # noqa: E402
 from runlog import RunLog  # noqa: E402
 from so101_arm import MODEL_START_DEG, q_from_deg  # noqa: E402
 from so101_model import ARM_JOINTS, GRIPPER_INDEX, Model  # noqa: E402
+from cartesian_control import DEFAULT_BOUNDS_MAX_M, DEFAULT_BOUNDS_MIN_M  # noqa: E402
 from solver import Solver  # noqa: E402
 from target import Target  # noqa: E402
 from viewer import LOOPBACK, WEB_PORT, MEASURED_COLOR, ensure_port_free  # noqa: E402
@@ -57,6 +62,25 @@ PAD_TILT_DEG = 55                     # and lean its face up toward the camera
 CAMERA_POSITION_M = (0.52, -0.62, 0.36)
 CAMERA_LOOK_AT_M = (0.12, -0.12, 0.10)
 POLL_DEVICE_S = 1.0        # how often to look for a pad when there is none
+PRACTICE_HOLD_S = 1.5      # keep explaining the last control this long after it goes quiet
+
+# Practice narration: what each control does, shown while it is the one being used.
+EXPLAIN = {
+    "left_stick": "**Left stick** — moves the tool in the horizontal plane: forward/back is x, left/right is y. "
+                  "Push further to move faster; let go and the arm stops where it is.",
+    "right_stick": "**Right stick** — forward/back moves the tool up and down (z); left/right rolls the wrist "
+                   "about the tool axis. The tool point stays put while rolling: the other joints compensate.",
+    "lt": "**LT** — pitches the tool down (nose toward the table). The pull depth sets the speed.",
+    "rt": "**RT** — pitches the tool up. Pitch is the only orientation the arm can choose freely "
+          "besides roll; yaw always follows the base.",
+    "a": "**A** — opens the gripper while held. Let go and it stops.",
+    "b": "**B** — closes the gripper while held. Let go and it stops; on the real arm keep it short "
+         "on an object, the servo turns position error into force.",
+    "start": "**Start** — on the real arm: torque on, start following. Nothing to do in this simulation.",
+    "back": "**Back** — on the real arm: stop following, keep torque. Nothing to do in this simulation.",
+}
+IDLE_TEXT = ("Move a stick or press a button. The arm here is a simulation, nothing is connected; "
+             "in cartesian_control.py the real arm follows exactly like this.")
 
 
 @dataclass(frozen=True)
@@ -105,6 +129,9 @@ class Wizard:
         self.message = ""
         self.step_started = time.monotonic()
         self._last_poll = 0.0
+        self.practice: GamepadSource | None = None      # set once paired: the practice stage
+        self.practice_target: Target | None = None
+        self._explaining: tuple[str, float] = ("", 0.0)  # (part, when it was last active)
 
         scene, gui = server.scene, server.gui
         scene.set_up_direction("+z")
@@ -158,7 +185,13 @@ class Wizard:
         self.mapping["device"] = name
         self.device_text.content = f"**{name}** at `{path}` — {len(axes)} axes, {len(buttons)} buttons"
         self.log.event("gamepad found", path=str(path), name=name, axes=len(axes), buttons=len(buttons))
-        self._begin_step()
+        known = load_map(self.map_path, name)
+        if known is not None:
+            self.mapping.update(known)
+            self.log.event("already paired, practice", device=name)
+            self._finish(write=False)
+        else:
+            self._begin_step()
         return True
 
     # ---- steps ------------------------------------------------------------------------
@@ -170,6 +203,7 @@ class Wizard:
         self._restart_requested = False
         self.mapping = {"device": self.mapping["device"], "axes": {}, "buttons": {}}
         self.index, self.done = 0, False
+        self.practice, self.practice_target = None, None
         self.log.event("pairing restarted")
         self._begin_step()
 
@@ -191,16 +225,21 @@ class Wizard:
                                   f"## {s.ask}\n\n**It will:** {s.does}")
         self.arm_label.text = s.does
 
-    def _finish(self) -> None:
+    def _finish(self, write: bool = True) -> None:
         self.done = True
         self.view.highlight(None)
-        write_map(self.map_path, self.mapping["device"], self.mapping)
-        self.log.event("pairing complete", path=str(self.map_path), mapping=self.mapping)
-        self.step_text.content = ("## Pairing complete\n\n"
-                                  f"Mapping for **{self.mapping['device']}** written to `{self.map_path.name}`. "
-                                  "cartesian_control.py can now enable Gamepad with this pad. "
-                                  "Move the sticks: the drawn pad follows.")
+        if write:
+            write_map(self.map_path, self.mapping["device"], self.mapping)
+            self.log.event("pairing complete", path=str(self.map_path), mapping=self.mapping)
+        assert self.pad is not None
+        self.practice = GamepadSource(self.pad, self.mapping)
+        self.practice_target = self.base_target
+        self.step_text.content = ("## Paired — now practise\n\n"
+                                  f"**{self.mapping['device']}** is paired (`{self.map_path.name}`); "
+                                  "cartesian_control.py can enable Gamepad with it. "
+                                  "Drive the simulated arm below to get the feel; *Restart pairing* to pair again.")
         self.arm_label.text = ""
+        self.message = IDLE_TEXT
 
     def _advance(self) -> None:
         self.index += 1
@@ -321,8 +360,46 @@ class Wizard:
                 target = Target(target.xyz, target.pitch, target.roll, pct)
         sol = self.solver.solve(self.q_demo, target)
         self.q_demo = sol.q_goal
-        by_name = {name: float(self.q_demo[i]) for i, name in enumerate(ARM_JOINTS)}
-        by_name["gripper"] = self.model.gripper_angle(float(self.q_demo[GRIPPER_INDEX]))
+        self._draw_arm(self.q_demo)
+
+    def _practice_tick(self, dt: float, now: float) -> None:
+        """Paired: the pad drives the simulated arm the way it will drive the real one, with commentary."""
+        assert self.practice is not None and self.practice_target is not None
+        state = self.practice.read()
+        self.practice_target = integrate(self.practice_target, state, dt, DEFAULT_BOUNDS_MIN_M, DEFAULT_BOUNDS_MAX_M,
+                                         self.model.limits["wrist_roll"])
+        sol = self.solver.solve(self.q_demo, self.practice_target)
+        self.q_demo = sol.q_goal
+        self._draw_arm(self.q_demo)
+
+        # which control is doing the most right now?
+        _, buttons = self.pad.snapshot()
+        candidates = {
+            "left_stick": math.hypot(state.vx, state.vy),
+            "right_stick": math.hypot(state.vz, state.roll_rate),
+            "lt": max(0.0, state.pitch_rate), "rt": max(0.0, -state.pitch_rate),
+            "a": max(0.0, state.gripper_rate), "b": max(0.0, -state.gripper_rate),
+            "start": 1.0 if "hold" in state.pressed else 0.0, "back": 1.0 if "stop" in state.pressed else 0.0,
+        }
+        part, strength = max(candidates.items(), key=lambda kv: kv[1])
+        if strength > 0:
+            self._explaining = (part, now)
+        part, when = self._explaining
+        if part and now - when <= PRACTICE_HOLD_S:
+            self.view.highlight(part, 1.0)
+            t = self.practice_target
+            self.message = (EXPLAIN[part] + "\n\n"
+                            f"tool target: x {t.xyz[0]:.3f} m · y {t.xyz[1]:.3f} m · z {t.xyz[2]:.3f} m · "
+                            f"pitch {math.degrees(t.pitch):.0f}° · roll {math.degrees(t.roll):.0f}° · "
+                            f"gripper {t.gripper_pct:.0f}%"
+                            + ("" if sol.error.reachable() else " · **out of reach — the arm stops at the edge**"))
+        else:
+            self.view.highlight(None)
+            self.message = IDLE_TEXT
+
+    def _draw_arm(self, q: np.ndarray) -> None:
+        by_name = {name: float(q[i]) for i, name in enumerate(ARM_JOINTS)}
+        by_name["gripper"] = self.model.gripper_angle(float(q[GRIPPER_INDEX]))
         self.arm.update_cfg(np.array([by_name[n] for n in self._urdf_joints]))
 
     def _draw_progress(self) -> None:
@@ -338,6 +415,9 @@ class Wizard:
             else:
                 got = ""
             rows.append(f"| {s.key} | {s.does} | {got} |")
+        if self.practice is not None:
+            self.progress.content = self.message
+            return
         self.progress.content = ((self.message + "\n\n") if self.message else "") + \
             "| step | does | mapped to |\n|---|---|---|\n" + "\n".join(rows)
 
@@ -359,7 +439,10 @@ class Wizard:
                 if self.step.hint_tilt and self.phase == "wait":
                     self.view.set_stick(self.step.part, *(np.array(self.step.hint_tilt) * pulse))
             self._mirror_pad()
-            self._demo_arm(t0 - self.step_started)
+            if self.practice is not None and self.pad is not None and self.pad.connected:
+                self._practice_tick(dt, t0)
+            else:
+                self._demo_arm(t0 - self.step_started)
             if t0 - last_progress > 0.2:
                 last_progress = t0
                 self._draw_progress()

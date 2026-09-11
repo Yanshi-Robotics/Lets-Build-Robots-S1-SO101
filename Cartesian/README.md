@@ -109,7 +109,7 @@ boxes and nothing else.
   plane. Green = reachable, red = the solver could not get within 5 mm. Small axes on
   the ball show the target tool orientation.
 * **Rings**: one per arm joint, on the joint axis. Drag to turn that joint; the ball follows.
-* **Sliders**: pitch, roll (degrees), gripper (percent), plus *Open gripper* / *Close gripper* buttons.
+* **Sliders**: pitch, roll (degrees), gripper (percent), plus *Open/Close gripper (hold)* buttons that move the gripper only while held.
 * **Buttons** (live only): *Hold and follow* parks the goal at the present position, turns
   torque on and starts following the ball. *Stop* stops sending; torque stays on, the
   arm holds. *Release torque* switches torque off.
@@ -217,6 +217,18 @@ it will do, you move or press it on the real pad, the wizard records which axis 
 that was and moves on. Ten steps: left stick forward / right, right stick forward / right,
 LT, RT, A, B, Start, Back. The result is `Cartesian/gamepad_map.json` (per pad, not in
 git). A control you already used is refused; *Restart pairing* starts over.
+
+After the last step the page turns into a practice range: the simulated arm follows the
+pad exactly as the real arm will in `cartesian_control.py`, the control you are using
+glows on the drawn pad, and the panel explains what it does and where the tool target
+is. A pad that is already paired skips straight to practice (*Restart pairing* to pair
+it again).
+
+Buttons that move something act **only while held**: A/B on the pad and the page's
+*Open/Close gripper (hold)* buttons move the gripper at 60 %/s and stop the moment you
+let go. Nothing on the pad or the page commands "fully closed" in one press: a gripper
+told to close on an object keeps pushing, and on the real arm the command may lead the
+measured gripper by at most 10 % for that reason.
 
 The pad is read through the Linux joystick interface (`/dev/input/js*`, `gamepad.py`),
 no extra packages. Unplugging mid-way is detected; plugging in later is picked up.

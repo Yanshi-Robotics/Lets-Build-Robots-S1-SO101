@@ -21,6 +21,7 @@ from target import Target
 DEADZONE = 0.12               # sticks never rest at exactly zero
 LINEAR_SPEED_MPS = 0.08       # tool speed at full stick
 ANGULAR_SPEED_RAD_S = 1.2     # pitch / roll rate at full trigger / stick
+GRIPPER_SPEED_PCT_S = 60.0    # A / B move the gripper only while held: full travel in under two seconds
 PITCH_LIMIT_RAD = np.radians(120)   # keep the sliders' range; the arm cannot do more anyway
 
 
@@ -56,11 +57,12 @@ class GamepadState:
     vz: float = 0.0            # up, -1..1
     roll_rate: float = 0.0     # -1..1
     pitch_rate: float = 0.0    # +1 = pitching down at full trigger
-    pressed: tuple[str, ...] = field(default_factory=tuple)   # button keys that went down this tick
+    gripper_rate: float = 0.0  # +1 while A (open) is held, -1 while B (close) is held, 0 when neither
+    pressed: tuple[str, ...] = field(default_factory=tuple)   # hold / stop: edges, they change state once
 
     @property
     def moving(self) -> bool:
-        return any(abs(v) > 0 for v in (self.vx, self.vy, self.vz, self.roll_rate, self.pitch_rate))
+        return any(abs(v) > 0 for v in (self.vx, self.vy, self.vz, self.roll_rate, self.pitch_rate, self.gripper_rate))
 
 
 class GamepadSource:
@@ -86,18 +88,19 @@ class GamepadSource:
 
     def read(self) -> GamepadState:
         axes, buttons = self.pad.snapshot()
+        held = {key: idx < len(buttons) and buttons[idx] for key, idx in self.buttons.items()}
         pressed = []
-        for key, idx in self.buttons.items():
-            down = idx < len(buttons) and buttons[idx]
-            if down and not self._was_down[key]:
+        for key in ("hold", "stop"):
+            if held.get(key) and not self._was_down[key]:
                 pressed.append(key)
-            self._was_down[key] = down
+        self._was_down.update(held)
         return GamepadState(
             vx=self._axis(axes, "move_x"),
             vy=self._axis(axes, "move_y"),
             vz=self._axis(axes, "move_z"),
             roll_rate=self._axis(axes, "roll"),
             pitch_rate=self._axis(axes, "pitch_down") - self._axis(axes, "pitch_up"),
+            gripper_rate=float(bool(held.get("gripper_open"))) - float(bool(held.get("gripper_close"))),
             pressed=tuple(pressed),
         )
 
@@ -108,9 +111,5 @@ def integrate(target: Target, state: GamepadState, dt: float, bounds_min, bounds
     xyz = np.clip(xyz, bounds_min, bounds_max)
     pitch = float(np.clip(target.pitch + ANGULAR_SPEED_RAD_S * dt * state.pitch_rate, -PITCH_LIMIT_RAD, PITCH_LIMIT_RAD))
     roll = float(np.clip(target.roll + ANGULAR_SPEED_RAD_S * dt * state.roll_rate, roll_limits[0], roll_limits[1]))
-    gripper = target.gripper_pct
-    if "gripper_open" in state.pressed:
-        gripper = 100.0
-    if "gripper_close" in state.pressed:
-        gripper = 0.0
+    gripper = float(np.clip(target.gripper_pct + GRIPPER_SPEED_PCT_S * dt * state.gripper_rate, 0.0, 100.0))
     return Target(xyz=tuple(float(v) for v in xyz), pitch=pitch, roll=roll, gripper_pct=gripper)

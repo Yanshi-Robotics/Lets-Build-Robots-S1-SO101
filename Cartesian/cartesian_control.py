@@ -48,7 +48,8 @@ CONTROL_HZ_MODEL = 50      # no bus; just smooth animation
 MAX_JOINT_SPEED_RAD_S = 2.0   # keeps up with a dragged ball without whipping; STS3215 no-load is ~6 rad/s
 MAX_GRIPPER_SPEED_PCT_S = 150.0
 MAX_LEAD_DEG = 15.0        # position error is torque on an STS3215: never push harder than this
-MAX_GRIPPER_LEAD_PCT = 100.0  # the gripper is allowed to squeeze; its torque is capped in configure()
+MAX_GRIPPER_LEAD_PCT = 10.0   # a closed-on-an-object gripper may push, but only this far ahead of where it is:
+                              # 2026-09-11 a full-close command drove servo 6 into "Overload error"
 # Workspace the ball may be dragged in, metres in the base frame. Reach is ~0.40 m; nothing below the table.
 DEFAULT_BOUNDS_MIN_M = (0.0, -0.25, 0.0)
 DEFAULT_BOUNDS_MAX_M = (0.40, 0.25, 0.45)
@@ -207,16 +208,19 @@ class ControlLoop:
                 if button == HOLD and self.viewer.mode is None:
                     log.warning("hold refused: no control mode enabled")
                     continue
-                if button == HOLD:
-                    arm.hold()
-                    q_cmd, q_goal = q_meas.copy(), q_meas.copy()
-                    last_version, _ = self._sync_from(q_meas, "arm")
-                    following = True
-                elif button == STOP:
-                    following = False
-                elif button == RELEASE:
-                    arm.release()
-                    following = False
+                try:
+                    if button == HOLD:
+                        arm.hold()
+                        q_cmd, q_goal = q_meas.copy(), q_meas.copy()
+                        last_version, _ = self._sync_from(q_meas, "arm")
+                        following = True
+                    elif button == STOP:
+                        following = False
+                    elif button == RELEASE:
+                        following = False
+                        arm.release()
+                except RuntimeError as e:   # a servo answering with an error bit; the loop must live on
+                    log.warning("arm command failed", button=button, error=str(e))
                 record["button"] = button
 
             mode = self.viewer.mode

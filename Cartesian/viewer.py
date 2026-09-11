@@ -47,8 +47,8 @@ SLIDER_SYNC_HZ = 10      # how often gamepad / leader modes push the target back
 CAMERA_POSITION_M = (0.45, -0.55, 0.35)   # where a new browser tab starts looking from
 CAMERA_LOOK_AT_M = (0.2, 0.0, 0.15)       # roughly the middle of the arm's workspace
 PITCH_SLIDER_DEG = 180   # +/- range. The three pitch joints can sum well past 90.
-GRIPPER_OPEN_PCT = 100.0   # LeRobot's gripper scale: 100 = fully open
-GRIPPER_CLOSED_PCT = 0.0
+GRIPPER_HOLD_HZ = 10       # the open/close buttons act only while held, this often ...
+GRIPPER_STEP_PCT = 5.0     # ... and move the gripper this much per call: full travel in two seconds
 
 
 def ensure_port_free(host: str, port: int) -> None:
@@ -193,12 +193,14 @@ class Viewer:
                                    hint="0 = wrist_roll at zero; positive = positive wrist_roll")
         self.gripper = gui.add_slider("gripper (%)", 0, 100, 1, round(initial.gripper_pct),
                                       hint="LeRobot's 0 = closed, 100 = open")
-        open_btn = gui.add_button("Open gripper", icon=viser.Icon.ARROWS_HORIZONTAL)
-        close_btn = gui.add_button("Close gripper", icon=viser.Icon.ARROWS_JOIN)
+        open_btn = gui.add_button("Open gripper (hold)", icon=viser.Icon.ARROWS_HORIZONTAL,
+                                  hint="moves only while held; let go to stop")
+        close_btn = gui.add_button("Close gripper (hold)", icon=viser.Icon.ARROWS_JOIN,
+                                   hint="moves only while held; let go to stop")
         for slider in (self.pitch, self.roll, self.gripper):
             slider.on_update(lambda _: self._publish_target("slider"))
-        open_btn.on_click(lambda _: self._set_gripper(GRIPPER_OPEN_PCT))
-        close_btn.on_click(lambda _: self._set_gripper(GRIPPER_CLOSED_PCT))
+        open_btn.on_hold(lambda _: self._nudge_gripper(+GRIPPER_STEP_PCT), callback_hz=GRIPPER_HOLD_HZ)
+        close_btn.on_hold(lambda _: self._nudge_gripper(-GRIPPER_STEP_PCT), callback_hz=GRIPPER_HOLD_HZ)
 
     def _show_page(self, mode: str) -> None:
         for m, folder in self._mode_folder.items():
@@ -255,8 +257,9 @@ class Viewer:
         self.ball.position = np.clip(wanted, self._bounds_min, self._bounds_max)
         self._publish_target("ball")
 
-    def _set_gripper(self, pct: float) -> None:
-        self.gripper.value = round(pct)
+    def _nudge_gripper(self, step_pct: float) -> None:
+        """One tick of a held open/close button. Nothing happens once the button is released."""
+        self.gripper.value = int(min(100, max(0, self.gripper.value + step_pct)))
         self._publish_target("button")
 
     def _publish_target(self, source: str) -> None:
