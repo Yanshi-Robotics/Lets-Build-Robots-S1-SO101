@@ -21,11 +21,10 @@ Season 1 starts with printing and assembling two SO-101 arms and ends with a tra
 
 - **`Bringup/`**: `so101_bus_check.py` reads all six motors on one bus; `so101_calibrate.py` records each joint's mid position and range. Used in Lesson 6.
 - **`Cameras/`**: `so101_camera_check.py` lists the cameras that deliver frames, names the stable path for each, and serves them live on a local page where a view is matched to a mount, turned the right way up and saved to `cameras.json`; `check` measures first what the two configured cameras deliver alone and together. `so101_policy_view.py` then shows the same live frames as ACT, π₀, π₀.₅ and SmolVLA each reshape them. Used in Lesson 9.
-- **`IK/`**: `so101_cartesian_demo.py` holds the pinned model, this course's placo servo, the arm, and the one control loop the other two share; on its own it downloads the model and walks one Cartesian move on the model alone. `so101_visual_control.py` self-checks, then opens a browser page showing the arm with nothing powered, and powers it only when a mode is enabled: drag the handle and the arm follows it live, the arrow keys move that same handle, or a leader arm drives it joint for joint with no solver in the path. `--model-only` opens the same page with no arm attached. `so101_ee_teleop.py` is the arrow keys with no page, as the smallest thing that runs. Used in Lesson 8. All three stay in the same folder: the two control programs import everything from the first.
+- **`Cartesian/`**: Cartesian control of the arm, one page at <http://127.0.0.1:4602>. `cartesian_control.py` shows the arm and lets one source at a time move it: drag a ball (and turn a ring on each joint), a paired gamepad, or a leader arm; `--model-only` runs the same page with a simulated arm. `gamepad_setup.py` pairs a gamepad and then lets you practise on the simulated arm. `fetch_model.py` downloads the arm model. The other files are the stages of the control loop (sense, target, compare, solve, plan, execute) and are explained in `Cartesian/README.md`. Used in Lesson 8. Run them from the repository root; they import each other by folder.
 - **`Teleop/`**: `so101_teleop_log.py` dumps both arms' protection and calibration registers, checks the two arms against each other, and grades a recording made by `lerobot-record`. Teleoperation itself stays with the official `lerobot-teleoperate`. Used in Lesson 7.
-- **`tests/`**: 102 tests that run the programs against fake hardware.
+- **`tests/`**: 50 tests that run the Bringup, Teleop and Cameras programs against fake hardware; `Cartesian/test_cartesian.py` holds the 31 for the Cartesian programs.
 - **`Teleop/logs/`** (git-ignored): one debug log per diagnostics run, the last 20 kept, plus anything `lerobot-record` writes there. Send the newest one when something goes wrong.
-- **`tools/`**: `build_control_poses.py` computes the poses drawn in the lesson illustrations.
 
 The lessons print these paths, so files here are not moved or renamed. Later tasks get their own folders, such as `ACT-1-Pick`.
 
@@ -53,10 +52,10 @@ The lessons write the activation step as `<ACTIVATE_ENV>` so either environment 
 Download the arm model once. It comes from TheRobotStudio's pinned revision:
 
 ```bash
-python IK/so101_cartesian_demo.py prepare --model-dir models/so101
+python Cartesian/fetch_model.py --model-dir models/so101
 ```
 
-The command prints `Model ready: models/so101/so101_new_calib.urdf`. If it prints `STOP`, fix the reported problem and run it again.
+The command ends with `models/so101: 15 files present`. If it prints `download failed`, check the network and run it again; files already downloaded are kept.
 
 ---
 
@@ -66,21 +65,21 @@ Run everything from the repository root. The lessons use relative paths such as 
 
 ```bash
 source .venv/bin/activate
-python IK/so101_cartesian_demo.py preview --model-dir models/so101 --delta-mm 0 0 2
+python Cartesian/cartesian_control.py --model-dir models/so101 --model-only
 ```
 
-This computes the joint angles that move the gripper 2 mm up and prints them as JSON; `position_error_mm` should be below 0.1. It touches no hardware. The programs in `Bringup/`, and the two teleoperation programs in `IK/`, do open a serial port; Lessons 6, 7 and 8 cover the power and safety steps for those, and this file does not repeat them.
+This opens the control page with a simulated arm; drag the green ball and the arm follows. It touches no hardware. The programs in `Bringup/`, `Teleop/` and, with `--port`, `Cartesian/` do open a serial port; Lessons 6, 7 and 8 cover the power and safety steps for those, and this file does not repeat them.
 
 Before committing a change to a program, run the tests:
 
 ```bash
-python tests/test_bringup.py                            # fake hardware only, ends with OK (skipped=18)
-python tests/test_bringup.py --model-dir models/so101   # adds the numerical IK checks, ends with OK
+python tests/test_bringup.py                                 # Bringup, Teleop, Cameras; fake hardware only, ends with OK
+python Cartesian/test_cartesian.py --model-dir models/so101  # the Cartesian programs against the real model, ends with OK
 ```
 
 Neither command opens a serial port.
 
-Three folders are ignored by git. `.venv/` is large and specific to one machine. `calibration/` holds the mid positions and ranges of one particular arm and is wrong for any other. `models/` is downloaded by the `prepare` command above.
+Three folders are ignored by git. `.venv/` is large and specific to one machine. `calibration/` holds the mid positions and ranges of one particular arm and is wrong for any other. `models/` is downloaded by the `fetch_model.py` command above.
 
 ---
 

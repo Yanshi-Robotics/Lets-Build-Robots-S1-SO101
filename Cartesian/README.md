@@ -15,9 +15,15 @@ simulated arm or the real one.
 
 Then open <http://127.0.0.1:4602>. The page only listens on localhost.
 
-`models/so101/` must hold `so101_new_calib.urdf` and its `assets/` from
-[TheRobotStudio/SO-ARM100](https://github.com/TheRobotStudio/SO-ARM100). The Python
-environment is the course `.venv` (placo 0.9.15, viser 1.1.0, lerobot 0.6.1).
+`models/so101/` holds `so101_new_calib.urdf` and its meshes from
+[TheRobotStudio/SO-ARM100](https://github.com/TheRobotStudio/SO-ARM100), downloaded once at a
+pinned commit by
+
+```sh
+.venv/bin/python Cartesian/fetch_model.py --model-dir models/so101
+```
+
+The Python environment is the course `.venv` (placo 0.9.15, viser 1.1.0, lerobot 0.6.1).
 
 ## How it works
 
@@ -87,6 +93,7 @@ built-in 2.8 degree tilt which is included in that zero).
 | `planner.py` | 5 | speed limit and lead clamp, pure functions |
 | `so101_arm.py` | 1, 6 | `Arm` (LeRobot `SO101Follower`), `FakeArm`, degree/radian conversion |
 | `so101_leader.py` | 2 | `Leader` (LeRobot `SO101Leader`), joint goals from a hand-moved arm |
+| `fetch_model.py` | — | downloads the URDF, meshes and licence at a pinned commit |
 | `gamepad.py` | 2 | Linux joystick reader (`/dev/input/js*`) |
 | `gamepad_control.py` | 2 | paired axes/buttons -> velocities -> a moving `Target` |
 | `gamepad_view.py`, `gamepad_setup.py` | — | 3D pad drawn from primitives; the pairing wizard |
