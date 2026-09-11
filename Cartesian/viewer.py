@@ -46,6 +46,8 @@ STATUS_HZ = 5            # status text is for eyes, not for control; 5 Hz is eno
 CAMERA_POSITION_M = (0.45, -0.55, 0.35)   # where a new browser tab starts looking from
 CAMERA_LOOK_AT_M = (0.2, 0.0, 0.15)       # roughly the middle of the arm's workspace
 PITCH_SLIDER_DEG = 180   # +/- range. The three pitch joints can sum well past 90.
+GRIPPER_OPEN_PCT = 100.0   # LeRobot's gripper scale: 100 = fully open
+GRIPPER_CLOSED_PCT = 0.0
 
 
 def _wxyz(R: np.ndarray) -> np.ndarray:
@@ -85,6 +87,8 @@ class Viewer:
 
         # --- the ball ---------------------------------------------------------------
         limits = tuple((float(lo), float(hi)) for lo, hi in zip(bounds_min, bounds_max))
+        self._bounds_min = np.asarray(bounds_min, dtype=float)
+        self._bounds_max = np.asarray(bounds_max, dtype=float)
         self.ball = scene.add_transform_controls("/target", scale=BALL_GIZMO_SCALE, disable_rotations=True,
                                                  translation_limits=limits, position=initial.xyz)
         self.ball_ok = scene.add_icosphere("/target/ball", radius=BALL_RADIUS_M, color=BALL_OK_COLOR)
@@ -96,6 +100,11 @@ class Viewer:
         self.ball.on_drag_start(lambda _: self._set_ball_dragging(True))
         self.ball.on_drag_end(lambda _: self._set_ball_dragging(False))
         self.ball.on_update(lambda _: self._publish_target("ball"))
+        # Grabbing the sphere itself moves it freely in the plane facing the camera (what
+        # MoveIt's marker does); the gizmo arrows stay for axis-locked moves.
+        self._grab_offset = np.zeros(3)
+        for sphere in (self.ball_ok, self.ball_bad):
+            sphere.on_drag(self._ball_free_drag)
 
         # --- sliders ----------------------------------------------------------------
         roll_lo, roll_hi = (math.degrees(v) for v in model.limits["wrist_roll"])
@@ -108,8 +117,12 @@ class Viewer:
                                        hint="0 = wrist_roll at zero; positive = positive wrist_roll")
             self.gripper = gui.add_slider("gripper (%)", 0, 100, 1, round(initial.gripper_pct),
                                           hint="LeRobot's 0 = closed, 100 = open")
+            open_btn = gui.add_button("Open gripper", icon=viser.Icon.ARROWS_HORIZONTAL)
+            close_btn = gui.add_button("Close gripper", icon=viser.Icon.ARROWS_JOIN)
         for slider in (self.pitch, self.roll, self.gripper):
             slider.on_update(lambda _: self._publish_target("slider"))
+        open_btn.on_click(lambda _: self._set_gripper(GRIPPER_OPEN_PCT))
+        close_btn.on_click(lambda _: self._set_gripper(GRIPPER_CLOSED_PCT))
 
         # --- joint rings ------------------------------------------------------------
         self.rings: dict[str, viser.TransformControlsHandle] = {}
@@ -148,6 +161,23 @@ class Viewer:
 
     def _set_ball_dragging(self, on: bool) -> None:
         self._ball_dragging = on
+
+    async def _ball_free_drag(self, event) -> None:
+        # async so viser delivers start / update / end in order (see viser's on_drag docs)
+        if event.phase == "start":
+            self._ball_dragging = True
+            self._grab_offset = np.asarray(self.ball.position) - np.asarray(event.start_position)
+            return
+        if event.phase == "end":
+            self._ball_dragging = False
+            return
+        wanted = np.asarray(event.end_position) + self._grab_offset
+        self.ball.position = np.clip(wanted, self._bounds_min, self._bounds_max)
+        self._publish_target("ball")
+
+    def _set_gripper(self, pct: float) -> None:
+        self.gripper.value = round(pct)
+        self._publish_target("button")
 
     def _publish_target(self, source: str) -> None:
         if self._syncing:

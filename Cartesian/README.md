@@ -100,10 +100,12 @@ boxes and nothing else.
 * **Solid arm**: measured position (model mode: the command).
 * **Orange ghost** (live mode): the command being sent this tick. The gap between ghost
   and solid arm is the lead, i.e. the force being applied.
-* **Ball with arrows**: target position. Green = reachable, red = the solver could not get
-  within 5 mm. Small axes on the ball show the target tool orientation.
+* **Ball with arrows**: target position. Grab the ball itself to move it freely in the
+  plane facing the camera; grab an arrow or a square to move along one axis or in one
+  plane. Green = reachable, red = the solver could not get within 5 mm. Small axes on
+  the ball show the target tool orientation.
 * **Rings**: one per arm joint, on the joint axis. Drag to turn that joint; the ball follows.
-* **Sliders**: pitch, roll (degrees), gripper (percent).
+* **Sliders**: pitch, roll (degrees), gripper (percent), plus *Open gripper* / *Close gripper* buttons.
 * **Buttons** (live only): *Hold and follow* parks the goal at the present position, turns
   torque on and starts following the ball. *Stop* stops sending; torque stays on, the
   arm holds. *Release torque* switches torque off.
