@@ -397,6 +397,8 @@ class GamepadWizardTests(unittest.TestCase):
         for idx in (0, 1, 7, 6):  # A B Start Back
             self.press(idx)
         self.assertTrue(w.done)
+        w._mirror_pad()          # the loop keeps drawing after completion; must not index past the last step
+        w._demo_arm(0.3)
         written = json.loads((Path(self.tmp) / "map.json").read_text())
         self.assertEqual(written["buttons"], {"gripper_open": 0, "gripper_close": 1, "hold": 7, "stop": 6})
         self.assertEqual(set(written["axes"]), {"move_x", "move_y", "move_z", "roll", "pitch_down", "pitch_up"})

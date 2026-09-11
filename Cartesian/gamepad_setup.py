@@ -295,9 +295,10 @@ class Wizard:
                 return (v - e["rest"]) / 2.0
             return (v - e["rest"]) * e["sign"]
 
-        if not (self.step.part == "left_stick" and not self.done and self.phase == "wait"):
-            self.view.set_stick("left_stick", -value("move_y"), value("move_x"))
-        if not (self.step.part == "right_stick" and not self.done and self.phase == "wait"):
+        hinting = None if self.done or self.phase != "wait" else self.step.part   # the hint owns that knob
+        if hinting != "left_stick":
+            self.view.set_stick("left_stick", value("move_y"), value("move_x"))
+        if hinting != "right_stick":
             self.view.set_stick("right_stick", value("roll"), value("move_z"))
         self.view.set_trigger("lt", max(0.0, value("pitch_down")))
         self.view.set_trigger("rt", max(0.0, value("pitch_up")))
@@ -355,6 +356,7 @@ class Wizard:
                 self._do_restart()
             if self._ensure_pad() and not self.done:
                 self._detect()
+            if self.pad is not None and not self.done:   # re-checked: _detect may have just finished the last step
                 t = t0 - self.step_started
                 pulse = 0.5 + 0.5 * math.sin(2 * math.pi * PULSE_HZ * t)
                 self.view.highlight(self.step.part, pulse)
