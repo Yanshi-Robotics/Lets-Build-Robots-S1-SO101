@@ -26,8 +26,10 @@ import viser
 import viser.transforms as tf
 from viser.extras import ViserUrdf
 
+from gamepad_pairing import PairingView
+from gamepad_view import PadView, pad_wxyz
 from so101_model import ARM_JOINTS, GRIPPER_INDEX, Model
-from target import HOLD, LEADER_CHECK, MODE_DRAG, MODE_GAMEPAD, MODE_LEADER, MODES, RELEASE, STOP, CommandBox, JointCommand, Target, TargetBox
+from target import FOLLOWER_REAL, FOLLOWER_SIM, HOLD, LEADER_CHECK, MODE_DRAG, MODE_GAMEPAD, MODE_LEADER, MODES, PAIR, RELEASE, STOP, CommandBox, JointCommand, Target, TargetBox
 
 LOOPBACK = "127.0.0.1"   # the page has no login; local access only
 WEB_PORT = 4602          # registered in the machine-wide port table for the Season-1 viser page
@@ -46,6 +48,11 @@ STATUS_HZ = 5            # status text is for eyes, not for control; 5 Hz is eno
 SLIDER_SYNC_HZ = 10      # how often gamepad / leader modes push the target back into the sliders
 CAMERA_POSITION_M = (0.45, -0.55, 0.35)   # where a new browser tab starts looking from
 CAMERA_LOOK_AT_M = (0.2, 0.0, 0.15)       # roughly the middle of the arm's workspace
+# The drawn gamepad, shown on the Gamepad page: on the arm's left, turned to face the camera.
+PAD_POSITION_M = (-0.15, -0.28, 0.10)
+PAD_SCALE = 1.3
+PAD_YAW_DEG = 60
+PAD_TILT_DEG = 55
 PITCH_SLIDER_DEG = 180   # +/- range. The three pitch joints can sum well past 90.
 GRIPPER_HOLD_HZ = 10       # the open/close buttons act only while held, this often ...
 GRIPPER_STEP_PCT = 5.0     # ... and move the gripper this much per call: full travel in two seconds
@@ -57,7 +64,7 @@ def ensure_port_free(host: str, port: int) -> None:
     with socket.socket() as s:
         if s.connect_ex((host, port)) == 0:
             raise SystemExit(f"port {port} is already in use on {host}: close the other page "
-                             f"(gamepad_setup.py or cartesian_control.py) first, or pass --web-port")
+                             f"(another cartesian_control.py) first, or pass --web-port")
 
 
 def _wxyz(R: np.ndarray) -> np.ndarray:
@@ -75,7 +82,9 @@ class Viewer:
                  targets: TargetBox, commands: CommandBox, initial: Target):
         self.model = model
         self.live = live
+        self.follower = FOLLOWER_REAL if live else FOLLOWER_SIM   # which arm the sources drive
         self.mode: str | None = None    # nothing enabled until the user picks one
+        self.page = MODE_DRAG           # which mode page the sidebar shows
         self.targets = targets
         self.commands = commands
         self.server = viser.ViserServer(host=host, port=port, label="SO-101 Cartesian control", verbose=False)
@@ -93,8 +102,7 @@ class Viewer:
         self.commanded = ViserUrdf(self.server, model.urdf_path, root_node_name="/commanded",
                                    mesh_color_override=COMMANDED_COLOR)
         self._urdf_joint_names = self.measured.get_actuated_joint_names()
-        if not live:
-            self.commanded.show_visual = False
+        self.commanded.show_visual = live   # the ghost only means something when a real arm can lag it
 
         # --- the ball ---------------------------------------------------------------
         limits = tuple((float(lo), float(hi)) for lo, hi in zip(bounds_min, bounds_max))
@@ -128,6 +136,10 @@ class Viewer:
         self._mode_status: dict[str, viser.GuiMarkdownHandle] = {}
         self._mode_button: dict[str, viser.GuiButtonHandle] = {}
         self._mode_folder: dict[str, viser.GuiFolderHandle] = {}
+        followers = [FOLLOWER_REAL, FOLLOWER_SIM] if live else [FOLLOWER_SIM]
+        self.follower_select = gui.add_dropdown("Follower", followers, initial_value=self.follower,
+                                                hint="the simulated arm follows the same sources; nothing is sent to the real one")
+        self.follower_select.on_update(lambda _: self._set_follower(self.follower_select.value))
         self.page_select = gui.add_dropdown("Mode", list(MODES), initial_value=MODE_DRAG)
         self.page_select.on_update(lambda _: self._show_page(self.page_select.value))
         for mode in MODES:
@@ -142,6 +154,8 @@ class Viewer:
                 self._mode_button[mode].on_click(lambda _, m=mode: self._toggle_mode(m))
                 if mode == MODE_DRAG:
                     self._build_target_widgets(gui, model, initial)
+                if mode == MODE_GAMEPAD:
+                    self._build_gamepad_widgets(gui)
         self.set_source_status(MODE_DRAG, True, "ready")
         self.set_source_status(MODE_GAMEPAD, False, "No gamepad detected")
         self.set_source_status(MODE_LEADER, False, "not checked yet")
@@ -167,7 +181,7 @@ class Viewer:
             ring.on_drag_end(lambda _, n=name: self._ring_dragging.discard(n))
             ring.on_update(lambda _, n=name: self._ring_update(n))
 
-        # --- buttons (live only) ----------------------------------------------------
+        # --- buttons (real arm only) --------------------------------------------------
         if live:
             with gui.add_folder("Arm"):
                 hold = gui.add_button("Hold and follow", hint="park the goal at the present position, torque on, then follow the ball")
@@ -181,6 +195,7 @@ class Viewer:
 
         self.status = gui.add_markdown("starting")
         self._status_at = 0.0
+        self._ghost_override = None
 
     def _build_target_widgets(self, gui: viser.GuiApi, model: Model, initial: Target) -> None:
         """Sliders and gripper buttons: part of the Drag to move page."""
@@ -202,9 +217,76 @@ class Viewer:
         open_btn.on_hold(lambda _: self._nudge_gripper(+GRIPPER_STEP_PCT), callback_hz=GRIPPER_HOLD_HZ)
         close_btn.on_hold(lambda _: self._nudge_gripper(-GRIPPER_STEP_PCT), callback_hz=GRIPPER_HOLD_HZ)
 
+    def _build_gamepad_widgets(self, gui: viser.GuiApi) -> None:
+        """Pairing panel and the note about the control in use: part of the Gamepad page."""
+        self.pair_button = gui.add_button("Pair again", icon=viser.Icon.REFRESH, visible=False,
+                                          hint="learn this pad's axes and buttons from scratch")
+        self.pair_button.on_click(lambda _: self.commands.push_button(PAIR))
+        self.pairing_step = gui.add_markdown("", visible=False)
+        self.pairing_progress = gui.add_markdown("", visible=False)
+        self.gamepad_note = gui.add_markdown("", visible=False)
+        self.pad_view: PadView | None = None
+
     def _show_page(self, mode: str) -> None:
+        self.page = mode
         for m, folder in self._mode_folder.items():
             folder.visible = m == mode
+        self.commands.push_button(f"page:{mode}")   # the loop starts pairing only while the Gamepad page shows
+
+    def _set_follower(self, follower: str) -> None:
+        if follower == self.follower:
+            return
+        self.follower = follower
+        self.commanded.show_visual = follower == FOLLOWER_REAL
+        self.commands.push_button(f"follower:{follower}")
+        self._refresh_mode_panel()
+
+    # ---- gamepad page (control thread) --------------------------------------------------
+
+    def show_pad(self, show: bool) -> None:
+        """The drawn gamepad lives in the scene only while the Gamepad page is up and a pad is connected."""
+        if show and self.pad_view is None:
+            self.pad_view = PadView(self.server, "/pad", PAD_POSITION_M, pad_wxyz(PAD_YAW_DEG, PAD_TILT_DEG), scale=PAD_SCALE)
+        elif not show and self.pad_view is not None:
+            self.pad_view.root.remove()
+            self.pad_view = None
+
+    def show_pairing(self, view: PairingView | None) -> None:
+        """None = not pairing (panel hidden). Otherwise the pairing panel shows this tick's state."""
+        pairing = view is not None and not view.done
+        self.pairing_step.visible = view is not None
+        self.pairing_progress.visible = view is not None
+        if view is not None:
+            self.pairing_step.content = view.step_text
+            self.pairing_progress.content = view.progress_text
+        if self.pad_view is not None:
+            self.pad_view.highlight(view.highlight if pairing else None, view.pulse if pairing else 0.0)
+            if pairing and view.hint:
+                self.pad_view.set_stick(view.hint[0], view.hint[1], view.hint[2])
+
+    def show_pad_state(self, values: dict[str, float], held: dict[str, bool], note: str | None, active: str | None) -> None:
+        """Mirror the real pad on the drawn one and explain the control in use (Gamepad mode enabled)."""
+        self.gamepad_note.visible = note is not None
+        if note is not None:
+            self.gamepad_note.content = note
+        if self.pad_view is None:
+            return
+        self.pad_view.set_stick("left_stick", values.get("reach", 0.0), values.get("move_z", 0.0))
+        self.pad_view.set_stick("right_stick", values.get("roll", 0.0), values.get("pitch", 0.0))
+        self.pad_view.set_trigger("lt", max(0.0, values.get("waist_left", 0.0)))
+        self.pad_view.set_trigger("rt", max(0.0, values.get("waist_right", 0.0)))
+        for key, part in (("gripper_open", "b"), ("gripper_close", "x"), ("hold", "start"), ("stop", "back")):
+            self.pad_view.set_button(part, bool(held.get(key)))
+        self.pad_view.highlight(active, 1.0)
+
+    def show_ghost(self, q: np.ndarray | None) -> None:
+        """Draw the ghost arm at q (the pairing demo); None puts it back to following the command."""
+        self._ghost_override = q
+        if q is not None:
+            self.commanded.show_visual = True
+            self.commanded.update_cfg(self._cfg(q))
+        else:
+            self.commanded.show_visual = self.follower == FOLLOWER_REAL
 
     # ---- callbacks (viser thread) -----------------------------------------------------
 
@@ -231,7 +313,7 @@ class Viewer:
             else:
                 button.label, button.disabled = f"Enable {mode}", not self._mode_ok[mode]
         for button in self._arm_buttons:
-            button.disabled = self.mode is None
+            button.disabled = self.mode is None or self.follower != FOLLOWER_REAL
 
     def set_source_status(self, mode: str, ok: bool, text: str) -> None:
         """The control loop reports whether a source is usable (pad plugged in, leader connected)."""
@@ -306,7 +388,7 @@ class Viewer:
     def push(self, q_meas: np.ndarray, q_cmd: np.ndarray, q_goal: np.ndarray,
              joint_frames: dict[str, np.ndarray], tool_R: np.ndarray, reachable: bool, status: str) -> None:
         self.measured.update_cfg(self._cfg(q_meas))
-        if self.live:
+        if self.follower == FOLLOWER_REAL and self._ghost_override is None:
             self.commanded.update_cfg(self._cfg(q_cmd))
         self._last_q_goal = np.array(q_goal)
 

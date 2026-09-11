@@ -21,7 +21,7 @@
 
 - **`Bringup/`**：`so101_bus_check.py` 读一条总线上的六台电机；`so101_calibrate.py` 记录每个关节的中位和活动范围。第 6 课用。
 - **`Cameras/`**：`so101_camera_check.py` 列出能出图的摄像头、给出各自该用的稳定路径，再把它们实时显示在一个本地网页上，认出哪台装在哪、把画面转正、存进 `cameras.json`；`check` 会先测出两台相机单开与同开的速率。`so101_policy_view.py` 接着把同样的实时画面按 ACT、π₀、π₀.₅、SmolVLA 各自的预处理显示出来。第 9 课用。
-- **`Cartesian/`**：机械臂的笛卡尔控制，一个页面 <http://127.0.0.1:4602>。`cartesian_control.py` 显示机械臂，同一时间只让一种来源控制它：拖一个球（每个关节上还有一个可转的环）、配好对的手柄、或示教臂；加 `--model-only` 用模拟臂打开同一个页面。`gamepad_setup.py` 给手柄配对，配完可以在模拟臂上练手。`fetch_model.py` 下载机械臂模型。其余文件是控制循环的各段（感知、目标、比较、求解、规划、执行），`Cartesian/README.md` 里有说明。第 8 课用。要在仓库根目录运行，它们按文件夹互相导入。
+- **`Cartesian/`**：机械臂的笛卡尔控制，一个页面 <http://127.0.0.1:4602>。`cartesian_control.py` 显示机械臂，同一时间只让一种来源控制它：拖一个球（每个关节上还有一个可转的环）、配好对的手柄、或示教臂；加 `--model-only` 用模拟臂打开同一个页面。手柄第一次插上时在同一个页面里配对；页面上的 **Follower** 开关可以改为控制模拟臂而不是真臂。`fetch_model.py` 下载机械臂模型。其余文件是控制循环的各段（感知、目标、比较、求解、规划、执行），`Cartesian/README.md` 里有说明。第 8 课用。要在仓库根目录运行，它们按文件夹互相导入。
 - **`Teleop/`**：`so101_teleop_log.py` 打印两只臂的保护与校准寄存器、把两只臂对着读，并给 `lerobot-record` 录下的数据打分。遥操作本身仍然用官方的 `lerobot-teleoperate`。第 7 课用。
 - **`tests/`**：50 条测试，用假硬件跑 Bringup、Teleop、Cameras 的程序；Cartesian 的 31 条在 `Cartesian/test_cartesian.py`。
 - **`Teleop/logs/`**（不进 git）：诊断程序每次运行一份调试日志，只留最近 20 份，`lerobot-record` 录下的数据也放这里。出问题时把最新那份发出来。

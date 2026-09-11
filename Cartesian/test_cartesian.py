@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -219,8 +220,26 @@ class NullViewer:
         self.mode = MODE_DRAG
         self.statuses: list[tuple] = []
 
+        self.page = MODE_DRAG
+        self.follower = None
+        self.pairing_views = []
+        self.ghosts = []
+        self.pair_button = SimpleNamespace(visible=False)
+
     def set_source_status(self, mode, ok, text):
         self.statuses.append((mode, ok, text))
+
+    def show_pad(self, show):
+        pass
+
+    def show_pairing(self, view):
+        self.pairing_views.append(view)
+
+    def show_pad_state(self, values, held, note, active):
+        pass
+
+    def show_ghost(self, q):
+        self.ghosts.append(q)
 
     def sync_target(self, target: Target) -> None:
         self.synced.append(target)
@@ -234,21 +253,23 @@ class FakeLiveArm(FakeArm):
 
 
 class ControlLoopTests(unittest.TestCase):
-    def run_loop(self, arm, seconds, actions, gamepad=None, pad=None, leader=None, mode=MODE_DRAG):
-        """actions: list of (time_offset_s, callable(targets, commands)). Returns (loop, viewer, log dir)."""
+    def run_loop(self, arm, seconds, actions, gamepad=None, pad=None, leader=None, mode=MODE_DRAG, map_path=None):
+        """arm: a FakeLiveArm standing in for the real one, or None for simulation only.
+        actions: list of (time_offset_s, callable(targets, commands))."""
         from cartesian_control import ControlLoop
         m = model()
         s = Solver(m)
         limits = planner.Limits(max_speed=np.array([2.0] * 5 + [150.0]), max_lead=np.array([math.radians(15)] * 5 + [100.0]))
-        arm.connect()
-        q0 = q_from_deg(arm.read_deg())
+        if arm is not None:
+            arm.connect()
+        q0 = q_from_deg(arm.read_deg() if arm is not None else FakeArm().read_deg())
         targets, commands = TargetBox(m.target_from_q(q0)), CommandBox()
         viewer = NullViewer()
         viewer.mode = mode
         tmp = tempfile.mkdtemp()
         log = RunLog(Path(tmp), "test")
-        loop = ControlLoop(m, s, arm, limits, 100.0, targets, commands, viewer, log,
-                           leader_factory=(lambda: leader) if leader else None)
+        loop = ControlLoop(m, s, arm, limits, 100.0, 100.0, targets, commands, viewer, log,
+                           gamepad_map_path=map_path, leader_factory=(lambda: leader) if leader else None)
         loop.pad, loop.gamepad = pad, gamepad     # an already-open, paired pad, as hot-plug would leave it
         loop.start()
         t0 = time.monotonic()
@@ -265,7 +286,7 @@ class ControlLoopTests(unittest.TestCase):
     def test_model_arm_walks_to_target_at_bounded_speed(self):
         target = Target((0.25, 0.10, 0.12), math.radians(45), math.radians(20), 60.0)
         loop, viewer, ticks, m = self.run_loop(
-            FakeArm(), 1.5, [(0.2, lambda t, c: t.set(target, "test"))])
+            None, 1.5, [(0.2, lambda t, c: t.set(target, "test"))])
         self.assertGreater(len(ticks), 100)
         solved = [t for t in ticks if "solve" in t]
         self.assertEqual(len(solved), 1)
@@ -282,7 +303,7 @@ class ControlLoopTests(unittest.TestCase):
 
     def test_ring_moves_one_joint_and_syncs_the_ball(self):
         loop, viewer, ticks, m = self.run_loop(
-            FakeArm(), 1.2, [(0.2, lambda t, c: c.push_joint(JointCommand("shoulder_pan", 0.5)))])
+            None, 1.2, [(0.2, lambda t, c: c.push_joint(JointCommand("shoulder_pan", 0.5)))])
         ringed = [t for t in ticks if "ring" in t]
         self.assertEqual(len(ringed), 1)
         self.assertEqual(ringed[0]["target"]["source"], "ring")
@@ -311,7 +332,7 @@ class ControlLoopTests(unittest.TestCase):
         def let_go(t, c):
             pad.press(1, False)         # ... for 0.5 s, then let go: the gripper must stop where it is
 
-        loop, viewer, ticks, m = self.run_loop(FakeArm(), 1.8, [(0.2, push), (0.7, release), (1.2, let_go)],
+        loop, viewer, ticks, m = self.run_loop(None, 1.8, [(0.2, push), (0.7, release), (1.2, let_go)],
                                                gamepad=source, pad=pad, mode=MODE_GAMEPAD)
         from gamepad_control import GRIPPER_SPEED_PCT_S
         start = ticks[0]["target"]["xyz"][0]
@@ -339,12 +360,81 @@ class ControlLoopTests(unittest.TestCase):
             leader.deg["shoulder_pan"] = 25.0
             leader.deg["gripper"] = 80.0
 
-        loop, viewer, ticks, m = self.run_loop(FakeArm(), 1.5, [(0.2, move)], leader=leader, mode=MODE_LEADER)
+        loop, viewer, ticks, m = self.run_loop(None, 1.5, [(0.2, move)], leader=leader, mode=MODE_LEADER)
         self.assertEqual(len([t for t in ticks if "solve" in t]), 0)
         self.assertEqual(ticks[-1]["target"]["source"], "leader")
         self.assertAlmostEqual(ticks[-1]["q_goal_deg"]["shoulder_pan"], 25.0, places=3)
         self.assertAlmostEqual(ticks[-1]["q_cmd_deg"]["shoulder_pan"], 25.0, places=2)
         self.assertAlmostEqual(ticks[-1]["q_cmd_deg"]["gripper"], 80.0, places=2)
+
+    def test_switching_to_the_simulated_follower_leaves_the_real_arm_alone(self):
+        from target import FOLLOWER_REAL, FOLLOWER_SIM
+        target = Target((0.25, 0.10, 0.12), math.radians(45), 0.0, 30.0)
+        arm = FakeLiveArm()
+        sent = []
+        original = arm.send_deg
+        arm.send_deg = lambda goal: (sent.append(dict(goal)), original(goal))
+        loop, viewer, ticks, m = self.run_loop(arm, 2.6, [
+            (0.2, lambda t, c: c.push_button(f"follower:{FOLLOWER_SIM}")),
+            (0.4, lambda t, c: t.set(target, "test")),
+            (1.6, lambda t, c: c.push_button(f"follower:{FOLLOWER_REAL}")),
+        ])
+        self.assertEqual(sent, [])                                    # nothing ever written to the real arm
+        self.assertFalse(arm.torque_on)
+        sim = [t for t in ticks if t["follower"] == "sim"]
+        self.assertTrue(sim and all(t["following"] for t in sim))
+        self.assertLess(sim[-1]["err_mm"]["cmd"], 1.0)                # the simulation reached the target
+        back = [t for t in ticks if t["follower"] == "real" and t["t"] > ticks[0]["t"] + 1.7]
+        self.assertTrue(back and not any(t["following"] for t in back))   # real again: waits for Hold
+        self.assertEqual(back[-1]["target"]["source"], "arm")            # and the ball went back to the real pose
+
+    def test_unpaired_pad_pairs_inside_the_gamepad_page(self):
+        from gamepad_pairing import STEPS
+        pad = FakePad()
+        pad.axes[4] = pad.axes[5] = -1.0
+        tmp = Path(tempfile.mkdtemp()) / "map.json"
+
+        def on_gamepad_page(t, c):
+            self.current_viewer.page = MODE_GAMEPAD
+            c.push_button("page:Gamepad")
+
+        actions = [(0.2, on_gamepad_page)]
+        # walk the ten steps: each axis push lasts 0.25 s, then 0.25 s rest
+        moves = [(1, -1.0), (0, 1.0), (3, -1.0), (2, 1.0), (4, 1.0), (5, 1.0)]
+        t = 0.6
+        for idx, value in moves:
+            actions.append((t, lambda tt, c, i=idx, v=value: pad.axes.__setitem__(i, v)))
+            actions.append((t + 0.25, lambda tt, c, i=idx: pad.axes.__setitem__(i, -1.0 if i in (4, 5) else 0.0)))
+            t += 0.5
+        for idx in (1, 2, 7, 6):
+            actions.append((t, lambda tt, c, i=idx: pad.press(i, True)))
+            actions.append((t + 0.15, lambda tt, c, i=idx: pad.press(i, False)))
+            t += 0.4
+        self.current_viewer = None
+        from cartesian_control import ControlLoop  # noqa: F401
+        orig = self.run_loop
+
+        def run(*a, **k):
+            return orig(*a, **k)
+        # the viewer object is created inside run_loop; grab it through a small hook
+        NullViewer_init = NullViewer.__init__
+
+        def hooked(v):
+            NullViewer_init(v)
+            self.current_viewer = v
+        NullViewer.__init__ = hooked
+        try:
+            loop, viewer, ticks, m = run(None, t + 0.5, actions, pad=pad, map_path=tmp)
+        finally:
+            NullViewer.__init__ = NullViewer_init
+        self.assertTrue(tmp.exists(), "pairing wrote the map")
+        written = json.loads(tmp.read_text())["pads"]["fake"]
+        self.assertEqual(set(written["axes"]), {s.key for s in STEPS if s.kind == "axis"})
+        self.assertEqual(written["buttons"], {"gripper_open": 1, "gripper_close": 2, "hold": 7, "stop": 6})
+        self.assertIsNotNone(loop.gamepad)                            # usable right away, no restart
+        self.assertTrue(any(v is not None and not v.done for v in viewer.pairing_views))
+        self.assertTrue(any(q is not None for q in viewer.ghosts))   # the demo played on the ghost arm
+        self.assertEqual(viewer.statuses[-1][:2], (MODE_GAMEPAD, True))
 
     def test_hold_refused_without_a_mode(self):
         arm = FakeLiveArm()
@@ -437,40 +527,22 @@ class GamepadIntegrateTests(unittest.TestCase):
         self.assertLess(nose_up.pitch, 0.0)                                             # stick forward = nose up = pitch decreases
 
 
-class GamepadWizardTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        import socket
-        import viser
-        from gamepad_setup import Wizard
-        import os
-        from viewer import WEB_PORT
-        port = int(os.environ.get("CARTESIAN_TEST_PORT", WEB_PORT))   # the page may be open on the default port
-        with socket.socket() as s:
-            busy = s.connect_ex(("127.0.0.1", port)) == 0
-        if busy:
-            raise unittest.SkipTest(f"port {port} is in use")
-        cls.tmp = tempfile.mkdtemp()
-        cls.log = RunLog(Path(cls.tmp), "test")
-        cls.server = viser.ViserServer(host="127.0.0.1", port=port, verbose=False)
-        cls.wizard = Wizard(model(), cls.server, cls.log, map_path=Path(cls.tmp) / "map.json")
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.server.stop()
-        cls.log.close()
-
+class PairingTests(unittest.TestCase):
     def setUp(self):
+        from gamepad_pairing import Pairing
         self.pad = FakePad()
-        w = self.wizard
-        w.pad = self.pad
-        w.mapping = {"device": "fake", "axes": {}, "buttons": {}}
-        w.index, w.done = 0, False
-        w._begin_step()
+        self.tmp = Path(tempfile.mkdtemp())
+        self.log = RunLog(self.tmp, "test")
+        self.p = Pairing(self.pad, self.tmp / "map.json", self.log, 0.0)
+        self.now = 0.0
+
+    def tearDown(self):
+        self.log.close()
 
     def ticks(self, n):
         for _ in range(n):
-            self.wizard._detect()
+            self.now += 0.02
+            self.view = self.p.tick(self.now)
 
     def push_axis(self, idx, value, hold=8):
         self.pad.axes[idx] = value
@@ -485,68 +557,68 @@ class GamepadWizardTests(unittest.TestCase):
         self.ticks(2)
 
     def test_full_pairing_writes_map(self):
-        w = self.wizard
+        p = self.p
+        self.ticks(1)
+        self.assertEqual(self.view.highlight, "left_stick")
+        self.assertIn("Step 1 / 10", self.view.step_text)
         self.push_axis(1, -1.0)   # left stick forward: Linux reports up as negative
-        self.assertEqual(w.mapping["axes"]["move_z"], {"axis": 1, "sign": -1, "kind": "stick", "rest": 0.0})
-        self.assertEqual(w.index, 1)
-        self.push_axis(0, 1.0)    # left stick right: reach
-        self.push_axis(3, -1.0)   # right stick forward: pitch
-        self.push_axis(2, 1.0)    # right stick right: roll
-        self.push_axis(4, 1.0)    # LT: -1 -> +1, waist left
-        self.assertEqual(w.mapping["axes"]["waist_left"]["kind"], "trigger")
+        self.assertEqual(p.mapping["axes"]["move_z"], {"axis": 1, "sign": -1, "kind": "stick", "rest": 0.0})
+        self.assertEqual(p.index, 1)
+        self.push_axis(0, 1.0)    # reach
+        self.push_axis(3, -1.0)   # pitch
+        self.push_axis(2, 1.0)    # roll
+        self.push_axis(4, 1.0)    # LT
+        self.assertEqual(p.mapping["axes"]["waist_left"]["kind"], "trigger")
         self.push_axis(5, 1.0)    # RT
         for idx in (1, 2, 7, 6):  # B X Start Back
             self.press(idx)
-        self.assertTrue(w.done)
-        w._mirror_pad()          # the loop keeps drawing after completion; must not index past the last step
-        # practice: the pad now drives the simulated arm, with commentary on the control in use
-        self.assertIsNotNone(w.practice)
-        z0 = w.practice_target.xyz[2]
-        self.pad.axes[1] = -1.0                      # left stick forward: up
-        for i in range(25):
-            w._practice_tick(0.02, 100.0 + i * 0.02)
-        self.assertGreater(w.practice_target.xyz[2], z0 + 0.03)
-        self.assertIn("Left stick", w.message)
-        self.pad.axes[1] = 0.0
-        w._practice_tick(0.02, 200.0)                # quiet for a long time: back to the idle text
-        self.assertNotIn("Left stick", w.message)
-        written = json.loads((Path(self.tmp) / "map.json").read_text())["pads"]["fake"]
+        self.assertTrue(p.done)
+        self.assertTrue(self.view.done)
+        written = json.loads((self.tmp / "map.json").read_text())["pads"]["fake"]
         self.assertEqual(written["buttons"], {"gripper_open": 1, "gripper_close": 2, "hold": 7, "stop": 6})
         self.assertEqual(set(written["axes"]), {"move_z", "reach", "pitch", "roll", "waist_left", "waist_right"})
 
     def test_small_or_brief_axis_motion_is_ignored(self):
-        w = self.wizard
         self.push_axis(1, -0.4)          # not far enough
-        self.assertEqual(w.index, 0)
+        self.assertEqual(self.p.index, 0)
         self.pad.axes[1] = -1.0
         self.ticks(2)                    # not long enough
         self.pad.axes[1] = 0.0
         self.ticks(2)
-        self.assertEqual(w.index, 0)
+        self.assertEqual(self.p.index, 0)
 
     def test_reused_control_is_refused(self):
-        w = self.wizard
+        p = self.p
         self.push_axis(1, -1.0)          # move_z <- axis 1
         self.push_axis(1, 1.0)           # asked for reach, gave the same axis
-        self.assertEqual(w.index, 1)
-        self.assertIn("already", w.message)
-        self.push_axis(0, 1.0)           # the right one
-        self.assertEqual(w.index, 2)
-        w.index = 6
-        w._begin_step()
+        self.assertEqual(p.index, 1)
+        self.assertIn("already", p.message)
+        self.push_axis(0, 1.0)
+        self.assertEqual(p.index, 2)
+        p.index = 6
+        p._begin_step(self.now)
         self.press(1)                    # gripper_open <- button 1
         self.press(1)                    # gripper_close: same button, refused
-        self.assertEqual(w.index, 7)
+        self.assertEqual(p.index, 7)
         self.press(2)
-        self.assertEqual(w.index, 8)
+        self.assertEqual(p.index, 8)
 
     def test_restart_clears_mapping(self):
-        w = self.wizard
         self.push_axis(1, -1.0)
-        w.restart()
-        w._do_restart()
-        self.assertEqual(w.index, 0)
-        self.assertEqual(w.mapping["axes"], {})
+        self.p.restart(self.now)
+        self.assertEqual(self.p.index, 0)
+        self.assertEqual(self.p.mapping["axes"], {})
+
+    def test_demo_targets(self):
+        from gamepad_pairing import demo_target, STEPS
+        base = Target((0.3, 0.0, 0.15), 0.0, 0.0, 30.0)
+        for step in STEPS:
+            if step.demo is None:
+                continue
+            t = demo_target(base, step.demo, 1.0)
+            self.assertNotEqual(t, base, step.key)
+        turned = demo_target(base, ("waist", 1), 1.0)
+        self.assertAlmostEqual(math.hypot(*turned.xyz[:2]), 0.3, places=9)
 
 
 if __name__ == "__main__":

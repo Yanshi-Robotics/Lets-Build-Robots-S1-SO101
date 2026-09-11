@@ -7,7 +7,7 @@ to report the current state of every axis and button.
 `Gamepad` keeps the latest state (axes in -1..1, buttons as bools) and a queue of
 changes for anything that wants to react to presses rather than poll. Reading happens
 in its own thread; nothing here knows what the axes mean, that is `gamepad_map.json`'s
-job (written by gamepad_setup.py).
+job (written by the pairing on the Gamepad page, gamepad_pairing.py).
 """
 
 from __future__ import annotations

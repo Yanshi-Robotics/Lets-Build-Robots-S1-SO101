@@ -32,16 +32,17 @@ import planner  # noqa: E402
 from compare import REACH_TOLERANCE_M, error  # noqa: E402
 from gamepad import Gamepad, discover  # noqa: E402
 from gamepad_control import GamepadSource, integrate, load_map  # noqa: E402
+from gamepad_pairing import EXPLAIN, IDLE_TEXT, Pairing, active_control, demo_target  # noqa: E402
 from runlog import RunLog  # noqa: E402
-from so101_arm import SERVO_P_COEFFICIENT, Arm, FakeArm, deg_from_q, q_from_deg  # noqa: E402
+from so101_arm import MODEL_START_DEG, SERVO_P_COEFFICIENT, Arm, FakeArm, deg_from_q, q_from_deg  # noqa: E402
 from so101_leader import Leader  # noqa: E402
 from so101_model import ARM_JOINTS, GRIPPER_INDEX, Model  # noqa: E402
 from solver import Solver  # noqa: E402
-from target import HOLD, LEADER_CHECK, MODE_GAMEPAD, MODE_LEADER, RELEASE, STOP, CommandBox, TargetBox  # noqa: E402
+from target import FOLLOWER_REAL, HOLD, LEADER_CHECK, MODE_GAMEPAD, MODE_LEADER, PAIR, RELEASE, STOP, CommandBox, TargetBox  # noqa: E402
 from viewer import LOOPBACK, WEB_PORT, Viewer, ensure_port_free  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-GAMEPAD_MAP_PATH = HERE / "gamepad_map.json"   # written by gamepad_setup.py
+GAMEPAD_MAP_PATH = HERE / "gamepad_map.json"   # written by the pairing on the Gamepad page
 
 CONTROL_HZ_LIVE = 30       # one sync_read + one sync_write take 6-10 ms on the 1 Mbaud bus
 CONTROL_HZ_MODEL = 50      # no bus; just smooth animation
@@ -77,7 +78,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--leader-port", help="serial port of a leader arm; enables the 'Leader arm' mode")
     p.add_argument("--leader-id", default="so101-leader")
     p.add_argument("--leader-calibration-dir", type=Path, default=Path("calibration/leader"))
-    p.add_argument("--gamepad-map", type=Path, default=GAMEPAD_MAP_PATH, help="pairing result from gamepad_setup.py")
+    p.add_argument("--gamepad-map", type=Path, default=GAMEPAD_MAP_PATH, help="where gamepad pairings are kept")
     p.add_argument("--web-port", type=int, default=WEB_PORT)
     p.add_argument("--release-torque", action="store_true", help="turn torque off on exit (default: keep holding)")
     p.add_argument("--logs-dir", type=Path, default=HERE / "logs")
@@ -85,22 +86,35 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 class ControlLoop:
-    def __init__(self, model: Model, solver: Solver, arm, limits: planner.Limits, hz: float,
+    def __init__(self, model: Model, solver: Solver, real_arm, limits: planner.Limits, hz_live: float, hz_model: float,
                  targets: TargetBox, commands: CommandBox, viewer: Viewer, log: RunLog,
                  gamepad_map_path: Path | None = None, leader_factory=None, bounds=None):
-        self.model, self.solver, self.arm, self.limits = model, solver, arm, limits
+        self.model, self.solver, self.limits = model, solver, limits
+        # Two arms the sources can drive: the real one (only with --port) and a simulated one.
+        # The simulated one starts wherever the real one is, so switching over does not jump.
+        self.real_arm = real_arm
+        self.sim_arm = FakeArm(real_arm.read_deg() if real_arm is not None else MODEL_START_DEG)
+        self.arm = real_arm if real_arm is not None else self.sim_arm
+        self.hz_live, self.hz_model = hz_live, hz_model
         self.gamepad_map_path = gamepad_map_path
         self.pad: Gamepad | None = None
         self.gamepad: GamepadSource | None = None
+        self.pairing: Pairing | None = None
         self._gamepad_polled = 0.0
         self.leader_factory = leader_factory      # () -> Leader, or None when no --leader-port was given
         self.leader: Leader | None = None
         self.bounds_min, self.bounds_max = bounds if bounds else (DEFAULT_BOUNDS_MIN_M, DEFAULT_BOUNDS_MAX_M)
-        self.dt = 1.0 / hz
         self.targets, self.commands, self.viewer, self.log = targets, commands, viewer, log
-        self.live = arm.mode == "live"
         self._stop = threading.Event()
         self.thread = threading.Thread(target=self._run_guarded, name="control", daemon=True)
+
+    @property
+    def live(self) -> bool:
+        return self.arm is self.real_arm
+
+    @property
+    def dt(self) -> float:
+        return 1.0 / (self.hz_live if self.live else self.hz_model)
 
     def start(self) -> None:
         self.thread.start()
@@ -119,6 +133,8 @@ class ControlLoop:
             if self.pad is not None:
                 self.pad.stop()
 
+    # ---- sources ------------------------------------------------------------------------
+
     def _check_gamepad(self, now: float) -> None:
         """Hot-plug: find a pad when there is none, notice when it goes away. One glob per second."""
         if now - self._gamepad_polled < GAMEPAD_POLL_S:
@@ -129,7 +145,8 @@ class ControlLoop:
         if self.pad is not None:   # was there, now gone
             self.log.warning("gamepad lost", error=self.pad.error)
             self.pad.stop()
-            self.pad, self.gamepad = None, None
+            self.pad, self.gamepad, self.pairing = None, None, None
+            self.viewer.show_pairing(None)
             self.viewer.set_source_status(MODE_GAMEPAD, False, "No gamepad detected")
         devices = discover()
         if not devices:
@@ -139,12 +156,52 @@ class ControlLoop:
         mapping = load_map(self.gamepad_map_path, self.pad.name) if self.gamepad_map_path else None
         if mapping is None:
             self.gamepad = None
-            self.viewer.set_source_status(MODE_GAMEPAD, False, f"{self.pad.name}: not paired — run gamepad_setup.py")
+            self.viewer.set_source_status(MODE_GAMEPAD, False, f"{self.pad.name}: not paired yet — open the Gamepad page to pair")
             self.log.event("gamepad found but not paired", device=self.pad.name, path=str(devices[0][0]))
             return
         self.gamepad = GamepadSource(self.pad, mapping)
         self.viewer.set_source_status(MODE_GAMEPAD, True, self.pad.name)
         self.log.event("gamepad ready", device=self.pad.name, path=str(devices[0][0]))
+
+    def _start_pairing(self, now: float) -> None:
+        assert self.pad is not None
+        self.gamepad = None                          # not usable until the new pairing is complete
+        self.pairing = Pairing(self.pad, self.gamepad_map_path, self.log, now)
+        self.viewer.set_source_status(MODE_GAMEPAD, False, f"{self.pad.name}: pairing")
+        self.log.event("pairing started", device=self.pad.name)
+
+    def _gamepad_page_tick(self, now: float, base_target, q_seed, state) -> np.ndarray | None:
+        """Pairing and the drawn pad while the Gamepad page shows. Returns the ghost pose for a demo, if any."""
+        on_page = self.viewer.page == MODE_GAMEPAD and self.pad is not None and self.pad.connected
+        self.viewer.show_pad(on_page)
+        if not on_page:
+            if self.pairing is not None and not self.pairing.done:
+                return None                          # keep the pairing where it is; the page comes back
+            return None
+        # a pad that is plugged in but not paired starts pairing by itself
+        if self.pairing is None and self.gamepad is None:
+            self._start_pairing(now)
+        if self.pairing is not None:
+            view = self.pairing.tick(now)
+            self.viewer.show_pairing(view)
+            if view.done:
+                self.gamepad = GamepadSource(self.pad, self.pairing.mapping)
+                self.viewer.set_source_status(MODE_GAMEPAD, True, self.pad.name)
+                self.viewer.pair_button.visible = True
+                self.pairing = None
+                self.viewer.show_ghost(None)
+                return None
+            if view.demo is not None:
+                sol = self.solver.solve(q_seed, demo_target(base_target, view.demo, view.demo_phase))
+                return sol.q_goal
+            return None
+        # paired: mirror the pad and explain the control in use
+        assert self.gamepad is not None
+        values, held = self.gamepad.mirror()
+        active = active_control(state) if state is not None and self.viewer.mode == MODE_GAMEPAD else None
+        self.viewer.show_pad_state(values, held, EXPLAIN[active] if active else IDLE_TEXT, active)
+        self.viewer.pair_button.visible = True
+        return None
 
     def _check_leader(self) -> None:
         """Open the leader port and verify its calibration. A failure is shown, never fatal."""
@@ -171,15 +228,18 @@ class ControlLoop:
         self.viewer.sync_target(target)
         return version, target
 
+    # ---- the loop -------------------------------------------------------------------------
+
     def _run(self) -> None:
-        model, solver, arm, log = self.model, self.solver, self.arm, self.log
-        q_meas = q_from_deg(arm.read_deg())
+        model, solver, log = self.model, self.solver, self.log
+        q_meas = q_from_deg(self.arm.read_deg())
         q_cmd = q_meas.copy()
         q_goal = q_meas.copy()
         solution = None
-        following = not self.live       # the simulated arm follows from the start
+        following = not self.live       # the simulated arm follows from the start; the real one after Hold
         last_version, _ = self._sync_from(q_meas, "arm")
         last_synced_q = q_meas.copy()
+        demo_q_seed = q_meas.copy()
         log.event("loop start", live=self.live, hz=1.0 / self.dt, q_deg=deg_from_q(q_meas))
 
         self._check_leader()   # once at start; the page's button retries
@@ -188,6 +248,7 @@ class ControlLoop:
         t_prev = time.monotonic()
         while not self._stop.is_set():
             t0 = time.monotonic()
+            arm = self.arm
             record: dict = {"tick": tick, "period_ms": (t0 - t_prev) * 1000.0}
             t_prev = t0
             self._check_gamepad(t0)
@@ -200,11 +261,33 @@ class ControlLoop:
             joint_cmd, buttons = self.commands.drain()
             for button in buttons:
                 log.event("button", name=button)
-                if button.startswith("mode:"):
-                    continue   # logged, nothing else to do: the loop reads viewer.mode every tick
+                record["button"] = button
+                if button.startswith("mode:") or button.startswith("page:"):
+                    continue   # logged, nothing else to do: the loop reads viewer.mode / viewer.page every tick
                 if button == LEADER_CHECK:
                     self._check_leader()
                     continue
+                if button == PAIR and self.pad is not None and self.pad.connected:
+                    self._start_pairing(t0)
+                    continue
+                if button.startswith("follower:"):
+                    want_real = button == f"follower:{FOLLOWER_REAL}"
+                    if want_real and self.real_arm is None:
+                        continue
+                    if want_real:
+                        self.arm = arm = self.real_arm
+                        following = False              # the real arm waits for Hold
+                    else:
+                        self.sim_arm.send_deg(arm.read_deg())   # the simulation starts where the arm is now
+                        self.arm = arm = self.sim_arm
+                        following = True
+                    q_meas = q_from_deg(arm.read_deg())
+                    q_cmd, q_goal = q_meas.copy(), q_meas.copy()
+                    last_version, _ = self._sync_from(q_meas, "arm")
+                    solution = None
+                    continue
+                if not self.live:
+                    continue                           # Hold / Stop / Release only mean something on the real arm
                 if button == HOLD and self.viewer.mode is None:
                     log.warning("hold refused: no control mode enabled")
                     continue
@@ -221,14 +304,26 @@ class ControlLoop:
                         arm.release()
                 except RuntimeError as e:   # a servo answering with an error bit; the loop must live on
                     log.warning("arm command failed", button=button, error=str(e))
-                record["button"] = button
 
             mode = self.viewer.mode
             record["mode"] = mode
+            record["follower"] = "real" if self.live else "sim"   # after the buttons: a switch counts from this tick
+            dt = self.dt
 
-            # 2a. gamepad: sticks push the target along; buttons act like the page's buttons
-            if mode == MODE_GAMEPAD and self.gamepad is not None:
-                state = self.gamepad.read()
+            # 2a. the Gamepad page: pairing (with a demo on the ghost arm) or the drawn pad.
+            # The pad is read once per tick: read() consumes button edges.
+            state = self.gamepad.read() if self.gamepad is not None else None
+            current, _, _ = self.targets.snapshot()
+            ghost_q = self._gamepad_page_tick(t0, current, demo_q_seed, state)
+            if ghost_q is not None:
+                demo_q_seed = ghost_q
+                self.viewer.show_ghost(ghost_q)
+            elif self.pairing is None:
+                demo_q_seed = q_cmd.copy()
+                self.viewer.show_ghost(None)
+
+            # 2b. gamepad: sticks push the target along; buttons act like the page's buttons
+            if mode == MODE_GAMEPAD and state is not None:
                 for key in state.pressed:
                     if key == "hold":
                         self.commands.push_button(HOLD)      # handled next tick, same path as the page button
@@ -236,8 +331,7 @@ class ControlLoop:
                         self.commands.push_button(STOP)
                 if following and (state.moving or state.pressed):
                     current, _, _ = self.targets.snapshot()
-                    moved = integrate(current, state, self.dt, self.bounds_min, self.bounds_max,
-                                      model.limits["wrist_roll"])
+                    moved = integrate(current, state, dt, self.bounds_min, self.bounds_max, model.limits["wrist_roll"])
                     if moved != current:
                         self.targets.set(moved, "gamepad")
                         self.viewer.sync_target(moved)
@@ -245,7 +339,7 @@ class ControlLoop:
                                      "pitch": state.pitch_rate, "roll": state.roll_rate, "gripper": state.gripper_rate,
                                      "pressed": list(state.pressed)}
 
-            # 2b. leader arm: its joints are the goal; no solve
+            # 2c. leader arm: its joints are the goal; no solve
             if mode == MODE_LEADER and self.leader is not None and following:
                 q_leader = model.clamp(q_from_deg(self.leader.read_deg()))
                 if np.any(np.abs(q_leader - q_goal) > LEADER_CHANGED_RAD):
@@ -281,7 +375,7 @@ class ControlLoop:
 
             # 5. plan
             if following:
-                step = planner.step(q_cmd, q_goal, q_meas if self.live else q_cmd, self.dt, self.limits)
+                step = planner.step(q_cmd, q_goal, q_meas if self.live else q_cmd, dt, self.limits)
                 q_cmd = step.q_next
                 record["speed_limited"] = step.speed_limited
                 record["lead_limited"] = step.lead_limited
@@ -321,18 +415,21 @@ class ControlLoop:
             log.tick(record)
             tick += 1
 
-            remaining = self.dt - (time.monotonic() - t0)
+            remaining = dt - (time.monotonic() - t0)
             if remaining > 0:
                 time.sleep(remaining)
 
     def _status(self, following, target, goal_err, cmd_err, meas_err, q_meas, record) -> str:
-        mode = "LIVE" if self.live else "MODEL"
         if self.live:
-            state = "following the ball" if following else ("torque on, stopped" if self.arm.torque_on else "torque off, ball mirrors the arm")
+            which = "REAL ARM"
+            state = "following" if following else ("torque on, stopped" if self.arm.torque_on else "torque off, ball mirrors the arm")
         else:
-            state = "simulated arm follows the ball"
+            which = "SIMULATED ARM"
+            state = "follows the target" + (" (the real arm is not being driven)" if self.real_arm is not None else "")
+        if self.pairing is not None:
+            state = "pairing the gamepad; the ghost arm shows the demo"
         lines = [
-            f"**{mode}** · {self.viewer.mode or 'no control mode enabled'} · {state}",
+            f"**{which}** · {self.viewer.mode or 'no control mode enabled'} · {state}",
             f"target xyz = ({target.xyz[0]:.3f}, {target.xyz[1]:.3f}, {target.xyz[2]:.3f}) m · "
             f"pitch {math.degrees(target.pitch):.0f}° · roll {math.degrees(target.roll):.0f}° · gripper {target.gripper_pct:.0f}%",
             f"error: solver {goal_err.position_m * 1e3:.1f} mm · command {cmd_err.position_m * 1e3:.1f} mm · "
@@ -346,17 +443,12 @@ class ControlLoop:
 def main(argv=None) -> int:
     args = parse_args(argv)
     live = args.port is not None
-    hz = args.hz or (CONTROL_HZ_LIVE if live else CONTROL_HZ_MODEL)
     ensure_port_free(LOOPBACK, args.web_port)
     log = RunLog(args.logs_dir, "live" if live else "model")
     log.event("arguments", **{k: str(v) for k, v in vars(args).items()})
 
-    if live:
-        arm = Arm(args.port, args.robot_id, args.calibration_dir, args.p_coefficient)
-        calibration_path = arm.calibration_path
-    else:
-        arm = FakeArm()
-        calibration_path = None
+    real_arm = Arm(args.port, args.robot_id, args.calibration_dir, args.p_coefficient) if live else None
+    calibration_path = real_arm.calibration_path if real_arm is not None else None
     model = Model(args.model_dir, calibration_path)
     log.event("model", urdf=str(model.urdf_path), calibration=str(calibration_path),
               limits_deg={k: [math.degrees(a), math.degrees(b)] for k, (a, b) in model.limits.items()},
@@ -367,9 +459,10 @@ def main(argv=None) -> int:
         max_lead=np.array([math.radians(args.max_lead_deg)] * 5 + [MAX_GRIPPER_LEAD_PCT]),
     )
 
-    arm.connect()
-    q0 = q_from_deg(arm.read_deg())
-    log.event("arm connected", mode=arm.mode, q_deg=deg_from_q(q0), torque=arm.torque_on)
+    if real_arm is not None:
+        real_arm.connect()
+        log.event("arm connected", q_deg=real_arm.read_deg(), torque=real_arm.torque_on)
+    q0 = q_from_deg(real_arm.read_deg() if real_arm is not None else MODEL_START_DEG)
 
     # The leader is optional: it is opened by the control thread (at start and whenever
     # the page's "Check leader arm" button is pressed), and a failure only greys out
@@ -387,7 +480,8 @@ def main(argv=None) -> int:
     log.event("page up", url=f"http://{LOOPBACK}:{args.web_port}")
     print(f"open http://{LOOPBACK}:{args.web_port}  (logs: {log.dir})", flush=True)
 
-    loop = ControlLoop(model, solver, arm, limits, hz, targets, commands, viewer, log,
+    loop = ControlLoop(model, solver, real_arm, limits, args.hz or CONTROL_HZ_LIVE, args.hz or CONTROL_HZ_MODEL,
+                       targets, commands, viewer, log,
                        gamepad_map_path=args.gamepad_map, leader_factory=leader_factory,
                        bounds=(args.bounds_min_m, args.bounds_max_m))
     loop.start()
@@ -402,7 +496,8 @@ def main(argv=None) -> int:
         loop.stop()
         if loop.leader is not None:
             loop.leader.close()
-        arm.close(release_torque=args.release_torque)
+        if real_arm is not None:
+            real_arm.close(release_torque=args.release_torque)
         log.event("closed", torque_released=args.release_torque and live)
         log.close()
 

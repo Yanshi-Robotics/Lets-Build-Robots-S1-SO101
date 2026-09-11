@@ -96,7 +96,8 @@ built-in 2.8 degree tilt which is included in that zero).
 | `fetch_model.py` | — | downloads the URDF, meshes and licence at a pinned commit |
 | `gamepad.py` | 2 | Linux joystick reader (`/dev/input/js*`) |
 | `gamepad_control.py` | 2 | paired axes/buttons -> velocities -> a moving `Target` |
-| `gamepad_view.py`, `gamepad_setup.py` | — | 3D pad drawn from primitives; the pairing wizard |
+| `gamepad_pairing.py` | 2 | the pairing steps (pure state machine) and the per-control explanations |
+| `gamepad_view.py` | — | the gamepad drawn from primitives, shown on the Gamepad page |
 | `viewer.py` | 2 | the viser page: two arms, ball, sliders, rings, buttons, status |
 | `runlog.py` | — | one directory per run under `logs/` |
 | `cartesian_control.py` | loop | arguments, wiring, the control thread |
@@ -120,6 +121,78 @@ boxes and nothing else.
 * **Buttons** (live only): *Hold and follow* parks the goal at the present position, turns
   torque on and starts following the ball. *Stop* stops sending; torque stays on, the
   arm holds. *Release torque* switches torque off.
+
+## One page: which arm, then which source
+
+Two dropdowns at the top of the sidebar.
+
+**Follower** picks which arm the sources drive: *Real arm* (only when started with
+`--port`) or *Simulated arm*. The simulation always follows; it starts wherever the real
+arm is when you switch, so nothing jumps. While the simulated arm is selected nothing is
+sent to the real one (its torque stays as it was), and the three arm buttons are greyed.
+Switching back to the real arm puts the ball on its actual pose and waits for *Hold and
+follow* again. Started without `--port`, only the simulated arm exists.
+
+**Mode** picks which source the sidebar shows: its self-check status and its buttons,
+nothing else. Each has an *Enable* button. Nothing is enabled at start. Enable one and
+the other two show *waiting* until you disable it again. On the real arm, *Hold and
+follow* is refused until a source is enabled.
+
+* **Drag to move** — the ball, the sliders, the rings (above).
+* **Gamepad** — the layout is Interbotix's X-Series arm layout (a five-joint arm like
+  this one) with Xbox names: LT / RT turn the whole arm about its base, the left stick
+  moves the tool up/down and out/in along the arm, the right stick pitches and rolls it,
+  B / X open / close the gripper while held, Start / Back are *Hold and follow* / *Stop*.
+  The target moves in cylindrical terms (waist angle, reach, height) at up to 0.08 m/s
+  and 0.8 rad/s. The ball and sliders follow so you see what the pad is asking for. Pads
+  are looked for once a second (one directory listing), so plugging in after start works,
+  and so does swapping pads; if the pad goes away while enabled, the mode drops back to
+  none. **Pairing happens on this page**: open it with an unpaired pad plugged in and the
+  ten steps start by themselves (below). A paired pad shows a drawn copy of itself on the
+  page that mirrors your sticks and lights up the control you are using, with a line
+  saying what it does. *Pair again* redoes the steps.
+* **Leader arm** — a second SO-101 moved by hand; its joints become the goal directly
+  (no solving), the ball jumps to where that lands, speed and lead limits still apply.
+  Give its port on the command line (`--leader-port /dev/ttyACM1`, plus `--leader-id`,
+  `--leader-calibration-dir calibration/leader`). The row can only be enabled once the
+  check passes: the port opens and its motors carry the leader's calibration (LeRobot's
+  `is_calibrated` compares the homing offsets and limits stored in the servos with the
+  calibration file). The check runs once at start and again whenever you press *Check
+  leader arm*, so a leader plugged in later, or a wrong port fixed, just needs the
+  button. A failing check greys the row out and says why; it never stops the program —
+  someone who only wants the gamepad is not held up by a leader arm.
+
+Switching never jumps: the target stays where it is until the new source moves it.
+In gamepad and leader modes the page only displays the target; the mouse does not set it.
+
+**What must work for the program to start at all**: the model, and — with `--port` — the
+follower arm: its port opens and its motors carry the follower calibration. A follower
+port that holds the leader's numbers (arms swapped), or `--leader-port` equal to
+`--port`, fails the start with a message; nothing is ever written into the motors to
+"fix" a mismatch.
+
+## Gamepad pairing
+
+Different pads report the same stick under different numbers, so the first time a pad is
+plugged in the program has to learn which number each control has. Open the Gamepad
+page: the drawn pad appears next to the arm, the control being asked for glows, the
+orange ghost arm shows what it will do, you move or press it on the real pad, the wizard
+records which axis or button that was and moves on. Ten steps: left stick forward /
+right, right stick forward / right, LT, RT, B, X, Start, Back. The result is one entry
+per pad in `Cartesian/gamepad_map.json` (not in git); a pad paired once is recognised
+next time. A control you already used is refused; *Pair again* starts over.
+
+To get the feel before touching the real arm, switch **Follower** to *Simulated arm*,
+enable Gamepad, and drive the simulation; the real arm is not written to.
+
+Buttons that move something act **only while held**: B/X on the pad and the page's
+*Open/Close gripper (hold)* buttons move the gripper at 60 %/s and stop the moment you
+let go. Nothing on the pad or the page commands "fully closed" in one press: a gripper
+told to close on an object keeps pushing, and on the real arm the command may lead the
+measured gripper by at most 10 % for that reason.
+
+The pad is read through the Linux joystick interface (`/dev/input/js*`, `gamepad.py`),
+no extra packages. Unplugging mid-way is detected; plugging in later is picked up.
 
 ## Real arm: the order of things
 
@@ -175,74 +248,6 @@ jq -c '[.t, .target.source, .err_mm.goal, .err_mm.meas, .lead_limited]' Cartesia
 jq -c 'select(.solve) | .solve' Cartesian/logs/latest/ticks.jsonl
 ```
 
-## Three ways to drive it: one page, one enabled at a time
-
-The **Mode** dropdown at the top of the sidebar picks which source the sidebar shows:
-its self-check status and its buttons, nothing else. Each has an *Enable* button.
-Nothing is enabled at start: the page shows the arm and that is all. Enable one and the
-other two show *waiting* until you disable it again. On the real arm, *Hold and follow*
-is refused until a source is enabled.
-
-* **Drag to move** — the ball, the sliders, the rings (above).
-* **Gamepad** — the layout is Interbotix's X-Series arm layout (a five-joint arm like
-  this one) with Xbox names: LT / RT turn the whole arm about its base, the left stick
-  moves the tool up/down and out/in along the arm, the right stick pitches and rolls it,
-  B / X open / close the gripper while held, Start / Back are *Hold and follow* / *Stop*.
-  The target moves in cylindrical terms (waist angle, reach, height) at up to 0.08 m/s
-  and 0.8 rad/s. The ball and sliders follow so you see what the pad is asking for. The
-  row says *No gamepad detected* until a pad is plugged in — pads are looked for once a
-  second (one directory listing, no measurable load), so plugging in after start works,
-  and so does swapping pads. A pad that has never been paired shows *not paired — run
-  gamepad_setup.py*; the pairing file keeps one entry per pad, so a pad paired once is
-  recognised next time. If the pad goes away while enabled, the mode drops back to none.
-* **Leader arm** — a second SO-101 moved by hand; its joints become the goal directly
-  (no solving), the ball jumps to where that lands, speed and lead limits still apply.
-  Give its port on the command line (`--leader-port /dev/ttyACM1`, plus `--leader-id`,
-  `--leader-calibration-dir calibration/leader`). The row can only be enabled once the
-  check passes: the port opens and its motors carry the leader's calibration (LeRobot's
-  `is_calibrated` compares the homing offsets and limits stored in the servos with the
-  calibration file). The check runs once at start and again whenever you press *Check
-  leader arm*, so a leader plugged in later, or a wrong port fixed, just needs the
-  button. A failing check greys the row out and says why; it never stops the program —
-  someone who only wants the gamepad is not held up by a leader arm.
-
-Switching never jumps: the target stays where it is until the new source moves it.
-In gamepad and leader modes the page only displays the target; the mouse does not set it.
-
-**What must work for the program to start at all**: the model, and — with `--port` — the
-follower arm: its port opens and its motors carry the follower calibration. A follower
-port that holds the leader's numbers (arms swapped), or `--leader-port` equal to
-`--port`, fails the start with a message; nothing is ever written into the motors to
-"fix" a mismatch.
-
-## Gamepad: pairing first
-
-```sh
-.venv/bin/python Cartesian/gamepad_setup.py --model-dir models/so101
-```
-
-Gamepad control is locked until a pad has been paired. The pairing page draws the pad
-next to the arm and asks for one control at a time: the control glows, the arm shows what
-it will do, you move or press it on the real pad, the wizard records which axis or button
-that was and moves on. Ten steps: left stick forward / right, right stick forward / right,
-LT, RT, A, B, Start, Back. The result is `Cartesian/gamepad_map.json` (per pad, not in
-git). A control you already used is refused; *Restart pairing* starts over.
-
-After the last step the page turns into a practice range: the simulated arm follows the
-pad exactly as the real arm will in `cartesian_control.py`, the control you are using
-glows on the drawn pad, and the panel explains what it does and where the tool target
-is. A pad that is already paired skips straight to practice (*Restart pairing* to pair
-it again).
-
-Buttons that move something act **only while held**: B/X on the pad and the page's
-*Open/Close gripper (hold)* buttons move the gripper at 60 %/s and stop the moment you
-let go. Nothing on the pad or the page commands "fully closed" in one press: a gripper
-told to close on an object keeps pushing, and on the real arm the command may lead the
-measured gripper by at most 10 % for that reason.
-
-The pad is read through the Linux joystick interface (`/dev/input/js*`, `gamepad.py`),
-no extra packages. Unplugging mid-way is detected; plugging in later is picked up.
-
 ## Tests
 
 ```sh
@@ -253,4 +258,4 @@ Covers FK against known poses, the parallel-axis and yaw facts above, `compose`/
 round trips (including the straight-down pose), solver convergence on reachable targets
 and its residual on unreachable ones, the planner's two clamps, the ring angle math, the
 calibration-to-limits conversion, the run log, and the full control loop with a fake arm
-(target walk, ring, hold/stop).
+(target walk, ring, hold/stop, follower switching, pairing inside the page).

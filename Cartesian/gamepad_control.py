@@ -17,7 +17,7 @@ is what a five-joint arm can actually do; pushing "left" in base-frame y would o
 make the solver turn the base anyway, so the pad turns it directly.
 
 Nothing here knows the pad's axis numbers; those come from `gamepad_map.json` written
-by gamepad_setup.py. Each tick the control loop asks `GamepadSource.read()` for rates
+by the pairing on the Gamepad page (gamepad_pairing.py). Each tick the control loop asks `GamepadSource.read()` for rates
 (-1..1) and button edges, then `integrate()` moves the current target by `speed x dt`.
 Sticks at rest change nothing, so the target only gets a new version when the user is
 actually pushing.
@@ -43,7 +43,7 @@ GRIPPER_SPEED_PCT_S = 60.0    # B / X move the gripper only while held: full tra
 PITCH_LIMIT_RAD = np.radians(120)   # keep the sliders' range; the arm cannot do more anyway
 MIN_REACH_M = 0.03            # the tool cannot be pulled onto the base axis; the solver would have no yaw to hold
 
-# What a pairing must contain to be usable (the steps in gamepad_setup.py write exactly these).
+# What a pairing must contain to be usable (the steps in gamepad_pairing.py write exactly these).
 AXIS_KEYS = ("move_z", "reach", "pitch", "roll", "waist_left", "waist_right")
 BUTTON_KEYS = ("gripper_open", "gripper_close", "hold", "stop")
 
@@ -109,6 +109,18 @@ class GamepadSource:
             return 0.0
         # rescale so the output starts from 0 right outside the deadzone
         return float(np.sign(v) * (abs(v) - DEADZONE) / (1.0 - DEADZONE))
+
+    def mirror(self) -> tuple[dict[str, float], dict[str, bool]]:
+        """Raw per-key values (sticks -1..1, triggers 0..1) and held buttons, for drawing the pad."""
+        axes, buttons = self.pad.snapshot()
+        values = {}
+        for key, e in self.axes.items():
+            if e["axis"] >= len(axes):
+                continue
+            v = axes[e["axis"]]
+            values[key] = (v - e["rest"]) / 2.0 if e["kind"] == "trigger" else (v - e["rest"]) * e["sign"]
+        held = {key: idx < len(buttons) and buttons[idx] for key, idx in self.buttons.items()}
+        return values, held
 
     def read(self) -> GamepadState:
         axes, buttons = self.pad.snapshot()
