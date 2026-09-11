@@ -454,6 +454,22 @@ def measure_following(args):
     if disagreeing:
         raise CheckFailed(f"Calibration disagrees on {', '.join(disagreeing)}.\n        "
                           + LESSON_7_CHECK)
+
+    # ⚠️ An unpowered SO-101 falls onto its stops and rests outside the model, which is where
+    # it is every time you walk up to it -- and this measurement moves each joint both ways, so
+    # it cannot run from there. Torque is off and the bus is closed at this point, so the arm is
+    # free to be moved by hand; the operator holds it somewhere it can move from and says when.
+    # ⛔ Read again afterwards. Whatever was read before they moved it is no longer true, and
+    # powering on against a stale pose is the 2026-09-08 incident.
+    print("Hold the arm in a middle pose with both hands -- shoulder about -60, elbow about 60,\n"
+          f"wrist about -30, every joint more than {MEASURE_EXCURSION_DEG:.0f} deg from either\n"
+          "end of its travel. Keep holding it, and press Enter.", flush=True)
+    input()
+    observation, powered, _registers = arm.read_before_power()
+    if powered:
+        raise CheckFailed(f"Torque came on while the arm was being moved: "
+                          f"{', '.join(powered)}.\n        Support the arm, then run:\n\n"
+                          + release_command(args))
     start = model.joint_degrees(observation)
     blocked = (model.joints_on_a_stop(observation, arm.robot.calibration)
                + model.joints_outside_the_model(start, limits))
@@ -462,8 +478,9 @@ def measure_following(args):
                           f"{MEASURE_EXCURSION_DEG:.0f} deg and back, so it will not start from "
                           "here:\n        " + "\n        ".join(blocked))
 
-    print(f"Measuring with P={args.p_coefficient}. Each joint moves "
-          f"{MEASURE_EXCURSION_DEG:.0f} deg and back, twice. Keep clear.\n", flush=True)
+    print(f"\nMeasuring with P={args.p_coefficient}. Each joint moves "
+          f"{MEASURE_EXCURSION_DEG:.0f} deg and back, twice. You can let go. Keep clear.\n",
+          flush=True)
     arm.hold(start)
     widest, rows = 0.0, []
     try:
