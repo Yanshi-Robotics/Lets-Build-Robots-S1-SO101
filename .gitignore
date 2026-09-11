@@ -19,3 +19,6 @@ Teleop/logs/
 
 # 第 9 课的摄像头配置：设备路径与画面方向跟着这一台实物和它的 USB 口走
 cameras.json
+
+# 笛卡尔控制程序每次运行写一个日志目录（run.log + ticks.jsonl），只留最近 30 次
+Cartesian/logs/
