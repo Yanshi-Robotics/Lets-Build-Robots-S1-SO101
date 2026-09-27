@@ -22,3 +22,22 @@ Cartesian/logs/
 
 # 手柄配对结果：轴号和键号跟着这一只手柄走
 Cartesian/gamepad_map.json
+
+# 一次性脚本与实验，用完即清；⛔ 别让 git add . 把它扫进来
+temp/
+
+# 读者可能把虚拟环境叫别的名字。README 教的是 .venv，
+# 但只写 .venv 的话，一个叫 venv 的目录会被 git add . 扫进来——6.6 G
+venv/
+env/
+
+# 各系统的资源管理器与编辑器留下的东西：换系统协作时最容易误提交
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+
+# 测试与打包产物
+.pytest_cache/
+*.egg-info/

@@ -1,0 +1,4 @@
+# 行尾一律 LF 进库。
+# Git for Windows 默认 core.autocrlf=true，clone 下来工作区会变成 CRLF；
+# 没有这一行，Windows 读者改一行再提交就可能把整个文件的行尾一起推上来，diff 炸成全红。
+* text=auto eol=lf
