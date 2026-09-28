@@ -7,6 +7,11 @@
                      every stage (see README, "Reading the logs")
     logs/latest -> the newest run
 
+`latest` is a symlink. Windows refuses to create one unless the account is an
+administrator or developer mode is on, so there it becomes `latest.txt` holding the
+directory name instead. The jq one-liners in the README read through the symlink and
+therefore only work on Linux and macOS.
+
 Old runs beyond KEEP_RUNS are deleted at start-up.
 """
 
@@ -42,20 +47,30 @@ class RunLog:
         stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         self.dir = root / f"{stamp}_{mode}"
         self.dir.mkdir()
-        latest = root / "latest"
+        latest, pointer = root / "latest", root / "latest.txt"
         if latest.is_symlink() or latest.exists():
             latest.unlink()
-        latest.symlink_to(self.dir.name)
+        try:
+            latest.symlink_to(self.dir.name)
+            pointer.unlink(missing_ok=True)   # in case an earlier run fell back to the file
+        except OSError:
+            # WinError 1314 without admin rights or developer mode. A text pointer keeps the
+            # information reachable; `_prune` skips it because it is not a directory.
+            pointer.write_text(self.dir.name + "\n", encoding="utf-8")
 
         self.log = logging.getLogger("cartesian")
         self.log.setLevel(logging.INFO)
         self.log.propagate = False
         fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-        for handler in (logging.FileHandler(self.dir / "run.log"), logging.StreamHandler()):
+        # encoding is explicit because event() uses ensure_ascii=False and the pairing wizard
+        # logs emoji: on Windows the locale encoding (cp1252 / cp936) cannot hold them and
+        # logging would print a UnicodeEncodeError traceback instead of the line.
+        for handler in (logging.FileHandler(self.dir / "run.log", encoding="utf-8"), logging.StreamHandler()):
             handler.setFormatter(fmt)
             self.log.addHandler(handler)
 
-        self._ticks = open(self.dir / "ticks.jsonl", "w", buffering=1)  # line buffered
+        # newline="" keeps one \n per record on every platform; Windows would write \r\n
+        self._ticks = open(self.dir / "ticks.jsonl", "w", buffering=1, encoding="utf-8", newline="")
         self._t0 = time.monotonic()
         self.event("run directory", path=str(self.dir))
 

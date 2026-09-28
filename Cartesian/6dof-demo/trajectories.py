@@ -146,7 +146,7 @@ def main(argv=None) -> int:
     p.add_argument("--output", type=Path, default=here / "trajectories.json")
     args = p.parse_args(argv)
     data = build(args.model_dir, args.panda_urdf)
-    args.output.write_text(json.dumps(data))
+    args.output.write_text(json.dumps(data), encoding="utf-8")
     print(f"{args.output}: clips {sorted(data['clips'])}, {len(next(iter(data['clips'].values()))['frames'])} frames each")
     return 0
 

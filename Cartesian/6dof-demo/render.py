@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import math
+import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -55,7 +56,7 @@ def main():
     parser.add_argument("--only", nargs="*", default=None, help="clip names to render (default: all)")
     args = parser.parse_args(sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else [])
     frames_root = args.frames_dir or (args.demo_dir / "frames")
-    trajectories = json.loads((args.demo_dir / "trajectories.json").read_text())
+    trajectories = json.loads((args.demo_dir / "trajectories.json").read_text(encoding="utf-8"))
 
     # ---- scene -------------------------------------------------------------------------
     bpy.ops.object.select_all(action="SELECT")
@@ -281,7 +282,8 @@ def main():
         poster = args.demo_dir / f"{name}-poster.png"
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(FPS), "-i", str(frames_dir / "%04d.png"),
                         "-c:v", "libwebp_anim", "-lossless", "0", "-q:v", "62", "-loop", "0", "-pix_fmt", "yuva420p", str(webp)], check=True)
-        subprocess.run(["cp", str(frames_dir / "0000.png"), str(poster)], check=True)
+        # shutil, not cp: there is no cp executable on Windows.
+        shutil.copyfile(frames_dir / "0000.png", poster)
         print(f"{name}: {len(list(indices))} frames -> {webp.stat().st_size // 1024} KB", flush=True)
         return [webp, poster]
 
@@ -460,7 +462,7 @@ def main():
             "assets": [{"name": p.stem, "file": p.name, "bytes": p.stat().st_size, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
                        for p in sorted(outputs)],
         }
-        (args.demo_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        (args.demo_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         print("wrote manifest.json", flush=True)
 
 

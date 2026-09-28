@@ -108,7 +108,7 @@ class Model:
         self.calibration_path = None
         if calibration_path is not None:
             self.calibration_path = Path(calibration_path)
-            calibration = json.loads(self.calibration_path.read_text())
+            calibration = json.loads(self.calibration_path.read_text(encoding="utf-8"))
             for name, half_deg in calibration_half_travel_deg(calibration).items():
                 if name == GRIPPER or name not in self.limits:
                     continue  # the gripper is not solved; its limits stay as the URDF says

@@ -20,10 +20,10 @@
 ## 仓库里有什么
 
 - **`Bringup/`**：`so101_bus_check.py` 读一条总线上的六台电机；`so101_calibrate.py` 记录每个关节的中位和活动范围。第 6 课用。
-- **`Cameras/`**：`so101_camera_check.py` 列出能出图的摄像头、给出各自该用的稳定路径，再把它们实时显示在一个本地网页上，认出哪台装在哪、把画面转正、存进 `cameras.json`；`check` 会先测出两台相机单开与同开的速率。`so101_policy_view.py` 接着把同样的实时画面按 ACT、π₀、π₀.₅、SmolVLA 各自的预处理显示出来。第 9 课用。
+- **`Cameras/`**：`so101_camera_check.py` 列出能出图的摄像头、给出各自该用的稳定路径，再把它们实时显示在一个本地网页上，认出哪台装在哪、把画面转正、存进 `cameras.json`；`check` 会先测出两台相机单开与同开的速率。`so101_policy_view.py` 接着把同样的实时画面按 ACT、π₀、π₀.₅、SmolVLA 各自的预处理显示出来。第 9 课用。Linux 能读到设备列表、给出每台相机的稳定路径；macOS 与 Windows 没有这个列表，`list` 改成逐个试相机序号（`--max-index` 决定试到几号），认哪台是哪台靠看画面。
 - **`Cartesian/`**：机械臂的笛卡尔控制，一个页面 <http://127.0.0.1:4602>。`cartesian_control.py` 显示机械臂，同一时间只让一种来源控制它：拖一个球（每个关节上还有一个可转的环）、配好对的手柄、或示教臂；加 `--model-only` 用模拟臂打开同一个页面。手柄第一次插上时在同一个页面里配对；页面上的 **Follower** 开关可以改为控制模拟臂而不是真臂。`fetch_model.py` 下载机械臂模型。其余文件是控制循环的各段（感知、目标、比较、求解、规划、执行），`Cartesian/README.md` 里有说明。第 8 课用。要在仓库根目录运行，它们按文件夹互相导入。
 - **`Teleop/`**：`so101_teleop_log.py` 打印两只臂的保护与校准寄存器、把两只臂对着读，并给 `lerobot-record` 录下的数据打分。遥操作本身仍然用官方的 `lerobot-teleoperate`。第 7 课用。
-- **`tests/`**：50 条测试，用假硬件跑 Bringup、Teleop、Cameras 的程序；Cartesian 的 31 条在 `Cartesian/test_cartesian.py`。
+- **`tests/`**：50 条测试，用假硬件跑 Bringup、Teleop、Cameras 的程序；Cartesian 的 38 条在 `Cartesian/test_cartesian.py`。
 - **`Teleop/logs/`**（不进 git）：诊断程序每次运行一份调试日志，只留最近 20 份，`lerobot-record` 录下的数据也放这里。出问题时把最新那份发出来。
 
 课程正文印着这些路径，所以这里的文件不会移动或改名。以后的任务各占一个新文件夹，例如 `ACT-1-Pick`。
@@ -32,22 +32,35 @@
 
 ## 安装
 
-Python 3.12 和 LeRobot 0.6.1，装在仓库根目录的虚拟环境里。命令顺序和第 3、7、8 课一样：
+Python 3.12 和 LeRobot 0.6.1，装在仓库根目录的虚拟环境里。命令顺序和第 3、7、8 课一样。建环境和激活环境是唯一按系统不同的一步：
+
+| 系统 | 建环境 | 激活 |
+|---|---|---|
+| Linux、macOS | `python3.12 -m venv .venv` | `source .venv/bin/activate` |
+| Windows 11 | `py -3.12 -m venv .venv` | `.\.venv\Scripts\Activate.ps1` |
+
+之后三个系统完全一样。每条命令都写成一行是有意的：PowerShell 续行用的是反引号而不是反斜杠，而反引号后面跟一个空格就会静默失效，所以这个仓库的长命令一律不折行。
 
 ```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install "lerobot[feetech]==0.6.1"
-python -m pip install "viser[urdf]==1.1.0" "lerobot[kinematics,feetech]==0.6.1" \
-  "cmeel-urdfdom==4.0.1" "cmeel-tinyxml2==10.0.0"
+python -m pip install "viser[urdf]==1.1.0" "lerobot[kinematics,feetech]==0.6.1" "cmeel-urdfdom==4.0.1" "cmeel-tinyxml2==10.0.0"
 python -m pip install "lerobot[core_scripts,feetech]==0.6.1"
 python -m pip check
 ```
 
-课程正文把激活这一步写成 `<ACTIVATE_ENV>`，两种环境管理器都能用。venv 代入 `source .venv/bin/activate`，Windows 11 代入 `.\.venv\Scripts\Activate.ps1`。conda 用 `conda create -n lerobot-s1 python=3.12` 建环境、`conda activate lerobot-s1` 激活，再跑同样几条 `pip install`。conda 没有在本课程实机验证过，真正要紧的是上面那些锁定版本。
+第 9 课要读手柄。Linux 用内核自带的 joystick 接口，不用另外装东西；macOS 与 Windows 通过 pygame 读，LeRobot 把它作为一个可选项发布，所以在那两个系统上补一条：
 
-`pip check` 输出 `No broken requirements found.` 就装好了。Linux 上默认的 torch 带 CUDA，整个环境约 6.6 GB；这一季后面训练的课会用到它。
+```bash
+python -m pip install "lerobot[gamepad,feetech]==0.6.1"
+```
+
+课程正文把激活这一步写成 `<ACTIVATE_ENV>`，两种环境管理器都能用。conda 用 `conda create -n lerobot-s1 python=3.12` 建环境、`conda activate lerobot-s1` 激活，再跑同样几条 `pip install`。conda 没有在本课程实机验证过，真正要紧的是上面那些锁定版本。
+
+`pip check` 输出 `No broken requirements found.` 就装好了。本课程在 Ubuntu 24.04 上实机验证过；macOS 与 Windows 的命令按上游文档和这些包实际发布的安装文件写，没有实机验证过。开始之前有两件与系统有关的事要知道：
+
+- 第 8 课在 Windows 上装不了。它的求解器 `placo` 和它依赖的五个 `cmeel-*` 包只发布 Linux 与 macOS 的安装文件，任何版本都没有 Windows 的。那一课用 WSL 2 或云主机，或者跳过——这一季后面没有任何内容依赖它。macOS 可以，Intel 和 Apple Silicon 都行。
+- Linux 上默认的 torch 带 CUDA，整个环境约 6.6 GB。Windows 上 `pip` 即使在装了 NVIDIA 显卡的机器上也会装成只有 CPU 的 torch（[lerobot#4093](https://github.com/huggingface/lerobot/issues/4093)），所以跑一下 `python -c "import torch; print(torch.cuda.is_available())"`，打印 `False` 就从 PyTorch 官方索引重装一次 torch。
 
 机械臂模型下载一次即可，来自 TheRobotStudio 的锁定版本：
 
@@ -61,10 +74,9 @@ python Cartesian/fetch_model.py --model-dir models/so101
 
 ## 运行程序
 
-所有命令都在仓库根目录执行。课程里 `models/so101`、`calibration/follower` 这类相对路径，只有在这里才成立。
+所有命令都在仓库根目录执行。课程里 `models/so101`、`calibration/follower` 这类相对路径，只有在这里才成立。先激活环境——Linux 与 macOS 是 `source .venv/bin/activate`，Windows 11 是 `.\.venv\Scripts\Activate.ps1`——然后：
 
 ```bash
-source .venv/bin/activate
 python Cartesian/cartesian_control.py --model-dir models/so101 --model-only
 ```
 
@@ -79,7 +91,7 @@ python Cartesian/test_cartesian.py --model-dir models/so101  # Cartesian 程序�
 
 两条都不打开串口。
 
-有三个文件夹被 git 忽略。`.venv/` 太大，也只对这一台机器有效；`calibration/` 记的是某一只机械臂的中位和活动范围，换一只就不对；`models/` 由上面的 `fetch_model.py` 命令下载。
+有几个路径被 git 忽略。`.venv/` 太大，也只对这一台机器有效；`calibration/` 记的是某一只机械臂的中位和活动范围，换一只就不对；`models/` 由上面的 `fetch_model.py` 命令下载；`cameras.json` 与 `Cartesian/gamepad_map.json` 记的是这一张工作台上的相机和这一只手柄。
 
 ---
 

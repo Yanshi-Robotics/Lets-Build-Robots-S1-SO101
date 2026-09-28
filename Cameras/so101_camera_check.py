@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import array
-import fcntl
 import json
 import os
 import struct
@@ -32,6 +31,23 @@ import sys
 import time
 from importlib.metadata import version
 from pathlib import Path
+
+IS_LINUX = sys.platform.startswith("linux")
+IS_MACOS = sys.platform == "darwin"
+IS_WINDOWS = sys.platform == "win32"
+
+# Windows only, and it has to happen before cv2 is imported anywhere in the process:
+# without it the MSMF backend spends 90+ seconds opening a camera. LeRobot carries the
+# same line for the same reason (cameras/opencv/camera_opencv.py, after issue #1368).
+if IS_WINDOWS:
+    os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
+
+# fcntl and the V4L2 ioctls below exist only on Linux. Importing fcntl at module level
+# would make this file, so101_policy_view.py (which imports it) and the whole of
+# tests/test_bringup.py (which loads it by path) fail to import on Windows before a
+# single line of any of them runs.
+if IS_LINUX:
+    import fcntl
 
 LEROBOT_VERSION = "0.6.1"
 COURSE_CAMERA_NAMES = ("top", "wrist")
@@ -41,6 +57,11 @@ ROTATIONS = (0, 90, 180, -90)
 
 CAPTURE_WIDTH, CAPTURE_HEIGHT = 640, 480  # The size LeRobot's SO-101 guides record at.
 CAPTURE_FPS, CAPTURE_FOURCC = 30, "MJPG"
+
+# How far `list` probes when there are no device paths to enumerate (macOS, Windows).
+# LeRobot scans 60; on Windows every probe opens and closes a DirectShow graph, which is
+# slow, and a course workbench has two or three cameras. --max-index raises it.
+DEFAULT_MAX_INDEX = 10
 
 # --- V4L2 device query -------------------------------------------------------------
 # VIDIOC_QUERYCAP is the only ioctl used here. It answers the two questions the numbers
@@ -54,9 +75,13 @@ V4L2_CAP_VIDEO_CAPTURE = 0x00000001
 def query_capability(node):
     """driver, card, bus_info and whether this node can capture video; None if it cannot be asked.
 
+    Linux only; the caller is expected to have checked. Returns None anywhere else.
+
     A node that exists but refuses the ioctl is reported as unknown rather than skipped:
     silently dropping a device would hide exactly the case an operator is looking for.
     """
+    if not IS_LINUX:
+        return None
     buffer = array.array("B", bytes(104))
     try:
         file = os.open(str(node), os.O_RDONLY | os.O_NONBLOCK)
@@ -93,7 +118,13 @@ def supported_sizes(node):
 
     Asked over ioctl rather than by trying `VideoCapture.set`, because set() silently
     settles for the nearest mode it likes and reports that back as if it were granted.
+
+    ⛔ Empty on macOS and Windows, and deliberately not faked by reading `set()` back:
+    a size list invented that way would offer sizes the camera cannot actually deliver.
+    The page then offers only the one size this course records at.
     """
+    if not IS_LINUX:
+        return []
     try:
         file = os.open(str(node), os.O_RDONLY | os.O_NONBLOCK)
     except OSError:
@@ -176,12 +207,45 @@ def preferred_path(node, links, *, model_is_duplicated):
     return node, "no stable link exists; this number changes when the camera is replugged"
 
 
-def survey():
+def survey_by_index(max_index):
+    """Cameras found by trying index numbers, for systems that have no device paths.
+
+    OpenCV offers no way to list cameras or read a camera's name — opencv/opencv#26888 is
+    still open and the example PR for it was declined — so a number is all there is, and
+    opening one is the only way to learn whether it delivers frames. That is why the course
+    identifies cameras by looking at the pictures rather than by reading a device list.
+    """
+    cameras, notes = [], []
+    for index in range(max_index):
+        if grab_one_frame(index) is None:
+            continue
+        cameras.append({
+            "node": f"index {index}",
+            "card": f"camera at index {index}",
+            "bus": None,
+            "path": index,
+            "duplicated": False,
+            "reason": "this system reports only this number, not a stable path; it can change when "
+                      "a camera is replugged or the computer restarts, so leave each camera in the "
+                      "socket it is in now",
+        })
+    if not cameras:
+        notes.append(f"tried index 0 to {max_index - 1}; pass --max-index to look further")
+    return cameras, notes
+
+
+def survey(*, max_index=DEFAULT_MAX_INDEX):
     """Every camera that can actually deliver frames, in a stable order, with its best path.
 
     Node-level detail is collected here but not printed by default: an operator choosing
     between two cameras needs one line per camera, not one line per /dev entry.
+
+    ⛔ The split is on the platform, not on "the V4L2 scan came back empty". Falling back
+    when it is empty would change what Linux does when no camera is plugged in: instead of
+    saying so and stopping, it would start opening index 0.
     """
+    if not IS_LINUX:
+        return survey_by_index(max_index)
     links, nodes = stable_links(), video_nodes()
     groups = {}
     for node, capability in nodes:
@@ -211,30 +275,6 @@ def survey():
     return cameras, notes
 
 
-def grab_one_frame(path):
-    """One frame from a camera, opened and closed again; None when it delivers nothing.
-
-    Cameras are opened one at a time here. Three at once can exceed what a shared USB
-    controller carries, and a failure to open would then look like a broken camera.
-    """
-    import cv2
-
-    capture = cv2.VideoCapture(str(path), cv2.CAP_V4L2)
-    if not capture.isOpened():
-        capture.release()
-        return None
-    try:
-        capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        # The first frames off a UVC camera are often stale or half exposed.
-        for _ in range(8):
-            received, frame = capture.read()
-        return frame if received else None
-    finally:
-        capture.release()
-
-
 DEFAULT_PORT = 4603  # Registered for this course tool; --port moves it.
 JPEG_QUALITY = 80
 
@@ -251,22 +291,61 @@ def encode_jpeg(frame):
     return buffer.tobytes() if encoded else None
 
 
+def capture_backends(cv2):
+    """The cv2 backends to try, in order, on this platform.
+
+    Windows gets three because which one works differs per machine: in lerobot#1368 one
+    reader could only open a camera through MSMF and two others only through DSHOW. Trying
+    them in turn beats asking a reader to guess. Along the way OpenCV's Orbbec probe prints
+    `obsensor ... index out of range` — noise, not a failure.
+    """
+    if IS_LINUX:
+        return (cv2.CAP_V4L2,)
+    if IS_MACOS:
+        return (cv2.CAP_AVFOUNDATION,)
+    if IS_WINDOWS:
+        return (cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY)
+    return (cv2.CAP_ANY,)
+
+
+def configure_capture(capture, cv2, width, height):
+    """FOURCC and frame size. The order differs on Windows and that is not cosmetic.
+
+    With DSHOW, changing the resolution after the FOURCC silently drops the FOURCC, so the
+    size is set first there. LeRobot's camera_opencv.py does the same for the same reason.
+    """
+    fourcc = cv2.VideoWriter_fourcc(*CAPTURE_FOURCC)
+    if IS_WINDOWS:
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        capture.set(cv2.CAP_PROP_FOURCC, fourcc)
+    else:
+        capture.set(cv2.CAP_PROP_FOURCC, fourcc)
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+
 def open_for_preview(path, *, width=None, height=None):
     """A camera opened at the given capture size, or None when something else holds it."""
     import cv2
 
-    capture = cv2.VideoCapture(str(path), cv2.CAP_V4L2)
-    if not capture.isOpened():
-        capture.release()
-        return None
-    capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    capture.set(cv2.CAP_PROP_FRAME_WIDTH, width or CAPTURE_WIDTH)
-    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height or CAPTURE_HEIGHT)
-    return capture
+    handle = path if isinstance(path, int) else str(path)
+    for backend in capture_backends(cv2):
+        capture = cv2.VideoCapture(handle, backend)
+        if not capture.isOpened():
+            capture.release()
+            continue
+        configure_capture(capture, cv2, width or CAPTURE_WIDTH, height or CAPTURE_HEIGHT)
+        return capture
+    return None
 
 
 def grab_one_frame(path):
-    """One frame from a camera, opened and closed again; None when it delivers nothing."""
+    """One frame from a camera, opened and closed again; None when it delivers nothing.
+
+    Cameras are opened one at a time here. Three at once can exceed what a shared USB
+    controller carries, and a failure to open would then look like a broken camera.
+    """
     capture = open_for_preview(path)
     if capture is None:
         return None
@@ -509,7 +588,11 @@ class PreviewState:
                 return None
             stream = self.streams[number - 1]
             width, height = size_for(*self.sensor, stream.rotation)
-            entries[name] = {"type": "opencv", "index_or_path": str(stream.camera["path"]),
+            # An index stays a number: LeRobot's OpenCVCamera takes either, and "0" as a
+            # string would be read back as a path that does not exist.
+            handle = stream.camera["path"]
+            entries[name] = {"type": "opencv",
+                             "index_or_path": handle if isinstance(handle, int) else str(handle),
                              "width": width, "height": height, "fps": self.fps,
                              "fourcc": self.fourcc, "rotation": stream.rotation}
         return entries
@@ -693,7 +776,7 @@ def start_streams(cameras, *, size=(CAPTURE_WIDTH, CAPTURE_HEIGHT)):
 
 
 def run_list(args):
-    cameras, notes = survey()
+    cameras, notes = survey(max_index=args.max_index)
     if not cameras:
         print("No camera delivers frames on this computer. Plug them in and run this again.")
         for note in notes:
@@ -710,7 +793,8 @@ def run_list(args):
     if args.verbose:
         print("\nWhy each path was chosen:")
         for number, camera in enumerate(cameras, 1):
-            print(f"  [{number}] {camera['node']} on {camera['bus']}: {camera['reason']}.")
+            where = f"{camera['node']} on {camera['bus']}" if camera["bus"] else camera["node"]
+            print(f"  [{number}] {where}: {camera['reason']}.")
         for note in notes:
             print(f"  {note}")
 
@@ -829,6 +913,13 @@ def verdict(cameras, results, buses):
     top_bus, wrist_bus = (buses.get(name) for name in COURSE_CAMERA_NAMES)
     if top_bus and wrist_bus and top_bus == wrist_bus:
         return "SAME CAMERA", f"both entries reach the same physical camera on {top_bus}"
+    # Without V4L2 there is no bus to compare, so the only case still detectable is the
+    # same handle written twice. ⛔ Keyed on the platform, not on "the bus came back None":
+    # on Linux a None means the path does not exist, and that has to stay CANNOT TELL.
+    if not IS_LINUX:
+        handles = [cameras[name]["path"] for name in COURSE_CAMERA_NAMES]
+        if handles[0] == handles[1]:
+            return "SAME CAMERA", f"both entries name the same camera ({handles[0]})"
     unread = [name for name in COURSE_CAMERA_NAMES if name not in results]
     if unread:
         return "CANNOT TELL", f"the {' and the '.join(unread)} camera could not be opened"
@@ -926,7 +1017,14 @@ def run_preview(cameras, *, port=DEFAULT_PORT, snapshot=None, save_path="cameras
 
 
 def bus_of(path):
-    """The USB socket behind a camera path, used to catch one camera entered twice."""
+    """The USB socket behind a camera path, used to catch one camera entered twice.
+
+    Linux only: bus_info comes from a V4L2 ioctl. Elsewhere `verdict` compares the handles
+    instead, which catches the mistake a reader actually makes but cannot tell two sockets
+    apart when the same camera is reached by two different numbers.
+    """
+    if not IS_LINUX:
+        return None
     node = Path(path)
     if not node.exists():
         return None
@@ -983,6 +1081,9 @@ def main(argv=None):
     listing = commands.add_parser("list", help="every camera that delivers frames, with one frame from each")
     listing.add_argument("--verbose", action="store_true", help="also print why each path was chosen")
     listing.add_argument("--cameras", default="cameras.json", help="where the page's Save button writes")
+    listing.add_argument("--max-index", type=int, default=DEFAULT_MAX_INDEX,
+                         help=f"on macOS and Windows, how many camera numbers to try (default {DEFAULT_MAX_INDEX}); "
+                              "ignored on Linux, which reads the device list instead")
     listing.add_argument("--snapshot", help="write one still per camera to this file instead of serving a page")
     listing.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"port for the viewing page (default {DEFAULT_PORT})")
     check = commands.add_parser("check", help="verify cameras.json, then show both views")

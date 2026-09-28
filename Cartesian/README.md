@@ -4,13 +4,19 @@ Open a page, drag a ball, the arm follows. Each joint also carries a ring you ca
 directly, the way MoveIt's interactive markers work in RViz. The same program drives the
 simulated arm or the real one.
 
+Linux and macOS only: the solver `placo` and the `cmeel-*` packages behind it publish no
+Windows wheel at any version, so this lesson cannot be installed there. Use WSL 2 or a
+cloud machine. The commands below use `.venv/bin/python`, which is the same on both
+supported systems; only the serial port is named differently — `/dev/ttyACM0` on Linux,
+`/dev/tty.usbmodem…` on macOS. Take the real value from `lerobot-find-port`.
+
 ```sh
 # simulated arm, no hardware
 .venv/bin/python Cartesian/cartesian_control.py --model-dir models/so101 --model-only
 
 # real arm (torque stays off until you press "Hold and follow" in the page)
-.venv/bin/python Cartesian/cartesian_control.py --model-dir models/so101 \
-    --port /dev/ttyACM0 --robot-id so101-follower --calibration-dir calibration/follower
+# one line on purpose: a backslash continues a command only in a POSIX shell
+.venv/bin/python Cartesian/cartesian_control.py --model-dir models/so101 --port /dev/ttyACM0 --robot-id so101-follower --calibration-dir calibration/follower
 ```
 
 Then open <http://127.0.0.1:4602>. The page only listens on localhost.
@@ -154,7 +160,8 @@ follow* is refused until a source is enabled.
   saying what it does. *Pair again* redoes the steps.
 * **Leader arm** — a second SO-101 moved by hand; its joints become the goal directly
   (no solving), the ball jumps to where that lands, speed and lead limits still apply.
-  Give its port on the command line (`--leader-port /dev/ttyACM1`, plus `--leader-id`,
+  Give its port on the command line (`--leader-port /dev/ttyACM1`, or the macOS
+  `/dev/tty.usbmodem…` form, plus `--leader-id`,
   `--leader-calibration-dir calibration/leader`). The row can only be enabled once the
   check passes: the port opens and its motors carry the leader's calibration (LeRobot's
   `is_calibrated` compares the homing offsets and limits stored in the servos with the

@@ -32,7 +32,7 @@ from pathlib import Path
 
 import numpy as np
 
-from gamepad import Gamepad
+from gamepad import Gamepad, current_backend
 from target import Target
 
 DEADZONE = 0.12               # sticks never rest at exactly zero
@@ -48,20 +48,37 @@ AXIS_KEYS = ("move_z", "reach", "pitch", "roll", "waist_left", "waist_right")
 BUTTON_KEYS = ("gripper_open", "gripper_close", "hold", "stop")
 
 
+def trigger_span(entry: dict) -> float:
+    """How far a trigger travels from resting to fully pulled, so that full becomes 1.0.
+
+    The Linux joystick interface reports a trigger as -1 at rest and +1 pulled, which is
+    where the 2.0 in the old code came from. SDL drivers are not all the same: some report
+    0 at rest. Deriving the span from the resting value handles both and keeps full pull at
+    exactly 1.0 — which matters, because the lesson states the base turns at 0.8 rad/s at
+    full trigger and that number is WAIST_SPEED_RAD_S multiplied by this output.
+    """
+    return max(1.0 - entry["rest"], 1e-6)
+
+
 def read_maps(path: Path) -> dict[str, dict]:
     """All pairings on file, keyed by the pad's device name. Missing file: none."""
     path = Path(path)
     if not path.exists():
         return {}
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     return data.get("pads", {})
 
 
 def write_map(path: Path, device: str, mapping: dict) -> None:
     """Add or replace one pad's pairing, keeping the others."""
     pads = read_maps(path)
-    pads[device] = {"axes": mapping["axes"], "buttons": mapping["buttons"]}
-    Path(path).write_text(json.dumps({"pads": pads}, indent=2, ensure_ascii=False) + "\n")
+    # The backend is read here rather than passed in: gamepad_pairing.py calls this and
+    # ⛔ that file must not change (its text is on screen in a recorded episode).
+    pads[device] = {"backend": current_backend(), "axes": mapping["axes"], "buttons": mapping["buttons"]}
+    # encoding is explicit and matters here: the key is the pad's own name, read from
+    # /sys on Linux or reported by SDL elsewhere, and ensure_ascii=False lets a non-ASCII
+    # name reach the file as it is.
+    Path(path).write_text(json.dumps({"pads": pads}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def load_map(path: Path, device: str) -> dict | None:
@@ -71,6 +88,11 @@ def load_map(path: Path, device: str) -> dict | None:
         return None
     if not all(k in mapping.get("axes", {}) for k in AXIS_KEYS) or not all(k in mapping.get("buttons", {}) for k in BUTTON_KEYS):
         return None   # paired under an older layout: pair again
+    # A map carries the backend it was made with. Absent means jsdev, which is what every
+    # map written before this field existed was — so a Linux reader keeps their pairing,
+    # while the same file carried to another system asks to be paired again.
+    if mapping.get("backend", "jsdev") != current_backend():
+        return None
     return mapping
 
 
@@ -102,7 +124,7 @@ class GamepadSource:
             return 0.0
         v = axes[e["axis"]]
         if e["kind"] == "trigger":
-            v = (v - e["rest"]) / 2.0            # -1..1 -> 0..1
+            v = (v - e["rest"]) / trigger_span(e)   # resting..full -> 0..1
         else:
             v = (v - e["rest"]) * e["sign"]
         if abs(v) < DEADZONE:
@@ -118,7 +140,8 @@ class GamepadSource:
             if e["axis"] >= len(axes):
                 continue
             v = axes[e["axis"]]
-            values[key] = (v - e["rest"]) / 2.0 if e["kind"] == "trigger" else (v - e["rest"]) * e["sign"]
+            values[key] = ((v - e["rest"]) / trigger_span(e) if e["kind"] == "trigger"
+                           else (v - e["rest"]) * e["sign"])
         held = {key: idx < len(buttons) and buttons[idx] for key, idx in self.buttons.items()}
         return values, held
 

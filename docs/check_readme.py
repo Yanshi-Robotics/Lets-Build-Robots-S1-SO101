@@ -19,7 +19,9 @@ EXTERNAL = ("http://", "https://", "#", "mailto:")
 
 def tracked_files():
     out = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
-    return set(out.split())
+    # splitlines, not split: a tracked file whose name contains a space would otherwise
+    # be torn into two entries that match nothing.
+    return set(out.splitlines())
 
 
 def check(path, tracked, failures):
@@ -46,7 +48,10 @@ def check(path, tracked, failures):
             continue
         resolved = (path.parent / target.split("#")[0]).resolve()
         try:
-            inside_repo = str(resolved.relative_to(ROOT))
+            # as_posix, not str: `git ls-files` prints forward slashes on every platform,
+            # so on Windows str() would give docs\i18n\zh\README.md and every single link
+            # in the README would be reported as untracked.
+            inside_repo = resolved.relative_to(ROOT).as_posix()
         except ValueError:
             failures.append(f"{rel}: link {target} leaves the repository")
             continue

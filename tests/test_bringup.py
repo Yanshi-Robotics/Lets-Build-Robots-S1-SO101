@@ -54,7 +54,7 @@ class BusReadTests(unittest.TestCase):
         bus.disconnect.assert_called_once_with(disable_torque=False)
 
     def test_no_register_writes_in_scan_source(self):
-        tree = ast.parse(Path(scan.__file__).read_text())
+        tree = ast.parse(Path(scan.__file__).read_text(encoding="utf-8"))
         called = {node.func.attr for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
         self.assertFalse(called & {"write", "sync_write", "enable_torque", "disable_torque", "configure", "write_calibration"})
 
@@ -153,7 +153,7 @@ class TeleopLogTests(unittest.TestCase):
     def test_diagnostics_never_write_a_motor_register(self):
         # The whole point of registers/compare is that they cannot move an arm. Teleoperation and
         # recording stay with the official tools, so no action is ever sent either.
-        tree = ast.parse(Path(teleop.__file__).read_text())
+        tree = ast.parse(Path(teleop.__file__).read_text(encoding="utf-8"))
         called = {node.func.attr for node in ast.walk(tree)
                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
         self.assertFalse(called & {"write", "sync_write", "enable_torque", "disable_torque", "configure",
