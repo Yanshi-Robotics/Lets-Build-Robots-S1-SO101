@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -488,19 +488,24 @@ class CameraCheckTests(unittest.TestCase):
         return {name: {"fps": fps, "identical": identical, "frames": frames,
                        "width": 1280, "height": 720} for name in ("top", "wrist")}
 
+    # preferred_path only ever runs on Linux, because /dev/v4l/by-id links exist nowhere else.
+    # ⛔ Its tests use PurePosixPath rather than Path: on a Windows runner Path("/dev/video9")
+    # becomes a WindowsPath and str() gives \dev\video9, which fails an assertion about logic
+    # that was never wrong. PurePosixPath keeps POSIX semantics on every host, so the Linux
+    # behaviour is what gets tested wherever the suite runs.
     def test_by_id_is_preferred_only_while_it_names_one_camera(self):
-        links = {"/dev/video4": [("by-id", Path("/dev/v4l/by-id/usb-Model-video-index0")),
-                                 ("by-path", Path("/dev/v4l/by-path/pci-0-usb-0:4.3:1.0-video-index0"))]}
-        alone, _ = cameras.preferred_path(Path("/dev/video4"), links, model_is_duplicated=False)
+        links = {"/dev/video4": [("by-id", PurePosixPath("/dev/v4l/by-id/usb-Model-video-index0")),
+                                 ("by-path", PurePosixPath("/dev/v4l/by-path/pci-0-usb-0:4.3:1.0-video-index0"))]}
+        alone, _ = cameras.preferred_path(PurePosixPath("/dev/video4"), links, model_is_duplicated=False)
         self.assertEqual(alone.parent.name, "by-id")
         # Two cameras of one model: udev keeps a single by-id link and it points at whichever
         # enumerated last, so the link that exists is the wrong thing to write down.
-        duplicated, reason = cameras.preferred_path(Path("/dev/video4"), links, model_is_duplicated=True)
+        duplicated, reason = cameras.preferred_path(PurePosixPath("/dev/video4"), links, model_is_duplicated=True)
         self.assertEqual(duplicated.parent.name, "by-path")
         self.assertIn("serial", reason)
 
     def test_a_camera_with_no_link_at_all_reports_the_bare_number_as_unstable(self):
-        path, reason = cameras.preferred_path(Path("/dev/video9"), {}, model_is_duplicated=False)
+        path, reason = cameras.preferred_path(PurePosixPath("/dev/video9"), {}, model_is_duplicated=False)
         self.assertEqual(str(path), "/dev/video9")
         self.assertIn("changes when the camera is replugged", reason)
 
