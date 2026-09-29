@@ -8,7 +8,7 @@ Linux and macOS only: the solver `placo` and the `cmeel-*` packages behind it pu
 Windows wheel at any version, so this lesson cannot be installed there. Use WSL 2 or a
 cloud machine. The commands below use `.venv/bin/python`, which is the same on both
 supported systems; only the serial port is named differently — `/dev/ttyACM0` on Linux,
-`/dev/tty.usbmodem…` on macOS. Take the real value from `lerobot-find-port`.
+`/dev/cu.usbmodem…` on macOS — the callout node, which is what the port listing prints. Take the real value from `lerobot-find-port`, or on macOS from `python -m serial.tools.list_ports usb -v`.
 
 ```sh
 # simulated arm, no hardware
@@ -161,7 +161,7 @@ follow* is refused until a source is enabled.
 * **Leader arm** — a second SO-101 moved by hand; its joints become the goal directly
   (no solving), the ball jumps to where that lands, speed and lead limits still apply.
   Give its port on the command line (`--leader-port /dev/ttyACM1`, or the macOS
-  `/dev/tty.usbmodem…` form, plus `--leader-id`,
+  `/dev/cu.usbmodem…` form, plus `--leader-id`,
   `--leader-calibration-dir calibration/leader`). The row can only be enabled once the
   check passes: the port opens and its motors carry the leader's calibration (LeRobot's
   `is_calibrated` compares the homing offsets and limits stored in the servos with the
