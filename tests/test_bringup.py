@@ -32,6 +32,7 @@ def load(name, path):
 
 scan = load("bus_check", ROOT / "Bringup/so101_bus_check.py")
 calibrate = load("calibrate_entry", ROOT / "Bringup/so101_calibrate.py")
+release = load("release_torque", ROOT / "Bringup/so101_release_torque.py")
 teleop = load("teleop_log", ROOT / "Teleop/so101_teleop_log.py")
 cameras = load("camera_check", ROOT / "Cameras/so101_camera_check.py")
 sys.modules["so101_camera_check"] = cameras
@@ -465,6 +466,80 @@ class PolicyViewTests(unittest.TestCase):
         self.assertIn("GR00T", policy_view.NOT_DRAWN)
         listed = {policy["id"] for policy in policy_view.POLICIES}
         self.assertEqual(listed, {"act", "pi0", "pi05", "smolvla"})
+
+
+class ReleaseTorqueTests(unittest.TestCase):
+    """Releasing torque on a bus where a motor answers with an error bit set.
+
+    This is the case LeRobot's own disconnect cannot handle: it disables torque motor by
+    motor and raises on the first error byte, leaving everything after it powered.
+    """
+
+    class FakeBus:
+        """A six-motor bus. `flags` sets a status byte per id; `silent` ids never answer."""
+
+        def __init__(self, flags=None, silent=(), stuck=()):
+            self.model_ctrl_table = {}
+            self.motors = {name: SimpleNamespace(id=index)
+                           for index, name in enumerate(release.JOINT_NAMES, 1)}
+            self.flags = flags or {}
+            self.silent = set(silent)
+            self.stuck = set(stuck)          # ids whose torque never actually goes off
+            self.torque = {index: 1 for index in range(1, 7)}
+            self.writes = []
+            self.disconnected_with = None
+
+        def _write(self, addr, length, id_, value, num_retry=0, raise_on_error=True):
+            self.writes.append((id_, value))
+            if id_ not in self.stuck:
+                self.torque[id_] = value
+
+        def _read(self, addr, length, id_, num_retry=0, raise_on_error=True):
+            if id_ in self.silent:
+                return 0, 1, 0                       # non-zero comm code = failure
+            return (self.flags.get(id_, 0) if addr == "status" else self.torque[id_]), 0, 0
+
+        def _is_comm_success(self, comm):
+            return comm == 0
+
+        def disconnect(self, disable_torque=True):
+            self.disconnected_with = disable_torque
+
+    @staticmethod
+    def get_address(_table, _model, field):
+        return ("status" if field == "Status" else "torque"), 1
+
+    def test_every_motor_is_released_even_when_one_reports_overload(self):
+        bus = self.FakeBus(flags={2: 32})            # shoulder_lift latched Overload
+        lines = []
+        still_on = release.release_bus(bus, self.get_address, output=lines.append)
+        self.assertEqual(still_on, [])
+        # ⛔ The point of the whole program: ids 3-6 are written too, which is what
+        # LeRobot's disconnect fails to do once id 2 raises.
+        self.assertEqual([id_ for id_, value in bus.writes], [1, 2, 3, 4, 5, 6])
+        self.assertTrue(all(value == 0 for _, value in bus.writes))
+        self.assertIn("overload", "\n".join(lines))
+
+    def test_a_motor_that_does_not_answer_is_reported_rather_than_assumed_off(self):
+        bus = self.FakeBus(silent={4})
+        still_on = release.release_bus(bus, self.get_address, output=lambda _line: None)
+        self.assertEqual(still_on, ["wrist_flex"])
+
+    def test_a_motor_still_reporting_torque_on_is_not_counted_as_released(self):
+        bus = self.FakeBus(stuck={6})
+        still_on = release.release_bus(bus, self.get_address, output=lambda _line: None)
+        self.assertEqual(still_on, ["gripper"])
+
+    def test_several_error_bits_are_all_named(self):
+        self.assertEqual(release.describe_flags(0), "none")
+        self.assertEqual(release.describe_flags(1 | 32), "voltage,overload")
+
+    def test_the_source_writes_only_the_torque_register(self):
+        """A course tool that claims to touch one register has to be checked, not trusted."""
+        source = (ROOT / "Bringup/so101_release_torque.py").read_text(encoding="utf-8")
+        writes = [line for line in source.splitlines() if "._write(" in line and not line.strip().startswith("#")]
+        self.assertEqual(len(writes), 1)
+        self.assertIn("torque_addr", writes[0])
 
 
 class CameraCheckTests(unittest.TestCase):
