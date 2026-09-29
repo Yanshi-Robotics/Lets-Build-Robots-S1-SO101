@@ -23,6 +23,14 @@ Cartesian/logs/
 # 手柄配对结果：轴号和键号跟着这一只手柄走
 Cartesian/gamepad_map.json
 
+# 第 13 课 lerobot-record 录出来的数据集：一条 45 秒的回合两路 480×640 视频，
+# 50 条就是几个 G。跟着这一台实物和这一次布置走，重录就变了
+datasets/
+
+# 第 14 课 lerobot-train 的训练产物：每个 checkpoint 约 200 MB，
+# save_freq=5000 跑满 10 万步就是 20 个 = 4 G
+outputs/
+
 # 一次性脚本与实验，用完即清；⛔ 别让 git add . 把它扫进来
 temp/
 
