@@ -57,25 +57,21 @@ jobs:
             label: Linux · Ubuntu 24.04
             shell: bash
             # Lesson 8's solver publishes no Windows wheel, so it installs on two of three.
+            # Its control-loop tests used to run on one runner only: they drove a real 100 Hz
+            # thread and slept on the wall clock, so what they measured depended on how much
+            # CPU that thread was given, and the macOS runner failed four assertions about
+            # distance travelled for that reason alone. ControlLoop and RunLog now take an
+            # injectable clock and the tests drive a virtual one in lockstep, so they give the
+            # same answer on any machine and run wherever the solver installs.
             install_cartesian: true
-            # Its control-loop tests run a real 100 Hz thread and sleep in wall-clock time, so
-            # what they measure depends on how much CPU the runner gives that thread. They are
-            # stable here and were not on the macOS runner, which ran the loop at roughly a
-            # quarter rate and failed four assertions about distance travelled — a property of
-            # the test, not of the program. Making them deterministic means giving ControlLoop
-            # an injectable clock; until that is done they run on one runner rather than being
-            # marked continue-on-error, which would report green while proving nothing.
-            test_cartesian: true
           - os: macos-15
             label: macOS · zsh
             shell: bash
             install_cartesian: true
-            test_cartesian: false
           - os: windows-2025
             label: Windows 11 · PowerShell
             shell: pwsh
             install_cartesian: false
-            test_cartesian: false
     defaults:
       run:
         shell: ${{ matrix.shell }}
@@ -154,7 +150,7 @@ jobs:
         run: |
           . .venv/bin/activate
           python Cartesian/test_cartesian.py --model-dir models/so101
-        if: matrix.test_cartesian
+        if: matrix.install_cartesian
 
       - name: README limits
         run: |

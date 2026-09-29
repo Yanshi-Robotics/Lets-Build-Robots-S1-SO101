@@ -40,7 +40,11 @@ def _round(value):
 
 
 class RunLog:
-    def __init__(self, root: Path, mode: str):
+    # `clock` exists so the tick timestamps come from the same clock the control loop runs on.
+    # ⛔ Without it a test that gives ControlLoop a virtual clock still gets wall-clock `t`
+    # values in the log, and any filter written as "ticks before t0 + 0.45s" silently matches
+    # the whole run. Default is the real one; nothing changes when running for real.
+    def __init__(self, root: Path, mode: str, clock=time.monotonic):
         root = Path(root)
         root.mkdir(parents=True, exist_ok=True)
         self._prune(root)
@@ -71,7 +75,8 @@ class RunLog:
 
         # newline="" keeps one \n per record on every platform; Windows would write \r\n
         self._ticks = open(self.dir / "ticks.jsonl", "w", buffering=1, encoding="utf-8", newline="")
-        self._t0 = time.monotonic()
+        self._clock = clock
+        self._t0 = clock()
         self.event("run directory", path=str(self.dir))
 
     @staticmethod
@@ -96,7 +101,7 @@ class RunLog:
         self.log.exception(message)
 
     def tick(self, record: dict) -> None:
-        record = {"t": round(time.monotonic() - self._t0, 4), **_round(record)}
+        record = {"t": round(self._clock() - self._t0, 4), **_round(record)}
         self._ticks.write(json.dumps(record) + "\n")
 
     def close(self) -> None:

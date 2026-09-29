@@ -88,7 +88,15 @@ def parse_args(argv=None) -> argparse.Namespace:
 class ControlLoop:
     def __init__(self, model: Model, solver: Solver, real_arm, limits: planner.Limits, hz_live: float, hz_model: float,
                  targets: TargetBox, commands: CommandBox, viewer: Viewer, log: RunLog,
-                 gamepad_map_path: Path | None = None, leader_factory=None, bounds=None):
+                 gamepad_map_path: Path | None = None, leader_factory=None, bounds=None,
+                 clock=time.monotonic, sleep=time.sleep):
+        # The loop reads the clock and sleeps through these two, so a test can hand it a
+        # virtual clock instead of the wall one. ⭐ That is what makes the control-loop tests
+        # give the same answer on a fast machine and a slow shared CI runner: with the wall
+        # clock, what the loop achieves in 1.8 s depends on how much CPU the thread was
+        # given, and four assertions about distance travelled failed on the macOS runner for
+        # that reason alone. ⛔ Defaults are the real ones; nothing changes when running for real.
+        self.clock, self.sleep = clock, sleep
         self.model, self.solver, self.limits = model, solver, limits
         # Two arms the sources can drive: the real one (only with --port) and a simulated one.
         # The simulated one starts wherever the real one is, so switching over does not jump.
@@ -245,9 +253,9 @@ class ControlLoop:
         self._check_leader()   # once at start; the page's button retries
 
         tick = 0
-        t_prev = time.monotonic()
+        t_prev = self.clock()
         while not self._stop.is_set():
-            t0 = time.monotonic()
+            t0 = self.clock()
             arm = self.arm
             record: dict = {"tick": tick, "period_ms": (t0 - t_prev) * 1000.0}
             t_prev = t0
@@ -255,7 +263,7 @@ class ControlLoop:
 
             # 1. sense
             q_meas = q_from_deg(arm.read_deg())
-            t1 = time.monotonic()
+            t1 = self.clock()
 
             # 2. target: buttons, a dragged ring, or the box
             joint_cmd, buttons = self.commands.drain()
@@ -360,7 +368,7 @@ class ControlLoop:
             target, version, source = self.targets.snapshot()
 
             # 3+4. compare and solve, only when the target changed
-            t2 = time.monotonic()
+            t2 = self.clock()
             if version != last_version:
                 solution = solver.solve(q_cmd, target)
                 q_goal = solution.q_goal
@@ -371,7 +379,7 @@ class ControlLoop:
                                    "roll_err_deg": math.degrees(solution.error.roll_rad)}
                 if not solution.converged:
                     log.warning("target not reached by solver", source=source, target=target.__dict__, **record["solve"])
-            t3 = time.monotonic()
+            t3 = self.clock()
 
             # 5. plan
             if following:
@@ -385,12 +393,12 @@ class ControlLoop:
                 if np.any(np.abs(q_meas[:5] - last_synced_q[:5]) > ARM_MOVED_RAD) or tick == 0:
                     last_version, target = self._sync_from(q_meas, "arm")
                     last_synced_q = q_meas.copy()
-            t4 = time.monotonic()
+            t4 = self.clock()
 
             # 6. execute
             if following:
                 arm.send_deg(deg_from_q(q_cmd))
-            t5 = time.monotonic()
+            t5 = self.clock()
 
             # what the eyes and the log get
             goal_err = solution.error if solution is not None else error(model, q_goal, target)
@@ -415,9 +423,9 @@ class ControlLoop:
             log.tick(record)
             tick += 1
 
-            remaining = dt - (time.monotonic() - t0)
+            remaining = dt - (self.clock() - t0)
             if remaining > 0:
-                time.sleep(remaining)
+                self.sleep(remaining)
 
     def _status(self, following, target, goal_err, cmd_err, meas_err, q_meas, record) -> str:
         if self.live:

@@ -10,6 +10,7 @@ import json
 import math
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -253,6 +254,89 @@ class FakeLiveArm(FakeArm):
 
 
 class ControlLoopTests(unittest.TestCase):
+    class TestClock:
+        """A monotonic clock the control loop and the test advance in lockstep.
+
+        ⛔ Why this exists rather than sleeping on the wall clock: the loop runs a real
+        100 Hz thread, so how far it gets in 1.8 s of wall time depends on how much CPU that
+        thread was given. On the macOS CI runner it got about a quarter of the rate and four
+        assertions about distance travelled failed — the program was fine, the measurement
+        was not. Here the loop may only run up to the instant the test has granted, so the
+        same run produces the same numbers on any machine, as fast as the CPU allows.
+
+        The loop reads the clock many times per tick and sleeps once at the end of one, so
+        one sleep is one tick of virtual time.
+        """
+
+        # ⚠️ Virtual time accumulates one dt at a time, so the two comparisons below need a
+        # tolerance: without it the loop's next target lands a hair above the instant the test
+        # granted and both sides wait for each other. A microsecond is far under any interval
+        # this loop deals in (a tick is 10 ms) and far over the accumulated float error.
+        EPS = 1e-6
+
+        # Starts away from zero, as a real monotonic clock does: the loop compares `now`
+        # against fields initialised to 0.0 (the gamepad poll stamp), and starting at zero
+        # would quietly change which branch runs on the first tick. ⛔ Not 1e6 either —
+        # adding 0.01 to a number that large throws away the precision this needs.
+        def __init__(self, start=1000.0):
+            self.start = start
+            self._t = start
+            self._granted = start
+            self._released = False
+            self._cv = threading.Condition()
+
+        def now(self):
+            with self._cv:
+                return self._t
+
+        def sleep(self, seconds):
+            """The loop's own sleep. It blocks until the test grants that much virtual time."""
+            with self._cv:
+                target = self._t + max(seconds, 0.0)
+                while not self._released and target > self._granted + self.EPS:
+                    if not self._cv.wait(timeout=30.0):
+                        raise AssertionError("the test never granted more virtual time")
+                self._t = target
+                self._cv.notify_all()
+
+        def run_to(self, instant, timeout=60.0):
+            """Let the loop run up to `instant` (seconds from start) and wait until it is there."""
+            goal = self.start + instant
+            deadline = time.monotonic() + timeout
+            with self._cv:
+                self._granted = max(self._granted, goal)
+                self._cv.notify_all()
+                while self._t < goal - self.EPS:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not self._cv.wait(timeout=remaining):
+                        raise AssertionError(
+                            f"the control loop stalled at t={self._t - self.start:.3f}s "
+                            f"while the test waited for t={instant:.3f}s")
+
+        def release(self):
+            """Stop holding the loop back, so stop() can join the thread."""
+            with self._cv:
+                self._released = True
+                self._cv.notify_all()
+
+    def test_the_real_clock_is_what_the_program_runs_on(self):
+        """Every other test here hands the loop a virtual clock, so this one guards the default.
+
+        ⛔ Without it, someone could make the injected clock mandatory, or point the default at
+        the virtual one, and every test would still pass while the shipped program no longer
+        slept between ticks.
+        """
+        from cartesian_control import ControlLoop
+        m = model()
+        loop = ControlLoop(m, Solver(m), None, planner.Limits(
+            max_speed=np.array([2.0] * 5 + [150.0]), max_lead=np.array([math.radians(15)] * 5 + [100.0])),
+            100.0, 100.0, TargetBox(m.target_from_q(q_from_deg(FakeArm().read_deg()))), CommandBox(),
+            NullViewer(), RunLog(Path(tempfile.mkdtemp()), "defaults"))
+        self.assertIs(loop.clock, time.monotonic)
+        self.assertIs(loop.sleep, time.sleep)
+        # The log stamps its ticks from the same clock, and by default that is the real one too.
+        self.assertIs(RunLog(Path(tempfile.mkdtemp()), "defaults")._clock, time.monotonic)
+
     def run_loop(self, arm, seconds, actions, gamepad=None, pad=None, leader=None, mode=MODE_DRAG, map_path=None):
         """arm: a FakeLiveArm standing in for the real one, or None for simulation only.
         actions: list of (time_offset_s, callable(targets, commands))."""
@@ -267,16 +351,20 @@ class ControlLoopTests(unittest.TestCase):
         viewer = NullViewer()
         viewer.mode = mode
         tmp = tempfile.mkdtemp()
-        log = RunLog(Path(tmp), "test")
+        clock = self.TestClock()
+        # ⭐ Same clock for the log: the tests filter ticks by the `t` they recorded.
+        log = RunLog(Path(tmp), "test", clock=clock.now)
         loop = ControlLoop(m, s, arm, limits, 100.0, 100.0, targets, commands, viewer, log,
-                           gamepad_map_path=map_path, leader_factory=(lambda: leader) if leader else None)
+                           gamepad_map_path=map_path, leader_factory=(lambda: leader) if leader else None,
+                           clock=clock.now, sleep=clock.sleep)
         loop.pad, loop.gamepad = pad, gamepad     # an already-open, paired pad, as hot-plug would leave it
         loop.start()
-        t0 = time.monotonic()
+        # Each action lands at a tick boundary, with the loop held at exactly that instant.
         for offset, action in actions:
-            time.sleep(max(0.0, t0 + offset - time.monotonic()))
+            clock.run_to(offset)
             action(targets, commands)
-        time.sleep(max(0.0, t0 + seconds - time.monotonic()))
+        clock.run_to(seconds)
+        clock.release()          # ⛔ before stop(), or the loop is still waiting and join times out
         loop.stop()
         log.close()
         self.assertTrue(loop.thread.is_alive() is False)
