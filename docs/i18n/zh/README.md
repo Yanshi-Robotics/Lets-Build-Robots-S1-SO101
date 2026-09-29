@@ -57,7 +57,7 @@ python -m pip install "lerobot[gamepad,feetech]==0.6.1"
 
 课程正文把激活这一步写成 `<ACTIVATE_ENV>`，两种环境管理器都能用。conda 用 `conda create -n lerobot-s1 python=3.12` 建环境、`conda activate lerobot-s1` 激活，再跑同样几条 `pip install`。conda 没有在本课程实机验证过，真正要紧的是上面那些锁定版本。
 
-`pip check` 输出 `No broken requirements found.` 就装好了。本课程在 Ubuntu 24.04 上实机验证过；macOS 与 Windows 的命令按上游文档和这些包实际发布的安装文件写，没有实机验证过。开始之前有两件与系统有关的事要知道：
+GitHub Actions 在每次推送后都把上面这套安装步骤和测试在 Ubuntu 24.04、macOS 与 Windows 11 上各跑一遍，每个系统用它自己的终端，所以三条路是验过的、不是推出来的；另有一个作业专门核对第 8 课那几个包是否仍然只发布本节说的那几种安装文件。`pip check` 输出 `No broken requirements found.` 就装好了。本课程在 Ubuntu 24.04 上实机验证过；macOS 与 Windows 的命令按上游文档和这些包实际发布的安装文件写，没有实机验证过。开始之前有两件与系统有关的事要知道：
 
 - 第 8 课在 Windows 上装不了。它的求解器 `placo` 和它依赖的五个 `cmeel-*` 包只发布 Linux 与 macOS 的安装文件，任何版本都没有 Windows 的。那一课用 WSL 2 或云主机，或者跳过——这一季后面没有任何内容依赖它。macOS 可以，Intel 和 Apple Silicon 都行。
 - Linux 上默认的 torch 带 CUDA，整个环境约 6.6 GB。Windows 上 `pip` 即使在装了 NVIDIA 显卡的机器上也会装成只有 CPU 的 torch（[lerobot#4093](https://github.com/huggingface/lerobot/issues/4093)），所以跑一下 `python -c "import torch; print(torch.cuda.is_available())"`，打印 `False` 就从 PyTorch 官方索引重装一次 torch。

@@ -1,0 +1,171 @@
+# The course claims its programs run on Linux, macOS and Windows. This runs the install
+# sequence from README.md in each system's own shell and then runs the tests, so the claim
+# is checked rather than argued. Only Linux is hardware-validated; CI covers the software.
+#
+# Upstream LeRobot has fourteen workflows and none of them use a macOS or Windows runner,
+# so its security conventions are followed here but its matrix is not a model to copy:
+# every action is pinned to a full commit SHA, the default token gets no permissions, and
+# checkout does not leave credentials on disk.
+name: Three operating systems
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      debug_session:
+        description: Open an SSH session on the runner when a job fails
+        type: boolean
+        default: false
+
+# No job needs to read or write anything in the repository beyond the checkout itself.
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # What the course says about package availability is a claim about the outside world, so
+  # it is asserted here. If placo ever publishes a Windows wheel this job goes red, which is
+  # the signal to rewrite Lesson 8 rather than leave a stale "cannot be installed" in it.
+  wheel-availability:
+    name: Wheels exist where Lesson 8 says they do
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - run: python tests/check_wheel_platforms.py
+
+  course-programs:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      # One system failing must not hide the state of the other two: the whole point of this
+      # workflow is to see all three verdicts at once.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            label: Linux · Ubuntu 24.04
+            shell: bash
+            # Lesson 8's solver publishes no Windows wheel, so its tests run on two of three.
+            cartesian: true
+          - os: macos-15
+            label: macOS · zsh
+            shell: bash
+            cartesian: true
+          - os: windows-2025
+            label: Windows 11 · PowerShell
+            shell: pwsh
+            cartesian: false
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      # The install steps below are deliberately written the way README.md writes them,
+      # including the activation line, so PowerShell itself checks the syntax the course
+      # teaches. A backslash continuation or a `source` on Windows would fail right here.
+      - name: Create and activate the environment the way the course does
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+        if: matrix.shell == 'bash'
+
+      - name: Create and activate the environment the way the course does
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\Activate.ps1
+          python -m pip install --upgrade pip
+        if: matrix.shell == 'pwsh'
+
+      # Lessons 3 and 7 install these; Lesson 9 adds the gamepad extra on macOS and Windows.
+      # Each line is one line on purpose: PowerShell continues with a backtick, not a
+      # backslash, and a backtick followed by a space stops continuing without saying so.
+      - name: Install what Lessons 3, 7 and 9 install
+        run: |
+          . .venv/bin/activate
+          python -m pip install "lerobot[core_scripts,gamepad,feetech]==0.6.1"
+          python -m pip check
+        if: matrix.shell == 'bash'
+
+      - name: Install what Lessons 3, 7 and 9 install
+        run: |
+          .\.venv\Scripts\Activate.ps1
+          python -m pip install "lerobot[core_scripts,gamepad,feetech]==0.6.1"
+          python -m pip check
+        if: matrix.shell == 'pwsh'
+
+      - name: Install what Lesson 8 installs
+        run: |
+          . .venv/bin/activate
+          python -m pip install "viser[urdf]==1.1.0" "lerobot[kinematics,feetech]==0.6.1" "cmeel-urdfdom==4.0.1" "cmeel-tinyxml2==10.0.0"
+          python -m pip check
+        if: matrix.cartesian
+
+      - name: Bringup, Teleop and Cameras tests
+        run: |
+          . .venv/bin/activate
+          python tests/test_bringup.py
+        if: matrix.shell == 'bash'
+
+      - name: Bringup, Teleop and Cameras tests
+        run: |
+          .\.venv\Scripts\Activate.ps1
+          python tests/test_bringup.py
+        if: matrix.shell == 'pwsh'
+
+      - name: Cartesian tests
+        run: |
+          . .venv/bin/activate
+          python Cartesian/fetch_model.py --model-dir models/so101
+          python Cartesian/test_cartesian.py --model-dir models/so101
+        if: matrix.cartesian
+
+      - name: README limits
+        run: |
+          . .venv/bin/activate
+          python docs/check_readme.py
+        if: matrix.os == 'ubuntu-24.04'
+
+      # Four locks on the debug session, because it is a shell on a machine holding a
+      # checkout of this repository: it is off unless the run was started by hand with the
+      # box ticked, it only opens on a failure, only the person who started the run can
+      # connect, and it closes itself after fifteen minutes.
+      - name: Debug session
+        if: ${{ failure() && github.event_name == 'workflow_dispatch' && inputs.debug_session }}
+        uses: mxschmitt/action-tmate@35b54afac29c97fb54faba5b513f8fbd1882f113 # v3
+        timeout-minutes: 15
+        with:
+          limit-access-to-actor: true
+
+  # Audits the workflow files themselves; the same tool upstream LeRobot runs.
+  workflow-audit:
+    name: Workflow security audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install zizmor
+      - run: zizmor --persona=pedantic .github/workflows
