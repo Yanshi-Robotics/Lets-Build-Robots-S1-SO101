@@ -475,9 +475,14 @@ class CameraCheckTests(unittest.TestCase):
     """
 
     def configured(self, **overrides):
-        entry = {"path": "/dev/video0", "width": 1280, "height": 720,
-                 "fps": 30, "fourcc": "MJPG", "rotation": 0}
-        return {name: {**entry, **overrides.get(name, {})} for name in ("top", "wrist")}
+        # ⛔ The two entries must hold different handles. They used to share one, because on
+        # Linux the bus map below is what tells the cameras apart and the handle did not
+        # matter. Off Linux there is no bus, so verdict() compares handles — and two equal
+        # handles are SAME CAMERA, which is correct behaviour that swallowed four rate tests
+        # on the macOS and Windows runners. Distinct handles keep each test on its subject.
+        entry = {"width": 1280, "height": 720, "fps": 30, "fourcc": "MJPG", "rotation": 0}
+        paths = {"top": "/dev/video0", "wrist": "/dev/video2"}
+        return {name: {**entry, "path": paths[name], **overrides.get(name, {})} for name in ("top", "wrist")}
 
     def measured(self, fps=30.0, identical=0, frames=90):
         return {name: {"fps": fps, "identical": identical, "frames": frames,
@@ -505,6 +510,35 @@ class CameraCheckTests(unittest.TestCase):
         verdict, detail = cameras.verdict(self.configured(), {}, {"top": "usb-1-4.4", "wrist": "usb-1-4.4"})
         self.assertEqual(verdict, "SAME CAMERA")
         self.assertIn("usb-1-4.4", detail)
+
+    def test_one_handle_written_twice_is_caught_without_any_bus(self):
+        """The macOS and Windows shape: survey_by_index reports no bus at all.
+
+        With nothing but numbers to compare, the same number written twice is the only
+        same-camera case still detectable — and it has to be, because that configuration is
+        what a reader produces by labelling one panel twice.
+
+        IS_LINUX is patched rather than skipping this on Linux: the branch would otherwise be
+        reachable only on a macOS or Windows machine, and a Linux-only change could break it
+        without anything saying so until CI ran.
+        """
+        doubled = self.configured(wrist={"path": "/dev/video0"})
+        with patch.object(cameras, "IS_LINUX", False):
+            verdict, detail = cameras.verdict(doubled, self.measured(), {"top": None, "wrist": None})
+        self.assertEqual(verdict, "SAME CAMERA")
+        self.assertIn("/dev/video0", detail)
+
+    def test_on_linux_a_missing_bus_stays_undecided_rather_than_same_camera(self):
+        """The other side of that switch, and the reason it is keyed on the platform.
+
+        On Linux a bus of None means the configured path does not exist. Treating that as
+        SAME CAMERA would tell the operator to change a path that is merely absent, so the
+        handle comparison must not run here even though the handles are equal.
+        """
+        doubled = self.configured(wrist={"path": "/dev/video0"})
+        with patch.object(cameras, "IS_LINUX", True):
+            verdict, _ = cameras.verdict(doubled, self.measured(), {"top": None, "wrist": None})
+        self.assertNotEqual(verdict, "SAME CAMERA")
 
     def test_a_frozen_stream_is_not_ready_even_at_full_rate(self):
         results = self.measured()
