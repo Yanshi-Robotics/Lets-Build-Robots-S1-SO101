@@ -9,6 +9,9 @@ import ast
 import importlib.util
 import json
 import math
+import os
+import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -33,6 +36,7 @@ def load(name, path):
 scan = load("bus_check", ROOT / "Bringup/so101_bus_check.py")
 calibrate = load("calibrate_entry", ROOT / "Bringup/so101_calibrate.py")
 release = load("release_torque", ROOT / "Bringup/so101_release_torque.py")
+run = load("run_wrapper", ROOT / "Bringup/so101_run.py")
 teleop = load("teleop_log", ROOT / "Teleop/so101_teleop_log.py")
 cameras = load("camera_check", ROOT / "Cameras/so101_camera_check.py")
 sys.modules["so101_camera_check"] = cameras
@@ -821,6 +825,193 @@ class CameraCheckTests(unittest.TestCase):
         sensor = cameras.size_for(720, 1280, 90)
         self.assertEqual(sensor, (1280, 720))
         self.assertEqual(cameras.size_for(*sensor, 90), (720, 1280))
+
+
+class RunWrapperTests(unittest.TestCase):
+    """The wrapper that runs a LeRobot command and releases torque afterwards.
+
+    Nothing here opens a port: the release itself is faked, and what is checked is the order of
+    events, which is where the whole point of the program lives.
+    """
+
+    def test_the_command_is_whatever_follows_the_bare_double_dash(self):
+        own, command = run.split_command(
+            ["--hold", "--", "lerobot-teleoperate", "--robot.type=so101_follower"])
+        self.assertEqual(own, ["--hold"])
+        self.assertEqual(command, ["lerobot-teleoperate", "--robot.type=so101_follower"])
+        # Without the separator there are no wrapper options, so a `--hold` the child understands
+        # is left for the child.
+        self.assertEqual(run.split_command(["lerobot-record", "--hold"]), ([], ["lerobot-record", "--hold"]))
+
+    def test_both_arms_are_read_out_of_the_command(self):
+        command = ["lerobot-teleoperate",
+                   "--robot.type=so101_follower", "--robot.port=/dev/ttyACM0",
+                   "--teleop.type=so101_leader", "--teleop.port", "/dev/ttyACM1"]
+        self.assertEqual(run.ports_in_arguments(command), ["/dev/ttyACM0", "/dev/ttyACM1"])
+
+    def test_a_port_is_never_read_from_the_next_flag(self):
+        """`--robot.port --teleop.port=/dev/ttyACM1` names one arm, not an arm called --teleop.port."""
+        command = ["lerobot-teleoperate", "--robot.port", "--teleop.port=/dev/ttyACM1"]
+        self.assertEqual(run.ports_in_arguments(command), ["/dev/ttyACM1"])
+
+    def test_the_same_port_written_twice_is_released_once(self):
+        command = ["lerobot-teleoperate", "--robot.port=/dev/ttyACM0", "--robot.port=/dev/ttyACM0"]
+        self.assertEqual(run.ports_in_arguments(command), ["/dev/ttyACM0"])
+
+    def test_a_command_with_no_port_stops_before_running_anything(self):
+        ran = []
+        lines = []
+        code = run.main(["lerobot-teleoperate", "--robot.type=so101_follower"],
+                        run=ran.append, release_ports=lambda *a, **k: {}, output=lines.append)
+        self.assertEqual(code, 2)
+        self.assertEqual(ran, [])
+        self.assertIn("no arm port found", "\n".join(lines))
+
+    def test_the_release_follows_the_command_and_never_precedes_it(self):
+        events = []
+        code = run.main(["lerobot-teleoperate", "--robot.port=/dev/ttyACM0", "--teleop.port=/dev/ttyACM1"],
+                        run=lambda command: events.append(("run", tuple(command))) or 0,
+                        release_ports=lambda ports, **k: events.append(("release", tuple(ports))) or {},
+                        output=lambda _line: None)
+        self.assertEqual(code, 0)
+        self.assertEqual(events[0][0], "run")
+        self.assertEqual(events[1], ("release", ("/dev/ttyACM0", "/dev/ttyACM1")))
+
+    def test_a_motor_that_stays_on_is_the_failure_it_reports(self):
+        lines = []
+        release_ports = lambda ports, **k: {ports[0]: ["shoulder_lift"]}  # noqa: E731 - a stub
+        self.assertEqual(
+            run.main(["lerobot-teleoperate", "--robot.port=/dev/ttyACM0"], run=lambda _c: 0,
+                     release_ports=release_ports, output=lines.append), 1)
+        self.assertIn("cut motor power", "\n".join(lines))
+
+    def test_a_command_that_failed_does_not_make_a_clean_release_look_like_a_failure(self):
+        """Ctrl-C leaves a command exiting non-zero; that is not what this program reports."""
+        lines = []
+        code = run.main(["--", "lerobot-teleoperate", "--robot.port=/dev/ttyACM0"],
+                        run=lambda _c: 1, release_ports=lambda *a, **k: {}, output=lines.append)
+        self.assertEqual(code, 0)
+        self.assertIn("the arms are released", "\n".join(lines))
+
+    def test_hold_passes_the_commands_own_code_through(self):
+        self.assertEqual(
+            run.main(["--hold", "--", "lerobot-record", "--robot.port=/dev/ttyACM0"],
+                     run=lambda _c: 3, release_ports=lambda *a, **k: {},
+                     output=lambda _l: None), 3)
+
+    def test_hold_leaves_torque_on_and_prints_the_way_back(self):
+        released = []
+        lines = []
+        code = run.main(["--hold", "--", "lerobot-record", "--robot.port=/dev/ttyACM0"],
+                        run=lambda _c: 0, release_ports=lambda *a, **k: released.append(True) or {},
+                        output=lines.append)
+        self.assertEqual(code, 0)
+        self.assertEqual(released, [])
+        self.assertIn("so101_release_torque.py --port /dev/ttyACM0", "\n".join(lines))
+
+    def test_the_child_runs_as_a_process_and_its_exit_code_comes_back(self):
+        """Real subprocess: the wrapper has to wait for the child, not race it.
+
+        `--hold` and a faked release: this command names no arm, so running it without them would
+        stop at the port guard instead of starting a process.
+        """
+        code = run.main(["--hold", "--", sys.executable, "-c", "import sys; sys.exit(3)"],
+                        release_ports=lambda *a, **k: {}, output=lambda _line: None)
+        self.assertEqual(code, 3)
+
+    def test_ctrl_c_during_the_child_does_not_kill_the_wrapper_before_it_releases(self):
+        """The whole reason the wrapper exists: the child's Ctrl-C teardown is allowed to fail.
+
+        The signal is sent at the instant the wrapper sets its own handler to ignore Ctrl-C.
+        Without that handler the wrapper would be dead before any release, which is the bug this
+        program was written for. Sending it any earlier lands inside subprocess's own fork, where
+        the signal is briefly blocked, and proves nothing about the wrapper.
+        """
+        handler = run.signal.signal
+        sent = []
+
+        def signal_and_send(sig, action):
+            previous = handler(sig, action)
+            if action is run.signal.SIG_IGN and not sent:
+                sent.append(sig)
+                os.kill(os.getpid(), sig)
+            return previous
+
+        released = []
+        try:
+            with patch.object(run.signal, "signal", signal_and_send):
+                # A real quick child: the wrapper runs it for real, and the signal is delivered
+                # the moment it installs its own handler.
+                code = run.main(["--", sys.executable, "-c", "import time; time.sleep(0.5)",
+                                 "--robot.port=/dev/ttyACM0"],
+                                release_ports=lambda ports, **k: released.append(tuple(ports)) or {},
+                                output=lambda _line: None)
+        finally:
+            handler(signal.SIGINT, signal.default_int_handler)
+        self.assertEqual(sent, [signal.SIGINT])    # the handler really was installed first
+        self.assertEqual(code, 0)                  # the wrapper outlived the Ctrl-C
+        self.assertEqual(released, [("/dev/ttyACM0",)])
+
+    def test_a_port_that_will_not_open_is_reported_rather_than_raised(self):
+        def broken(_port, **_kwargs):
+            raise RuntimeError("could not connect on port")
+
+        lines = []
+        still_on = run.release_every(["/dev/ttyACM0"], release_port=broken, output=lines.append)
+        self.assertEqual(still_on, {"/dev/ttyACM0": ["unknown"]})
+        self.assertIn("could not release", "\n".join(lines))
+
+
+class LeRobotShutdownTests(unittest.TestCase):
+    """What LeRobot's own shutdown does, measured rather than trusted.
+
+    The wrapper exists because of this behaviour, so the behaviour is pinned here: if a future
+    LeRobot releases every motor anyway, this test fails and the wrapper can be deleted.
+    """
+
+    def bus_with_a_faulty_motor(self):
+        from lerobot.motors import Motor, MotorNormMode
+        from lerobot.motors.feetech import FeetechMotorsBus
+
+        motors = {name: Motor(index, "sts3215", MotorNormMode.RANGE_M100_100)
+                  for index, name in enumerate(release.JOINT_NAMES, 1)}
+        bus = FeetechMotorsBus(port="test-fixture-not-a-device", motors=motors)
+        bus.port_handler = SimpleNamespace(is_open=True, is_using=False,
+                                           clearPort=lambda: None, closePort=lambda: None)
+        written = []
+
+        def fake_write(addr, length, motor_id, value, *, num_retry=0, raise_on_error=True, err_msg=""):
+            written.append(motor_id)
+            if motor_id == 2:                      # shoulder_lift latched Overload
+                if raise_on_error:
+                    raise RuntimeError(f"{err_msg} [RxPacketError] Overload error!")
+                return 0, 32
+            return 0, 0
+
+        bus._write = fake_write
+        return bus, written
+
+    def test_disconnect_stops_at_the_first_motor_that_reports_an_error_bit(self):
+        bus, written = self.bus_with_a_faulty_motor()
+        with self.assertRaises(RuntimeError):
+            bus.disconnect()
+        # LeRobot disables torque and then clears Lock, so a healthy motor takes two writes and
+        # the faulted one takes one. Ids 3 to 6 were never written at all: those four stay stiff.
+        self.assertEqual(written, [1, 1, 2])
+
+    def test_the_course_release_gets_past_the_same_fault(self):
+        """The same six writes through our program, against the same fault."""
+        bus, written = self.bus_with_a_faulty_motor()
+
+        def fake_read(addr, length, motor_id, *, num_retry=0, raise_on_error=True):
+            return (0, 0, 0)                       # torque off, comm fine
+
+        bus._read = fake_read
+        bus._is_comm_success = lambda comm: comm == 0
+        still_on = release.release_bus(bus, lambda _table, _model, field: (field, 1),
+                                       output=lambda _line: None, sleep=lambda _s: None)
+        self.assertEqual(still_on, [])
+        self.assertEqual(written, [1, 2, 3, 4, 5, 6])
 
 
 if __name__ == "__main__":

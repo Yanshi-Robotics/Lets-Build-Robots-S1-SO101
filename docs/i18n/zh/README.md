@@ -19,11 +19,11 @@
 
 ## 仓库里有什么
 
-- **`Bringup/`**：`so101_bus_check.py` 读一条总线上的六台电机；`so101_calibrate.py` 记录每个关节的中位和活动范围。第 6 课用。`so101_release_torque.py` 在某台电机带着错误状态位回包时也把六台的力矩全部关掉——那正是 LeRobot 自己的退出流程做不完的情况。
+- **`Bringup/`**：`so101_bus_check.py` 读一条总线上的六台电机；`so101_calibrate.py` 记录每个关节的中位和活动范围。第 6 课用。`so101_release_torque.py` 在某台电机带着错误状态位回包时也把六台的力矩全部关掉——那正是 LeRobot 自己的退出流程做不完的情况。`so101_run.py` 跑一条 LeRobot 命令，跑完自己给两只臂做这件事。
 - **`Cameras/`**：`so101_camera_check.py` 列出能出图的摄像头、给出各自该用的稳定路径，再把它们实时显示在一个本地网页上，认出哪台装在哪、把画面转正、存进 `cameras.json`；`check` 会先测出两台相机单开与同开的速率。`so101_policy_view.py` 接着把同样的实时画面按 ACT、π₀、π₀.₅、SmolVLA 各自的预处理显示出来。第 11 课用。Linux 能读到设备列表、给出每台相机的稳定路径；macOS 与 Windows 没有这个列表，`list` 改成逐个试相机序号（`--max-index` 决定试到几号），认哪台是哪台靠看画面。
 - **`Cartesian/`**：机械臂的笛卡尔控制，一个页面 <http://127.0.0.1:4602>。`cartesian_control.py` 显示机械臂，同一时间只让一种来源控制它：拖一个球（每个关节上还有一个可转的环）、配好对的手柄、或示教臂；加 `--model-only` 用模拟臂打开同一个页面。手柄第一次插上时在同一个页面里配对；页面上的 **Follower** 开关可以改为控制模拟臂而不是真臂。`fetch_model.py` 下载机械臂模型。其余文件是控制循环的各段（感知、目标、比较、求解、规划、执行），`Cartesian/README.md` 里有说明。第 8 课用。要在仓库根目录运行，它们按文件夹互相导入。
 - **`Teleop/`**：`so101_teleop_log.py` 打印两只臂的保护与校准寄存器、把两只臂对着读，并给 `lerobot-record` 录下的数据打分。遥操作本身仍然用官方的 `lerobot-teleoperate`。第 7 课用。
-- **`tests/`**：50 条测试，用假硬件跑 Bringup、Teleop、Cameras 的程序；Cartesian 的 38 条在 `Cartesian/test_cartesian.py`。
+- **`tests/`**：60 条测试，用假硬件跑 Bringup、Teleop、Cameras 的程序；Cartesian 的 38 条在 `Cartesian/test_cartesian.py`。
 - **`Teleop/logs/`**（不进 git）：诊断程序每次运行一份调试日志，只留最近 20 份，`lerobot-record` 录下的数据也放这里。出问题时把最新那份发出来。
 
 课程正文印着这些路径，所以这里的文件不会移动或改名。以后的任务各占一个新文件夹，例如 `ACT-1-Pick`。
@@ -92,6 +92,27 @@ python Cartesian/test_cartesian.py --model-dir models/so101  # Cartesian 程序�
 两条都不打开串口。
 
 有几个路径被 git 忽略。`.venv/` 太大，也只对这一台机器有效；`calibration/` 记的是某一只机械臂的中位和活动范围，换一只就不对；`models/` 由上面的 `fetch_model.py` 命令下载；`cameras.json` 与 `Cartesian/gamepad_map.json` 记的是这一张工作台上的相机和这一只手柄。
+
+---
+
+## 退出一次会话
+
+遥操作会话按 Ctrl-C 结束。LeRobot 接着逐个电机卸力，遇到第一个带错误状态位回包的电机就停下（通常是过载的 Follower），那台电机和它后面所有电机因此一直带电，手臂是硬的、电机是温的。lerobot 0.6.1 上，`shoulder_lift` 报 Overload 时，Follower 的 `elbow_flex` 到 `gripper` 四台根本没被写过。上游的修法是 [huggingface/lerobot#4695](https://github.com/huggingface/lerobot/pull/4695)，还没合并；在那之前由 `Bringup/so101_release_torque.py` 顶上，一次一条总线。
+
+想让这件事自己发生，就用 `Bringup/so101_run.py` 起会话，把命令写在 `--` 后面：
+
+```bash
+python Bringup/so101_run.py -- lerobot-teleoperate --robot.type=so101_follower --robot.port=<FOLLOWER_PORT> --robot.id=<FOLLOWER_ID> --teleop.type=so101_leader --teleop.port=<LEADER_PORT> --teleop.id=<LEADER_ID>
+```
+
+Ctrl-C 仍然是发给 `lerobot-teleoperate` 的，它照原来的方式退出；随后包装程序给两只臂逐个电机卸力，并逐台读回。课程里这条命令替换正文那一行 `lerobot-teleoperate`，`--robot.port` 与 `--teleop.port` 就是那一行里已经写着的两个端口。
+
+两种情况下不要用这个包装程序：
+
+- `lerobot-record` 要加 `--hold`，录完让 Follower 继续握住手里的东西。等手臂被托住之后自己卸：`python Bringup/so101_release_torque.py --port <FOLLOWER_PORT>`。
+- 没走包装程序、单独起的命令，退出后是什么状态就是什么状态，同样用上面那条 `so101_release_torque.py` 卸力。
+
+跑完那条命令还有电机报着自己带电，就该断电：`Torque_Enable` 存在 SRAM 里，掉电是唯一一定生效的清零方式。
 
 ---
 
