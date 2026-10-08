@@ -107,9 +107,9 @@ python Bringup/so101_run.py -- lerobot-teleoperate --robot.type=so101_follower -
 
 Ctrl-C still goes to `lerobot-teleoperate`, which exits the way it always did. Then the wrapper releases both arms, motor by motor, and reads each one back. Inside a lesson, this is the one command that replaces the lesson's `lerobot-teleoperate` line; `--robot.port` and `--teleop.port` are the ports that line already names.
 
-Two cases where the wrapper is not what you want:
+Two cases where the wrapper behaves differently on purpose:
 
-- `lerobot-record` runs with `--hold`, so the Follower keeps holding the object when recording ends. Release torque yourself once the arm is supported: `python Bringup/so101_release_torque.py --port <FOLLOWER_PORT>`.
+- `lerobot-record` wrapped this way leaves torque on and prints the one line that releases it, because a Follower that drops at the end of a recording session is a fall for no reason. Support the arm, then run that line. `--release` overrides this for a session that ends with the arm already supported.
 - A command started on its own, without the wrapper, leaves the arm the way LeRobot left it. The same `so101_release_torque.py` line releases it.
 
 A motor still reporting its torque on after that line has run means the supply is the thing to cut: `Torque_Enable` lives in SRAM, so no register write survives losing power.

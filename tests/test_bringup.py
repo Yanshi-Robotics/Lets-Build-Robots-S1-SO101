@@ -895,9 +895,39 @@ class RunWrapperTests(unittest.TestCase):
 
     def test_hold_passes_the_commands_own_code_through(self):
         self.assertEqual(
-            run.main(["--hold", "--", "lerobot-record", "--robot.port=/dev/ttyACM0"],
+            run.main(["--hold", "--", "lerobot-teleoperate", "--robot.port=/dev/ttyACM0"],
                      run=lambda _c: 3, release_ports=lambda *a, **k: {},
                      output=lambda _l: None), 3)
+
+    def test_recording_holds_by_itself_and_says_how_to_let_go(self):
+        """A dropped Follower at the end of a recording is a fall for no reason, so the safe
+        choice is the default one: nobody has to remember a flag."""
+        released, lines = [], []
+        code = run.main(["--", "lerobot-record", "--robot.port=/dev/ttyACM0"],
+                        run=lambda _c: 0, release_ports=lambda *a, **k: released.append(True) or {},
+                        output=lines.append)
+        self.assertEqual(code, 0)
+        self.assertEqual(released, [])
+        self.assertIn("recording, torque left on", "\n".join(lines))
+        self.assertIn("so101_release_torque.py --port /dev/ttyACM0", "\n".join(lines))
+
+    def test_release_overrides_the_recording_default(self):
+        released = []
+        code = run.main(["--release", "--", "lerobot-record", "--robot.port=/dev/ttyACM0"],
+                        run=lambda _c: 0,
+                        release_ports=lambda ports, **k: released.append(tuple(ports)) or {},
+                        output=lambda _l: None)
+        self.assertEqual(code, 0)
+        self.assertEqual(released, [("/dev/ttyACM0",)])
+
+    def test_a_recording_wrapped_through_python_is_still_a_recording(self):
+        released, lines = [], []
+        run.main(["--", sys.executable, "-m", "lerobot.scripts.lerobot_record",
+                  "--robot.port=/dev/ttyACM0"],
+                 run=lambda _c: 0, release_ports=lambda *a, **k: released.append(True) or {},
+                 output=lines.append)
+        self.assertEqual(released, [])
+        self.assertIn("recording, torque left on", "\n".join(lines))
 
     def test_hold_leaves_torque_on_and_prints_the_way_back(self):
         released = []

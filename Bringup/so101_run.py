@@ -30,14 +30,15 @@ Two things worth knowing before it is used in anger:
   * With no --ports it reads the ports out of the command's own arguments (--robot.port and
     --teleop.port). If it cannot find them it stops instead of guessing, because writing to a
     port that is not an arm is not a thing this program gets to do.
-  * `lerobot-record` is not teleoperation: a dropped Follower at the end of a recording session
-    is a fall for no reason. Pass --hold and torque is left on; release it yourself once the arm
-    is supported.
+  * `lerobot-record` is not teleoperation: a dropped Follower at the end of a recording session is
+    a fall for no reason. Wrapping a `lerobot-record` therefore leaves torque on by itself and
+    prints the one line that releases it once the arm is supported. `--release` overrides that for
+    a session that ends with the arm already supported; `--hold` does the same for anything else.
 
 Its exit code answers the one question it is here to answer, whether the arms let go: 0 when every
 motor reports its torque off, 1 when one does not and the supply is the thing to cut, 2 when it
 stopped before it could tell. A command stopped with Ctrl-C exits non-zero as a matter of course,
-so with --hold the command's own code is passed through instead.
+so when torque is left on the command's own code is passed through instead.
 
 Read-only software does not guarantee an unpowered or motionless arm.
 """
@@ -149,13 +150,24 @@ def main(argv=None, *, run=run_child, release_ports=release_every, output=print)
                         help="arm ports to release; default is to read them from the command")
     parser.add_argument("--hold", action="store_true",
                         help="leave torque on (recording: a dropped Follower is a fall for no reason)")
+    parser.add_argument("--release", action="store_true",
+                        help="release anyway, for a recording session whose arm is already supported")
     args = parser.parse_args(own)
 
     if not command:
         parser.error("no command to run; write it after `--`, such as `-- lerobot-teleoperate ...`")
 
+    # Recording holds on by default. A Follower that drops at the end of a recording session is a
+    # fall for no reason, and the operator is standing right there to support the arm before
+    # releasing it. Nobody has to remember a flag for the safe choice to happen. The command is
+    # recognised by its name, whichever of the three ways it is spelled: the console script, or
+    # `python -m lerobot.scripts.lerobot_record`.
+    recording = any("lerobot_record" in Path(part).name or Path(part).name == "lerobot-record"
+                    for part in command[:3])
+    hold = (args.hold or recording) and not args.release
+
     ports = args.ports if args.ports is not None else ports_in_arguments(command)
-    if not args.hold and not ports:
+    if not hold and not ports:
         output("STOP: no arm port found in the command; pass --ports <PORT> [<PORT> ...] "
                "(or --hold to leave torque on)")
         return 2
@@ -169,8 +181,10 @@ def main(argv=None, *, run=run_child, release_ports=release_every, output=print)
     output(f"so101_run: running {' '.join(command)}")
     code = run(command)
 
-    if args.hold:
-        output("\nso101_run: --hold, torque left on. The arms are still powered; support them, then run:")
+    if hold:
+        why = "recording" if recording and not args.hold else "--hold"
+        output(f"\nso101_run: {why}, torque left on. The arms are still powered; support them, "
+               "then run:")
         for port in ports:
             output(f"  python Bringup/so101_release_torque.py --port {port}")
         return code

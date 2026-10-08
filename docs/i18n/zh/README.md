@@ -107,9 +107,9 @@ python Bringup/so101_run.py -- lerobot-teleoperate --robot.type=so101_follower -
 
 Ctrl-C 仍然是发给 `lerobot-teleoperate` 的，它照原来的方式退出；随后包装程序给两只臂逐个电机卸力，并逐台读回。课程里这条命令替换正文那一行 `lerobot-teleoperate`，`--robot.port` 与 `--teleop.port` 就是那一行里已经写着的两个端口。
 
-两种情况下不要用这个包装程序：
+有两种情况包装程序是故意不一样的：
 
-- `lerobot-record` 要加 `--hold`，录完让 Follower 继续握住手里的东西。等手臂被托住之后自己卸：`python Bringup/so101_release_torque.py --port <FOLLOWER_PORT>`。
+- 这样包起来的 `lerobot-record` 会保留力矩，并把卸力那一条命令打出来：录完就让 Follower 掉下来没有道理。托住手臂，再跑它给的那一条。手臂本来就有支撑的会话可以加 `--release` 覆盖。
 - 没走包装程序、单独起的命令，退出后是什么状态就是什么状态，同样用上面那条 `so101_release_torque.py` 卸力。
 
 跑完那条命令还有电机报着自己带电，就该断电：`Torque_Enable` 存在 SRAM 里，掉电是唯一一定生效的清零方式。
