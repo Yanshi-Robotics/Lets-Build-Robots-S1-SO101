@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.2] - 2026-10-12
+
+### Fixed
+
+- Limit the legacy wrapper's two real process-group tests to POSIX systems. The v0.1.1 Windows CI run incorrectly expected that unsupported wrapper to launch a controller.
+- Add a regression that verifies an unsupported platform starts no child, attempts no release and reports the POSIX requirement with a failure code.
+
+The control, signal, release and tracing implementation is unchanged from v0.1.1. This patch corrects the test contract; it does not add Windows shutdown support. The operator-confirmed Linux recovery results and known limits below still apply. The published v0.1.1 tag is preserved.
+
 ## [0.1.1] - 2026-10-12
 
 ### Fixed
@@ -25,4 +34,5 @@ In that successful Ctrl+C run, upstream cleanup had already disabled torque befo
 
 The supervised entry point supports Linux with the pinned dependencies in the instructions. Windows, macOS, recording and Cartesian shutdown are outside this release's physical acceptance. The legacy `Bringup/so101_run.py` is not the validated entry point: it can still perform additional release after a child fault. Full safety work planned for v0.2.0 remains separate.
 
+[0.1.2]: https://github.com/Yanshi-Robotics/Lets-Build-Robots-S1-SO101/releases/tag/v0.1.2
 [0.1.1]: https://github.com/Yanshi-Robotics/Lets-Build-Robots-S1-SO101/releases/tag/v0.1.1

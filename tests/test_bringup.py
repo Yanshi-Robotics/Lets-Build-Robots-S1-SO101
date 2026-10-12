@@ -942,6 +942,24 @@ class RunWrapperTests(unittest.TestCase):
         self.assertEqual(released, [])
         self.assertIn("so101_release_torque.py --port /dev/ttyACM0", "\n".join(lines))
 
+    def test_unsupported_platform_starts_no_child_and_attempts_no_release(self):
+        released, lines = [], []
+
+        def unsupported_child(command):
+            with patch.object(run.os, "name", "nt"):
+                return run.run_child(command)
+
+        with patch.object(run.subprocess, "Popen") as launch:
+            code = run.main(["--", sys.executable, "--robot.port=FAKE"],
+                            run=unsupported_child,
+                            release_ports=lambda *a, **k: released.append(True),
+                            output=lines.append)
+        launch.assert_not_called()
+        self.assertEqual(released, [])
+        self.assertEqual(code, 2)
+        self.assertIn("requires POSIX", "\n".join(lines))
+
+    @unittest.skipUnless(os.name == "posix", "Legacy process-group supervision requires POSIX")
     def test_the_child_runs_as_a_process_and_its_exit_code_comes_back(self):
         """Real subprocess: the wrapper has to wait for the child, not race it.
 
@@ -952,6 +970,7 @@ class RunWrapperTests(unittest.TestCase):
                         release_ports=lambda *a, **k: {}, output=lambda _line: None)
         self.assertEqual(code, 3)
 
+    @unittest.skipUnless(os.name == "posix", "Legacy process-group supervision requires POSIX")
     def test_ctrl_c_during_the_child_does_not_kill_the_wrapper_before_it_releases(self):
         """The whole reason the wrapper exists: the child's Ctrl-C teardown is allowed to fail.
 

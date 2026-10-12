@@ -9,7 +9,7 @@
 
 Course programs for Season 1 of *Let's Build Robots*, a video course that builds and trains the LeRobot SO-101 arm.
 
-Release: [v0.1.1](CHANGELOG.md), including supervised Linux teleoperation shutdown and manual torque release.
+Release: [v0.1.2](CHANGELOG.md), including supervised Linux teleoperation shutdown and manual torque release.
 
 ---
 

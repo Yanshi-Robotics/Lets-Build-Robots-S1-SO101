@@ -1,6 +1,6 @@
 # Teleoperation shutdown
 
-The supervised entry point in v0.1.1 runs the installed LeRobot teleoperation loop and records its shutdown. Support both arms before starting and before requesting release: disabling torque can let an arm fall. Keep motor power accessible, and do not force a stiff joint.
+The supervised entry point in v0.1.2 runs the installed LeRobot teleoperation loop and records its shutdown. Support both arms before starting and before requesting release: disabling torque can let an arm fall. Keep motor power accessible, and do not force a stiff joint.
 
 ## Environment
 
@@ -11,7 +11,7 @@ python -m pip install "lerobot[core_scripts,feetech]==0.6.1" "feetech-servo-sdk=
 python Teleop/so101_shutdown_debug.py --version
 ```
 
-The version command prints `0.1.1`. Identify each arm's stable USB path and use its existing calibration file. USB enumeration alone does not identify which physical arm is attached. Check the power adapter against the motor variant; follow the [LeRobot assembly instructions](https://huggingface.co/docs/lerobot/main/en/assemble_so101).
+The version command prints `0.1.2`. Identify each arm's stable USB path and use its existing calibration file. USB enumeration alone does not identify which physical arm is attached. Check the power adapter against the motor variant; follow the [LeRobot assembly instructions](https://huggingface.co/docs/lerobot/main/en/assemble_so101).
 
 ## Start and stop
 
@@ -89,4 +89,6 @@ The operator ran the diagnostic predecessor, `0.2.0-debug.1`, on Linux with the 
 
 In the successful Ctrl+C run, upstream cleanup had already disabled torque before the supervisor's additional release. That evidence confirms the complete path and does not attribute success to the additional write alone. The earlier motor-3 enable timeout and historical incidents in which valid OFF replies coincided with a stiff arm remain unexplained.
 
-Release checks also passed 75 Bringup tests, 11 stop-safety tests, 13 diagnostic tests and 39 Cartesian regression tests. Three integrations used the installed LeRobot against emulated servo buses: normal completion, Ctrl+C with an upstream cleanup failure, and a runtime communication failure followed by explicit manual recovery. Those integrations verify software behavior; the two operator observations provide the separate physical evidence.
+Release checks also passed 76 Bringup tests, 11 stop-safety tests, 13 diagnostic tests and 39 Cartesian regression tests. Three integrations used the installed LeRobot against emulated servo buses: normal completion, Ctrl+C with an upstream cleanup failure, and a runtime communication failure followed by explicit manual recovery. Those integrations verify software behavior; the two operator observations provide the separate physical evidence.
+
+The v0.1.1 Windows CI run exposed two tests that expected the unsupported POSIX wrapper to launch. v0.1.2 restricts those real process tests to POSIX and adds an explicit unsupported-platform refusal check. It leaves the motor-control implementation unchanged and does not claim Windows shutdown support.
