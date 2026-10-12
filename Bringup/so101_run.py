@@ -12,33 +12,17 @@
 Everything before the `--` belongs to this program (`--hold`, `--ports`); everything after it is
 the command to run, written exactly as it would be written on its own.
 
-Why this exists. LeRobot disables torque on the way out, one motor at a time, and raises on the
-first motor that answers with an error bit — so that motor and every motor after it in the list
-keep their torque: the arm stays stiff and the motors stay warm after a shutdown that looked
-normal. Measured on 2026-10-09 against lerobot 0.6.1, with id 2 reporting Overload: disconnect()
-raises, ids 1 and 2 are written, and ids 3 to 6 are never written at all. The same code is still
-in LeRobot's main branch; the fix is huggingface/lerobot#4695, open since 2026-09-21.
+On POSIX, the child runs in its own process group. Ctrl-C is forwarded once, and the wrapper
+waits for shutdown before opening either bus. A cleanup timeout begins only after a stop
+request. A child that does not stop is terminated and reaped; a failed shutdown prevents release.
 
-What this does. It starts the command unchanged and lets it handle Ctrl-C as it always did, then
-releases torque itself on both arms, per motor, without raising on a status byte, reading each
-one back. Both arms: the Follower's motors are the ones under load, but the Leader's are left
-holding too, and releasing it also stops the leader arm from dropping onto the desk under its own
-weight mid-session.
+The release writes only Torque_Enable=0 and then checks all motors repeatedly. Exit code 0
+means the registers reported OFF, not that physical release was measured. Support the arms
+before stopping. If they remain stiff, cut motor power and retain the diagnostic output.
 
-Two things worth knowing before it is used in anger:
-
-  * With no --ports it reads the ports out of the command's own arguments (--robot.port and
-    --teleop.port). If it cannot find them it stops instead of guessing, because writing to a
-    port that is not an arm is not a thing this program gets to do.
-  * `lerobot-record` is not teleoperation: a dropped Follower at the end of a recording session is
-    a fall for no reason. Wrapping a `lerobot-record` therefore leaves torque on by itself and
-    prints the one line that releases it once the arm is supported. `--release` overrides that for
-    a session that ends with the arm already supported; `--hold` does the same for anything else.
-
-Its exit code answers the one question it is here to answer, whether the arms let go: 0 when every
-motor reports its torque off, 1 when one does not and the supply is the thing to cut, 2 when it
-stopped before it could tell. A command stopped with Ctrl-C exits non-zero as a matter of course,
-so when torque is left on the command's own code is passed through instead.
+Ports come from --robot.port and --teleop.port unless --ports is supplied. --hold skips this
+wrapper's additional release; it cannot prevent the child from performing its own shutdown.
+Recording defaults to --hold. --release explicitly requests the additional release for recording.
 
 Read-only software does not guarantee an unpowered or motionless arm.
 """
@@ -46,9 +30,11 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # The release logic stays in the program that owns it, so both write the same single register.
@@ -66,6 +52,9 @@ PORT_OPTIONS = ("--robot.port", "--teleop.port")
 # The child closes its own port on the way out; give it this long after Ctrl-C before reaching
 # for the port ourselves. Waiting costs nothing when the child exits at once.
 CHILD_CLEANUP_TIMEOUT_S = 30.0
+# Bound forced shutdown separately from normal operation; neither limits session duration.
+CHILD_TERMINATE_TIMEOUT_S = 5.0
+CHILD_POLL_INTERVAL_S = 0.1
 
 
 def split_command(argv):
@@ -104,27 +93,62 @@ def ports_in_arguments(arguments):
     return ordered
 
 
-def run_child(command):
-    """Run the wrapped command with this process's terminal, ignoring Ctrl-C while it cleans up.
+def run_child(command, *, cleanup_timeout=CHILD_CLEANUP_TIMEOUT_S,
+              terminate_timeout=CHILD_TERMINATE_TIMEOUT_S):
+    """Forward stop requests to an owned POSIX process group and reap before returning.
 
-    Ctrl-C reaches the child directly, because both processes share the foreground process
-    group; the wrapper's own handler is what has to wait rather than die, or the release would
-    race the child's shutdown instead of following it.
+    A callable parent handler is reset by exec; SIG_IGN would be inherited by Python children.
+    The child's separate session avoids delivering terminal Ctrl-C twice during its cleanup.
+    Its inherited stdin/stdout remain available for calibration prompts and logs.
     """
-    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
-    try:
-        child = subprocess.Popen(command)  # noqa: S603 - the operator's own command line
+    if os.name != "posix":
+        raise RuntimeError("This wrapper's shutdown supervision currently requires POSIX.")
+    requested = []
+
+    def request_stop(signum, _frame):
+        if not requested:
+            requested.append(signum)
+
+    previous = {sig: signal.signal(sig, request_stop) for sig in (signal.SIGINT, signal.SIGTERM)}
+    child = None
+
+    def send_group(sig):
         try:
-            return child.wait(timeout=CHILD_CLEANUP_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            print(f"\nso101_run: {command[0]} still has not exited after {CHILD_CLEANUP_TIMEOUT_S:.0f}s; "
-                  "releasing torque anyway", flush=True)
-            # Left running on purpose: killing it here would leave the port open, and the release
-            # below is the part that has to happen. A process still holding the port is reported
-            # rather than hidden.
-            return 0
+            os.killpg(child.pid, sig)
+        except ProcessLookupError:
+            pass
+
+    try:
+        child = subprocess.Popen(command, start_new_session=True)  # noqa: S603
+        deadline = None
+        terminating = False
+        while child.poll() is None:
+            now = time.monotonic()
+            if requested and deadline is None:
+                send_group(requested[0])
+                deadline = now + cleanup_timeout
+            elif deadline is not None and now >= deadline:
+                if not terminating:
+                    print("so101_run: cleanup timed out; terminating the child group", flush=True)
+                    send_group(signal.SIGTERM)
+                    terminating = True
+                    deadline = now + terminate_timeout
+                else:
+                    send_group(signal.SIGKILL)
+                    child.wait(timeout=terminate_timeout)
+                    break
+            time.sleep(CHILD_POLL_INTERVAL_S)
+        return child.wait()
     finally:
-        signal.signal(signal.SIGINT, previous)
+        # Descendants must not survive an exited launcher and continue controlling the bus.
+        # Only this newly created process group is targeted, never a name or global pattern.
+        try:
+            if child is not None:
+                send_group(signal.SIGKILL)
+                child.wait(timeout=terminate_timeout)
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
 
 
 def release_every(ports, *, release_port=release.release_port, output=print):
@@ -149,7 +173,7 @@ def main(argv=None, *, run=run_child, release_ports=release_every, output=print)
     parser.add_argument("--ports", nargs="+", default=None,
                         help="arm ports to release; default is to read them from the command")
     parser.add_argument("--hold", action="store_true",
-                        help="leave torque on (recording: a dropped Follower is a fall for no reason)")
+                        help="skip additional release; the child still performs its own cleanup")
     parser.add_argument("--release", action="store_true",
                         help="release anyway, for a recording session whose arm is already supported")
     args = parser.parse_args(own)
@@ -179,11 +203,15 @@ def main(argv=None, *, run=run_child, release_ports=release_every, output=print)
         return 2
 
     output(f"so101_run: running {' '.join(command)}")
-    code = run(command)
+    try:
+        code = run(command)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        output(f"STOP: child shutdown not confirmed ({exc}); no release attempted. Cut motor power.")
+        return 2
 
     if hold:
         why = "recording" if recording and not args.hold else "--hold"
-        output(f"\nso101_run: {why}, torque left on. The arms are still powered; support them, "
+        output(f"\nso101_run: {why}, additional release skipped. Torque state is unverified; support the arms, "
                "then run:")
         for port in ports:
             output(f"  python Bringup/so101_release_torque.py --port {port}")
@@ -201,14 +229,14 @@ def main(argv=None, *, run=run_child, release_ports=release_every, output=print)
         for port, names in still_on.items():
             output(f"FAIL: {port}: torque still on or no reply: {', '.join(names)} — cut motor power.")
         return 1
-    output(f"PASS: all six motors on {len(ports)} arm(s) report Torque_Enable=0.")
+    output(f"REGISTER CHECK: all six motors on {len(ports)} arm(s) report Torque_Enable=0. "
+           "Physical release is not verified; if still stiff, support the arms and cut motor power.")
     # The exit code answers the question this program is here to answer: did the arms let go? A
     # command stopped with Ctrl-C exits non-zero as a matter of course, so passing its code on
     # would make every clean shutdown look like a failure. A command that failed on its own says
     # so in its own output, which is right above this line.
     if code:
-        output(f"note: the command exited {code}; the arms are released, the exit code is about "
-               "the command, not the arms")
+        output(f"note: the command exited {code}; register checks completed, physical release is unverified")
     return 0
 
 

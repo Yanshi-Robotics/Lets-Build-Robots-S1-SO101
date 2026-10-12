@@ -137,6 +137,15 @@ jobs:
           python tests/test_bringup.py
         if: matrix.shell == 'pwsh'
 
+      - name: Linux shutdown supervision regressions
+        run: |
+          . .venv/bin/activate
+          python -m pip install "feetech-servo-sdk==1.0.0" "pyserial==3.5" "psutil==7.2.2"
+          python tests/test_stop_safety.py
+          python tests/test_shutdown_debug.py
+          python tests/audit/pty_shutdown_debug.py
+        if: matrix.os == 'ubuntu-24.04'
+
       # Downloading the model is the part worth doing everywhere Lesson 8 installs: it proves
       # the lesson's first command works on this system. The tests follow only where timing
       # allows (see the matrix comment).

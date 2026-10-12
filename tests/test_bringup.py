@@ -497,6 +497,7 @@ class ReleaseTorqueTests(unittest.TestCase):
             self.writes.append((id_, value))
             if id_ not in self.stuck:
                 self.torque[id_] = value
+            return 0, self.flags.get(id_, 0)
 
         def _read(self, addr, length, id_, num_retry=0, raise_on_error=True):
             if id_ in self.silent:
@@ -541,9 +542,11 @@ class ReleaseTorqueTests(unittest.TestCase):
     def test_the_source_writes_only_the_torque_register(self):
         """A course tool that claims to touch one register has to be checked, not trusted."""
         source = (ROOT / "Bringup/so101_release_torque.py").read_text(encoding="utf-8")
-        writes = [line for line in source.splitlines() if "._write(" in line and not line.strip().startswith("#")]
+        writes = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Attribute) and node.func.attr == "_write"]
         self.assertEqual(len(writes), 1)
-        self.assertIn("torque_addr", writes[0])
+        self.assertEqual(writes[0].args[0].id, "torque_addr")
+        self.assertEqual(writes[0].args[3].value, 0)
 
 
 class CameraCheckTests(unittest.TestCase):
@@ -891,7 +894,7 @@ class RunWrapperTests(unittest.TestCase):
         code = run.main(["--", "lerobot-teleoperate", "--robot.port=/dev/ttyACM0"],
                         run=lambda _c: 1, release_ports=lambda *a, **k: {}, output=lines.append)
         self.assertEqual(code, 0)
-        self.assertIn("the arms are released", "\n".join(lines))
+        self.assertIn("physical release is unverified", "\n".join(lines))
 
     def test_hold_passes_the_commands_own_code_through(self):
         self.assertEqual(
@@ -908,7 +911,7 @@ class RunWrapperTests(unittest.TestCase):
                         output=lines.append)
         self.assertEqual(code, 0)
         self.assertEqual(released, [])
-        self.assertIn("recording, torque left on", "\n".join(lines))
+        self.assertIn("recording, additional release skipped", "\n".join(lines))
         self.assertIn("so101_release_torque.py --port /dev/ttyACM0", "\n".join(lines))
 
     def test_release_overrides_the_recording_default(self):
@@ -927,7 +930,7 @@ class RunWrapperTests(unittest.TestCase):
                  run=lambda _c: 0, release_ports=lambda *a, **k: released.append(True) or {},
                  output=lines.append)
         self.assertEqual(released, [])
-        self.assertIn("recording, torque left on", "\n".join(lines))
+        self.assertIn("recording, additional release skipped", "\n".join(lines))
 
     def test_hold_leaves_torque_on_and_prints_the_way_back(self):
         released = []
@@ -952,7 +955,7 @@ class RunWrapperTests(unittest.TestCase):
     def test_ctrl_c_during_the_child_does_not_kill_the_wrapper_before_it_releases(self):
         """The whole reason the wrapper exists: the child's Ctrl-C teardown is allowed to fail.
 
-        The signal is sent at the instant the wrapper sets its own handler to ignore Ctrl-C.
+        The signal is sent at the instant the wrapper sets its own callable stop handler.
         Without that handler the wrapper would be dead before any release, which is the bug this
         program was written for. Sending it any earlier lands inside subprocess's own fork, where
         the signal is briefly blocked, and proves nothing about the wrapper.
@@ -962,7 +965,7 @@ class RunWrapperTests(unittest.TestCase):
 
         def signal_and_send(sig, action):
             previous = handler(sig, action)
-            if action is run.signal.SIG_IGN and not sent:
+            if sig == signal.SIGINT and callable(action) and not sent:
                 sent.append(sig)
                 os.kill(os.getpid(), sig)
             return previous

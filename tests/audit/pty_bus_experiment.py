@@ -23,6 +23,7 @@ and when.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import select
@@ -34,6 +35,8 @@ import threading
 import time
 import tty
 from pathlib import Path
+
+BUS_POLL_INTERVAL_S = 0.02  # Pause while no client owns the emulated serial port.
 
 REPO = Path(__file__).resolve().parents[2]
 PYTHON = REPO / ".venv/bin/python"
@@ -88,7 +91,13 @@ class FakeBus:
                 ready, _, _ = select.select([self.fd], [], [], 0.02)
                 with self.lock:
                     if ready:
-                        self.buffer += os.read(self.fd, 4096)
+                        try:
+                            self.buffer += os.read(self.fd, 4096)
+                        except OSError as exc:
+                            if exc.errno != errno.EIO:
+                                raise
+                            stop.wait(BUS_POLL_INTERVAL_S)
+                            continue
                     self.consume()
         except BaseException as exc:  # noqa: BLE001 - a dead bus thread is the thing to see
             print(f"  [bus] SERVER DIED: {type(exc).__name__}: {exc}", flush=True)
@@ -168,6 +177,8 @@ class Bench:
         tty.setraw(self.master)
         tty.setraw(self.slave)
         self.port = os.ttyname(self.slave)
+        # The emulator owns only the master; the client must be the sole slave owner.
+        os.close(self.slave)
         self.bus = FakeBus(self.master)
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.bus.serve_until, args=(self.stop,), daemon=True)
@@ -177,7 +188,6 @@ class Bench:
     def close(self):
         self.stop.set()
         self.thread.join(timeout=5)
-        os.close(self.slave)
         os.close(self.master)
 
     def fault_once_then_let_go(self, *, settle=0.4):
@@ -204,8 +214,22 @@ class Bench:
             child = subprocess.Popen(command, cwd=REPO, stdout=sink, stderr=subprocess.STDOUT,
                                      start_new_session=True)
             if signal_after is not None:
+                # Fault injection must happen after connect/configure, not during startup.
+                # Otherwise a startup exception plus a later Ctrl-C can masquerade as success.
+                deadline = time.monotonic() + timeout
+                while child.poll() is None and time.monotonic() < deadline:
+                    if "SOFollower connected." in log.read_text():
+                        break
+                    time.sleep(BUS_POLL_INTERVAL_S)
+                if "SOFollower connected." not in log.read_text():
+                    child.kill()
+                    child.wait(timeout=10)
+                    return "startup-failed", log
                 time.sleep(signal_after)
-                os.killpg(child.pid, signal.SIGINT)   # what Ctrl-C sends
+                self.bus.torque_writes.clear()
+                self.bus.stopping = True
+                self.fault_once_then_let_go()
+                os.killpg(child.pid, signal.SIGINT)
             try:
                 code = child.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -236,8 +260,6 @@ def main():
     command = [*teleoperate[:3], f"--robot.port={bench.port}", *teleoperate[3:5],
                f"--teleop.port={bench.port}", *teleoperate[5:]]
     print(f"1. lerobot-teleoperate on {bench.port}, stopped with SIGINT after 3s", flush=True)
-    bench.bus.stopping = True              # the session ends: this is when the motor faults
-    bench.fault_once_then_let_go()
     code, log = bench.run("session", command, timeout=60, signal_after=3.0)
     after_session = bench.bus.holding()
     writes = [motor_id for motor_id, ok in bench.bus.torque_writes if ok]
@@ -263,8 +285,6 @@ def main():
     wrapped = [str(PYTHON), "Bringup/so101_run.py", "--",
                *teleoperate[:3], f"--robot.port={bench.port}", *teleoperate[3:5],
                f"--teleop.port={bench.port}", *teleoperate[5:]]
-    bench.bus.stopping = True
-    bench.fault_once_then_let_go()
     code3, log3 = bench.run("wrapped", wrapped, timeout=120, signal_after=3.0)
     time.sleep(1.0)
     after_wrapper = bench.bus.holding()
@@ -280,9 +300,9 @@ def main():
         "after that session the arm is still held by motors with torque on":
             after_session != [],
         "the release program clears every one of them":
-            after_release == [],
+            code2 == 0 and after_release == [],
         "the same session under the wrapper needs no release afterwards":
-            after_wrapper == [],
+            code3 == 0 and after_wrapper == [],
     }
     for label, ok in checks.items():
         print(("  ok   " if ok else "  FAIL ") + label)

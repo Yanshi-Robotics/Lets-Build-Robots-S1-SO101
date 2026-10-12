@@ -23,6 +23,7 @@ hardware; `tests/audit/README.md` says who runs it and how often.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import select
@@ -34,6 +35,8 @@ import threading
 import time
 import tty
 from pathlib import Path
+
+BUS_POLL_INTERVAL_S = 0.02  # Pause while no client owns the emulated serial port.
 
 REPO = Path(__file__).resolve().parents[2]
 PYTHON = REPO / ".venv/bin/python"
@@ -112,7 +115,13 @@ class FakeBus:
             ready, _, _ = select.select([self.fd], [], [], 0.02)
             with self.lock:
                 if ready:
-                    self.buffer += os.read(self.fd, 4096)
+                    try:
+                        self.buffer += os.read(self.fd, 4096)
+                    except OSError as exc:
+                        if exc.errno != errno.EIO:
+                            raise
+                        stop.wait(BUS_POLL_INTERVAL_S)
+                        continue
                 self.consume()
 
     def consume(self):
@@ -196,6 +205,8 @@ class Bench:
         tty.setraw(self.master)
         tty.setraw(self.slave)
         self.port = os.ttyname(self.slave)
+        # The emulator owns only the master; the client must be the sole slave owner.
+        os.close(self.slave)
         self.bus = FakeBus(self.master)
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.bus.serve_until, args=(self.stop,), daemon=True)
@@ -206,7 +217,6 @@ class Bench:
     def close(self):
         self.stop.set()
         self.thread.join(timeout=5)
-        os.close(self.slave)
         os.close(self.master)
 
     def ctrl_c_session(self, wrapper, *, seconds=3.0):

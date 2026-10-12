@@ -9,6 +9,8 @@
 
 Course programs for Season 1 of *Let's Build Robots*, a video course that builds and trains the LeRobot SO-101 arm.
 
+Release: [v0.1.1](CHANGELOG.md), including supervised Linux teleoperation shutdown and manual torque release.
+
 ---
 
 ## Overview
@@ -19,12 +21,12 @@ Season 1 starts with printing and assembling two SO-101 arms and ends with a tra
 
 ## What's in the repository
 
-- **`Bringup/`**: `so101_bus_check.py` reads all six motors on one bus; `so101_calibrate.py` records each joint's mid position and range. Used in Lesson 6. `so101_release_torque.py` switches torque off on all six even when one answers with an error bit, which is the case LeRobot's own shutdown cannot finish. `so101_run.py` runs a LeRobot command and then performs that release on both arms by itself.
+- **`Bringup/`**: `so101_bus_check.py` reads all six motors on one bus; `so101_calibrate.py` records each joint's mid position and range. Used in Lesson 6. `so101_release_torque.py` continues attempting the remaining motors when one returns an error bit, then reads each motor back. `so101_run.py` is a legacy wrapper; use the supervised Teleop entry point for the documented fault policy.
 - **`Cameras/`**: `so101_camera_check.py` lists the cameras that deliver frames, names the stable path for each, and serves them live on a local page where a view is matched to a mount, turned the right way up and saved to `cameras.json`; `check` measures first what the two configured cameras deliver alone and together. `so101_policy_view.py` then shows the same live frames as ACT, π₀, π₀.₅ and SmolVLA each reshape them. Used in Lesson 11. Linux reads the device list and reports a stable path per camera; macOS and Windows have no such list, so `list` tries camera numbers instead (`--max-index` sets how many) and the pictures are what tells one camera from another.
 - **`Cartesian/`**: Cartesian control of the arm, one page at <http://127.0.0.1:4602>. `cartesian_control.py` shows the arm and lets one source at a time move it: drag a ball (and turn a ring on each joint), a paired gamepad, or a leader arm; `--model-only` runs the same page with a simulated arm. A gamepad is paired on the same page the first time it is plugged in, and a **Follower** switch drives the simulated arm instead of the real one. `fetch_model.py` downloads the arm model. The other files are the stages of the control loop (sense, target, compare, solve, plan, execute) and are explained in `Cartesian/README.md`. Used in Lesson 8. Run them from the repository root; they import each other by folder.
-- **`Teleop/`**: `so101_teleop_log.py` dumps both arms' protection and calibration registers, checks the two arms against each other, and grades a recording made by `lerobot-record`. Teleoperation itself stays with the official `lerobot-teleoperate`. Used in Lesson 7.
-- **`tests/`**: 60 tests that run the Bringup, Teleop and Cameras programs against fake hardware; `Cartesian/test_cartesian.py` holds the 38 for the Cartesian programs.
-- **`Teleop/logs/`** (git-ignored): one debug log per diagnostics run, the last 20 kept, plus anything `lerobot-record` writes there. Send the newest one when something goes wrong.
+- **`Teleop/`**: `so101_teleop_log.py` dumps both arms' protection and calibration registers, checks the two arms against each other, and grades a recording made by `lerobot-record`. `so101_shutdown_debug.py` supervises the official teleoperation loop, records shutdown and provides manual torque release. Used in Lesson 7.
+- **`tests/`**: offline tests that run the Bringup, Teleop and Cameras programs against fake hardware; `Cartesian/test_cartesian.py` holds the Cartesian tests.
+- **`Teleop/logs/`** (git-ignored): register logs and recordings, plus a separate `shutdown-debug/` directory per supervised run. Review logs before sharing: they contain local paths, device identities and calibration data.
 
 The lessons print these paths, so files here are not moved or renamed. Later tasks get their own folders, such as `ACT-1-Pick`.
 
@@ -97,22 +99,19 @@ Several paths are ignored by git. `.venv/` is large and specific to one machine.
 
 ## Stopping a session
 
-Ctrl-C is how a teleoperation session ends. LeRobot then disables torque motor by motor on the way out, and stops at the first motor that answers with an error bit — an overloaded Follower is the usual one — so that motor and every later one in the list stay powered: the arm stays stiff and the motors stay warm. On lerobot 0.6.1, with `shoulder_lift` reporting Overload, the Follower's `elbow_flex` to `gripper` are never written at all. The fix upstream is [huggingface/lerobot#4695](https://github.com/huggingface/lerobot/pull/4695), open and unmerged; `Bringup/so101_release_torque.py` covers it in the meantime, one port at a time.
+On Linux, use `Teleop/so101_shutdown_debug.py` directly to supervise teleoperation. Support both arms before starting and before stopping: releasing torque can let an arm fall. The pinned dependencies, complete launch command and recovery procedure are in [Teleoperation shutdown](docs/teleop-shutdown.md).
 
-To have that happen by itself, start the session through `Bringup/so101_run.py` and put the command after `--`:
+Press Ctrl+C once and wait for `Evidence saved:`. The supervisor forwards the stop request to its own child process group, waits for that group to exit, checks both serial ports and then releases each motor independently. Normal loop completion also requests release. Startup or runtime failures preserve the current torque state and keep their failure code; they can leave a partially enabled arm.
+
+For manual recovery after the controller has exited, set `RUN_DIR` to the saved run directory and execute:
 
 ```bash
-python Bringup/so101_run.py -- lerobot-teleoperate --robot.type=so101_follower --robot.port=<FOLLOWER_PORT> --robot.id=<FOLLOWER_ID> --teleop.type=so101_leader --teleop.port=<LEADER_PORT> --teleop.id=<LEADER_ID>
+python Teleop/so101_shutdown_debug.py release --from-run "$RUN_DIR"
 ```
 
-Ctrl-C still goes to `lerobot-teleoperate`, which exits the way it always did. Then the wrapper releases both arms, motor by motor, and reads each one back. Inside a lesson, this is the one command that replaces the lesson's `lerobot-teleoperate` line; `--robot.port` and `--teleop.port` are the ports that line already names.
+Check that the supported arm actually lets go while motor power remains connected. Register OFF alone does not measure physical release. If it remains stiff, support it and cut motor power.
 
-Two cases where the wrapper behaves differently on purpose:
-
-- `lerobot-record` wrapped this way leaves torque on and prints the one line that releases it, because a Follower that drops at the end of a recording session is a fall for no reason. Support the arm, then run that line. `--release` overrides this for a session that ends with the arm already supported.
-- A command started on its own, without the wrapper, leaves the arm the way LeRobot left it. The same `so101_release_torque.py` line releases it.
-
-A motor still reporting its torque on after that line has run means the supply is the thing to cut: `Torque_Enable` lives in SRAM, so no register write survives losing power.
+The legacy `Bringup/so101_run.py` has different fault behavior and is not the validated entry point for this policy. Recording, Cartesian control and other operating systems require separate shutdown validation.
 
 ---
 
