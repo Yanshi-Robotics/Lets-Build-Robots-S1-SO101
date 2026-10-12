@@ -17,6 +17,8 @@
 
 第一季从打印、组装两只 SO-101 机械臂开始，到训练出一个按颜色分拣物品、再把东西递给人的策略为止。[偃师造物学习中心](https://www.yanshirobotics.com/learn/lets-build-robots/season-1)里每一课的下载按钮旁边，都印着那个文件在这个仓库里的路径。克隆一次，课程点到的每个文件都在它说的位置上。
 
+项目由 [Jeff Liu](https://github.com/jeffliulab) 维护，[Claude Code](https://github.com/claude) 和 [OpenAI Codex](https://github.com/codex) 参与代码与文档开发。本次[遥操退出修复](../../../docs/teleop-shutdown.md)由 Codex 协助完成，实机验证由 Jeff 执行。
+
 ---
 
 ## 仓库里有什么

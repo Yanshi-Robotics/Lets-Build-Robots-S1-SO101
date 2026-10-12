@@ -17,6 +17,8 @@ Release: [v0.1.2](CHANGELOG.md), including supervised Linux teleoperation shutdo
 
 Season 1 starts with printing and assembling two SO-101 arms and ends with a trained policy that sorts objects by color and hands them to a person. Each lesson at the [Yanshi Robotics Learning Center](https://www.yanshirobotics.com/learn/lets-build-robots/season-1) that uses a program shows a download button, and next to the button it prints the file's path in this repository. Clone the repository once and every file is where the lesson says it is.
 
+Maintained by [Jeff Liu](https://github.com/jeffliulab), with code and documentation contributions from [Claude Code](https://github.com/claude) and [OpenAI Codex](https://github.com/codex). Codex assisted with the [teleoperation shutdown fix](docs/teleop-shutdown.md), and Jeff performed the physical validation.
+
 ---
 
 ## What's in the repository
