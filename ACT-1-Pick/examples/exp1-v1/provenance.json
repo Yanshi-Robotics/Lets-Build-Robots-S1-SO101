@@ -1,0 +1,13 @@
+{
+  "experiment": "EXP1-V1-ACT-001",
+  "recorded_at": "2026-10-13",
+  "dataset": "exp1_snack_into_box_v1",
+  "episodes": 90,
+  "frames": 31968,
+  "training_steps": 100000,
+  "metrics_source": "ACT v1 experiment report, training_metrics_completed.csv",
+  "source_sha256": "5a9191bb36b18a5a6adbe4394313ef35f48c212cf112b0104ee0b5ad9e4c2629",
+  "retained_records": 5,
+  "continuous_history": false,
+  "scope": "Five real retained log records. No missing middle metrics have been reconstructed. Loss is a logged interval mean; zero KL values are rounded."
+}

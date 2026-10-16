@@ -49,3 +49,9 @@ desktop.ini
 # 测试与打包产物
 .pytest_cache/
 *.egg-info/
+
+# AutoDL credentials normally live outside Git; protect accidental local copies too.
+autoDL/.env*
+autoDL/.secrets/
+autoDL/*.token
+autoDL/token

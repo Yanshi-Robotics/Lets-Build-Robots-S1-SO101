@@ -4,8 +4,8 @@
 它回答三个问题，全部只用「训练时没见过的回合」：
 
   1. 开环：模型看一眼就交出未来 100 步，这 100 步和示教里真实发生的差多少？
-     并按「第几步」分别统计——分块越往后越难，这条曲线比一个平均数有用得多。
-  2. 半闭环：把模型自己的输出当关节目标反馈回去（真机上就是这样），
+     按预测位置分别统计误差；不同位置的误差是否增大，需要看实际结果。
+  2. 半闭环：从记录状态初始化，再用简化的一阶跟随模型反馈预测目标，
      误差会不会越滚越大。画面仍然来自数据集，⛔ 所以这不是真机成功率。
   3. 越界：预测出来的动作有没有跑到关节行程之外，以及比示教见过的范围外推了多远。
 
@@ -16,7 +16,7 @@
 ⚠️ 单位不猜，必须用 --action-units 说明（见 --help）。LeRobot 0.6.1 的
    so101_follower 默认 use_degrees=True ⇒ 五个本体关节是「度」，
    而夹爪永远是 RANGE_0_100 的「百分比」（so_follower.py 里写死的，不随 use_degrees 变）。
-   早期版本默认 RANGE_M100_100 ⇒ 六个都是百分比。官方的
+   早期版本本体关节默认 RANGE_M100_100，夹爪仍为 RANGE_0_100。官方的
    lerobot/svla_so101_pickplace 就是百分比那一代，⛔ 别把它的数字当度数报。
 
 用法示例（从仓根跑）：
@@ -80,7 +80,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--action-units", choices=("degrees", "percent"), required=True,
         help="数据集 action 的单位。degrees=五个本体关节是度（LeRobot 0.6.1 默认）；"
-             "percent=六个都是 −100..100 百分比（早期默认，官方 svla_so101_pickplace 属此类）。"
+             "percent=本体关节 −100..100、夹爪 0..100 的归一化百分比（早期默认）。"
              "⛔ 不猜：报错的单位会让后面所有数字失去意义。",
     )
     p.add_argument(
@@ -211,7 +211,7 @@ def evaluate_one(policy_path: Path, args, device, ds_cache: dict) -> dict:
 
     bounds, bounds_src = bounds_for(names, args.action_units, args.model_dir)
 
-    # ---- 逐回合把帧取出来（动作与画面），按回合切开，⛔ 不跨回合混 ----
+    # ---- 逐回合把帧取出来（观测状态、动作与画面），按回合切开，⛔ 不跨回合混 ----
     ep_index_col = ds.hf_dataset["episode_index"]
     by_ep: dict[int, list[int]] = {}
     for i, e in enumerate(ep_index_col):
@@ -232,7 +232,7 @@ def evaluate_one(policy_path: Path, args, device, ds_cache: dict) -> dict:
     diverged_episodes: list[int] = []
     # ⚠️ 队列一次装 n_action_steps 个动作，装满了才会再查一次模型。
     # 所以回合比一个动作块还短时，整段只有一次前向、状态反馈根本没机会起作用，
-    # 半闭环会和开环逐位相同——那个数没有意义，必须说出来而不是让人误读。
+    # 半闭环没有利用更新后的关节反馈；不能据此得出反馈稳定性的结论。
     short_episodes: list[int] = []
 
     with torch.inference_mode():
@@ -240,9 +240,12 @@ def evaluate_one(policy_path: Path, args, device, ds_cache: dict) -> dict:
             if args.max_frames_per_episode:
                 rows = rows[: args.max_frames_per_episode]
             actions = [ds[i]["action"].numpy().tolist() for i in rows]
+            states = []
             frames = []
             for i in rows:
                 item = ds[i]
+                # Observation and demonstration target are distinct: never substitute action for state.
+                states.append(item["observation.state"].numpy().tolist())
                 f = {}
                 for c in cams:
                     img = item[c]
@@ -255,8 +258,12 @@ def evaluate_one(policy_path: Path, args, device, ds_cache: dict) -> dict:
             # 开环
             for t in range(0, n, n_action_steps):
                 policy.reset()
-                obs = _obs(frames[t], actions[t], device, task, robot_type, cams)
+                obs = _obs(frames[t], states[t], device, task, robot_type, cams)
                 pred = post(policy.predict_action_chunk(pre(obs)))[0]
+                if tuple(pred.shape) != (chunk, n_joints):
+                    raise ValueError(f"Prediction shape {tuple(pred.shape)} does not match {(chunk, n_joints)}")
+                if not torch.isfinite(pred).all():
+                    raise ValueError("Prediction contains non-finite values")
                 pred = pred.detach().to("cpu").float().numpy()
                 for h in range(min(chunk, n - t)):
                     p, truth = pred[h], actions[t + h]
@@ -278,11 +285,13 @@ def evaluate_one(policy_path: Path, args, device, ds_cache: dict) -> dict:
             if n <= n_action_steps:
                 short_episodes.append(ep)
             policy.reset()
-            sim = list(actions[0])
+            sim = list(states[0])
             errs = []
             for t in range(n):
                 obs = _obs(frames[t], sim, device, task, robot_type, cams)
                 act = post(policy.select_action(pre(obs)))[0]
+                if not torch.isfinite(act).all():
+                    raise ValueError("Feedback prediction contains non-finite values")
                 target = act.detach().to("cpu").float().numpy().tolist()
                 sim = [s + FOLLOW_ALPHA * (tg - s) for s, tg in zip(sim, target)]
                 errs.append(sum(abs(float(a) - float(b))
@@ -306,6 +315,7 @@ def evaluate_one(policy_path: Path, args, device, ds_cache: dict) -> dict:
         "action_units": args.action_units,
         "gripper_units": "percent (RANGE_0_100, 与 use_degrees 无关)",
         "open_loop": {
+            "prediction_shape": [chunk, n_joints],
             "mean_abs_all_joints": m([x for b in horizon_abs for x in b]),
             "per_joint_mean_abs": {names[j]: m(per_joint_abs[j]) for j in range(n_joints)},
             "by_horizon_first": horizon_curve[0] if horizon_curve else None,
@@ -362,6 +372,7 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print(f"数据集单位：{unit_word}　留出回合：{args.episodes}")
     print(f"越界判据来源：{results[0]['limits']['source']}")
+    print("跨关节汇总混合本体与夹爪数值，不具有统一物理单位；分关节结果见 --json-out。")
     print()
     head = f"{'检查点':<30} {'开环':>9} {'第1步':>8} {'第100步':>8} {'半闭环':>9} {'越界':>7} {'发散回合':>9}"
     print(head)
@@ -380,9 +391,9 @@ def main(argv: list[str] | None = None) -> int:
                          for e in r["closed_loop"]["degenerate_episodes_shorter_than_one_chunk"]})
     if degenerate:
         print(f"⚠️ 回合 {degenerate} 比一个动作块（{results[0]['n_action_steps']} 步）还短：")
-        print("   整段只有一次前向，状态反馈没起作用 ⇒ 这些回合的半闭环数等于开环数，⛔ 别当成两个独立结论。")
+        print("   整段只有一次前向，更新后的状态反馈未被查询，不能据此判断反馈稳定性。")
         print()
-    print("⛔ 这几个数都不是成功率。它们只说明策略学到了示教、输出合法且不发散；")
+    print("⛔ 这些是离线误差与范围检查，不是任务成功率，也不保证动作安全；")
     print("   任务做不做得成，只有真机能测。")
 
     if args.json_out:

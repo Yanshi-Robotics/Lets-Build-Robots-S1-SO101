@@ -1,0 +1,8 @@
+{
+  "req_gpu_amount": 1,
+  "expand_system_disk_by_gb": 0,
+  "gpu_spec_uuid": "5090-p",
+  "image_uuid": "base-image-mbr2n4urrc",
+  "cuda_v_from": 130,
+  "instance_name": "manual-api-example"
+}

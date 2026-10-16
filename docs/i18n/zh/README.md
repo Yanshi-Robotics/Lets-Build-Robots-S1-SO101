@@ -27,6 +27,7 @@
 - **`Cameras/`**：`so101_camera_check.py` 列出能出图的摄像头、给出各自该用的稳定路径，再把它们实时显示在一个本地网页上，认出哪台装在哪、把画面转正、存进 `cameras.json`；`check` 会先测出两台相机单开与同开的速率。`so101_policy_view.py` 接着把同样的实时画面按 ACT、π₀、π₀.₅、SmolVLA 各自的预处理显示出来。第 11 课用。Linux 能读到设备列表、给出每台相机的稳定路径；macOS 与 Windows 没有这个列表，`list` 改成逐个试相机序号（`--max-index` 决定试到几号），认哪台是哪台靠看画面。
 - **`Cartesian/`**：机械臂的笛卡尔控制，一个页面 <http://127.0.0.1:4602>。`cartesian_control.py` 显示机械臂，同一时间只让一种来源控制它：拖一个球（每个关节上还有一个可转的环）、配好对的手柄、或示教臂；加 `--model-only` 用模拟臂打开同一个页面。手柄第一次插上时在同一个页面里配对；页面上的 **Follower** 开关可以改为控制模拟臂而不是真臂。`fetch_model.py` 下载机械臂模型。其余文件是控制循环的各段（感知、目标、比较、求解、规划、执行），`Cartesian/README.md` 里有说明。第 8 课用。要在仓库根目录运行，它们按文件夹互相导入。
 - **`Teleop/`**：`so101_teleop_log.py` 打印两只臂的保护与校准寄存器、把两只臂对着读，并给 `lerobot-record` 录下的数据打分。`so101_shutdown_debug.py` 管理官方遥操循环、记录退出过程，并提供独立手动卸力。第 7 课用。
+- **`autoDL/`**：[ACT 云端训练脚手架](../../../autoDL/docs/zh/README.md)，集中管理本地凭据、实验配置、结果下载和资源关停。
 - **`tests/`**：离线测试，用假硬件跑 Bringup、Teleop、Cameras 的程序；Cartesian 测试在 `Cartesian/test_cartesian.py`。
 - **`Teleop/logs/`**（不进 git）：保存寄存器日志和录制数据，新入口的每次运行另存于 `shutdown-debug/` 下。日志含本机路径、设备身份和校准数据，分享前先检查。
 

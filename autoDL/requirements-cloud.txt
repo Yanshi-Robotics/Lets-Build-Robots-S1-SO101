@@ -1,0 +1,18 @@
+# Training packages captured from the completed local ACT baseline, 2026-10-13.
+# Install torch/torchvision from https://download.pytorch.org/whl/cu130 first.
+lerobot[training]==0.6.1
+torch==2.11.0
+torchvision==0.26.0
+torchcodec==0.11.1
+accelerate==1.15.0
+datasets==4.8.5
+huggingface-hub==1.30.0
+safetensors==0.8.0
+av==15.1.0
+numpy==2.2.6
+pandas==2.3.3
+pyarrow==25.0.1
+opencv-python-headless==4.13.0.92
+wandb==0.27.2
+draccus==0.11.6
+einops==0.8.2
